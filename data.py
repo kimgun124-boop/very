@@ -2,6 +2,7 @@
 
 - 실시간 시세: polling.finance.naver.com (여러 종목을 한 번에 조회)
 - 일봉(약 1년치): fchart.stock.naver.com, 실패하면 api.finance.naver.com/siseJson
+- 해외 종목(코드가 6자리 숫자가 아닌 것): 야후 파이낸스(yfinance) 일봉, 15분 안팎 지연
 
 개인 참고용입니다. 네이버 응답 형식이 바뀌면 parse_* 함수만 고치면 됩니다.
 환경변수 STOCK_MOCK=1 로 실행하면 인터넷 없이 가짜 데이터로 화면을 확인할 수 있어요.
@@ -84,6 +85,31 @@ def rows_to_frame(rows) -> pd.DataFrame:
 def chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def is_kr(code: str) -> bool:
+    """6자리 숫자면 국내 종목, 그 외(NVDA, 6857.T 등)는 해외 종목."""
+    return len(code) == 6 and code.isdigit()
+
+
+_SUFFIX_MARKET = {".T": ("JP", "JPY"), ".PA": ("FR", "EUR"), ".AS": ("NL", "EUR"),
+                  ".DE": ("DE", "EUR"), ".AX": ("AU", "AUD"), ".HK": ("HK", "HKD"), ".TW": ("TW", "TWD")}
+
+
+def market_of(code: str) -> tuple[str, str]:
+    """(시장, 통화)"""
+    if is_kr(code):
+        return "KR", "KRW"
+    for suffix, info in _SUFFIX_MARKET.items():
+        if code.upper().endswith(suffix):
+            return info
+    return "US", "USD"
+
+
+def quote_url(code: str) -> str:
+    if is_kr(code):
+        return f"https://m.stock.naver.com/domestic/stock/{code}/total"
+    return f"https://finance.yahoo.com/quote/{code}"
 
 
 # ─────────────────────────── 응답 해석 ───────────────────────────
@@ -171,16 +197,61 @@ def fetch_history(code: str, count: int = 300) -> tuple[str | None, pd.DataFrame
     return None, empty_frame(), error
 
 
+def normalize_yf(hist: pd.DataFrame) -> pd.DataFrame:
+    """yfinance history() 결과 → 공통 일봉 형식(date, open, high, low, close, volume)."""
+    if hist is None or hist.empty:
+        return empty_frame()
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist = hist.copy()
+        hist.columns = [c[0] if c[0] in ("Open", "High", "Low", "Close", "Volume") else c[-1]
+                        for c in hist.columns]
+    idx = pd.DatetimeIndex(hist.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df = pd.DataFrame({
+        "date": idx.normalize(),
+        "open": pd.to_numeric(hist.get("Open"), errors="coerce").values,
+        "high": pd.to_numeric(hist.get("High"), errors="coerce").values,
+        "low": pd.to_numeric(hist.get("Low"), errors="coerce").values,
+        "close": pd.to_numeric(hist.get("Close"), errors="coerce").values,
+        "volume": pd.to_numeric(hist.get("Volume"), errors="coerce").values,
+    })
+    df = df.dropna(subset=["close", "high", "low"])
+    df = df[df["close"] > 0]
+    return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+
+def fetch_history_overseas(ticker: str, count: int = 300) -> tuple[str | None, pd.DataFrame, str | None]:
+    """야후 파이낸스 일봉. (종목명은 확인하지 않으므로 None)"""
+    if MOCK:
+        return None, mock_history(ticker, count), None
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, empty_frame(), "yfinance가 설치되지 않음(requirements.txt 확인)"
+    try:
+        hist = yf.Ticker(ticker).history(period="14mo", interval="1d", auto_adjust=False)
+    except Exception as exc:  # 야후 쪽 일시 오류·요청 제한
+        return None, empty_frame(), f"야후 조회 실패: {exc.__class__.__name__}"
+    df = normalize_yf(hist)
+    return (None, df, None) if not df.empty else (None, df, "야후 응답에 일봉이 없음(티커 확인)")
+
+
 def fetch_histories(codes, workers: int = 8) -> dict[str, tuple]:
+    """국내·해외 섞인 코드 목록을 받아 각각 알맞은 곳에서 일봉을 가져옵니다."""
     codes = list(codes)
+
+    def one(code):
+        return fetch_history(code) if is_kr(code) else fetch_history_overseas(code)
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = pool.map(fetch_history, codes)
+        results = pool.map(one, codes)
     return dict(zip(codes, results))
 
 
 def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
     """({코드: 시세}, 오류메시지). 일부 실패해도 받은 만큼 돌려줍니다."""
-    codes = list(codes)
+    codes = [c for c in codes if is_kr(c)]
     if MOCK:
         return {c: mock_quote(c) for c in codes}, None
     out: dict[str, dict] = {}
@@ -278,9 +349,13 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict) -> pd.DataFra
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
         metrics = compute_metrics(hist, quotes.get(s["code"]))
+        market, currency = market_of(s["code"])
         rows.append({
             **s,
             **metrics,
+            "market": market,
+            "currency": currency,
+            "url": quote_url(s["code"]),
             "naver_name": naver_name,
             "name_ok": name_matches(s["name"], naver_name),
             "error": error if metrics["price"] is None else None,

@@ -18,6 +18,16 @@ UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
 NEW_HIGH_BG = "#FFF1C9"                # 신고가 행 강조
 REFRESH = {"끄기": None, "30초": 30, "1분": 60, "5분": 300}
 ALL_CODES = tuple(sorted({s["code"] for s in STOCKS}))
+KR_CODES = tuple(c for c in ALL_CODES if data.is_kr(c))
+OS_CODES = tuple(c for c in ALL_CODES if not data.is_kr(c))
+UNIT = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "AUD": "호주달러", "HKD": "홍콩달러", "TWD": "대만달러"}
+
+
+def fmt_price(value, currency: str) -> str:
+    """원화는 정수, 외화는 소수 둘째 자리까지."""
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{value:,.0f}" if currency in ("KRW", "JPY") else f"{value:,.2f}"
 
 st.markdown(
     """
@@ -87,6 +97,11 @@ def load_histories(codes: tuple[str, ...]):
     return data.fetch_histories(codes)
 
 
+@st.cache_data(ttl=300, show_spinner="해외 종목 일봉을 불러오는 중이에요.")
+def load_histories_overseas(codes: tuple[str, ...]):
+    return data.fetch_histories(codes, workers=4)
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def load_quotes(codes: tuple[str, ...]):
     return data.fetch_quotes(codes)
@@ -116,6 +131,7 @@ with st.sidebar:
         load_quotes.clear()
     if st.button("일봉까지 다시 받기", help="52주 최고가가 이상해 보일 때 눌러요."):
         load_histories.clear()
+        load_histories_overseas.clear()
         load_quotes.clear()
 
 
@@ -160,6 +176,7 @@ def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
         "종목": f["name"],
         "코드": f["code"],
+        "시장": f["market"],
         "분류": f["group"],
         "현재가": f["price"],
         "등락률": f["change"],
@@ -171,6 +188,8 @@ def render_table(f: pd.DataFrame):
         "정배열": f["aligned"],
         "설명": f["desc"],
     })
+
+    whole_rows = view.index[f["currency"].isin(["KRW", "JPY"]).values]
 
     def color_sign(v):
         if pd.isna(v) or v == 0:
@@ -184,10 +203,11 @@ def render_table(f: pd.DataFrame):
     styled = (
         view.style
         .format({
-            "현재가": "{:,.0f}", "52주 최고": "{:,.0f}",
+            "현재가": "{:,.2f}", "52주 최고": "{:,.2f}",
             "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
         }, na_rep="-")
+        .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, ["현재가", "52주 최고"]], na_rep="-")
         .map(color_sign, subset=["등락률"])
         .map(lambda _: "font-weight: 600", subset=["종목"])
         .apply(mark_new_high, axis=1)
@@ -232,17 +252,18 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             tags += '<span class="c-tag al">정배열</span>'
         cards.append(
             f'<a class="card{" hot" if hot else ""}" target="_blank" '
-            f'href="https://m.stock.naver.com/domestic/stock/{r.code}/total">'
+            f'href="{r.url}">'
             f'<div class="c-top"><span class="c-name">{html.escape(r.name)}{tags}</span>'
-            f'<span class="c-price">{r.price:,.0f}</span></div>'
+            f'<span class="c-price">{fmt_price(r.price, r.currency)}'
+            f'{"" if r.currency == "KRW" else " " + r.currency}</span></div>'
             f'<div class="c-mid"><span>{html.escape(r.group)}</span>{chg}</div>'
             f'<div class="c-bar"><i style="width:{max(2.0, min(100.0, r.pos)):.0f}%"></i></div>'
-            f'<div class="c-meta"><span>52주 최고 {r.high52:,.0f} ({r.gap:.1f}%)</span>'
+            f'<div class="c-meta"><span>52주 최고 {fmt_price(r.high52, r.currency)} ({r.gap:.1f}%)</span>'
             f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
             f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
         )
     st.markdown(kpis + '<div class="cards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
-    st.caption("카드를 누르면 네이버 증권 종목 화면이 열려요.")
+    st.caption("카드를 누르면 종목 화면이 열려요. 국내는 네이버 증권, 해외는 야후 파이낸스예요.")
 
 
 def render_detail(f: pd.DataFrame, histories: dict):
@@ -256,13 +277,14 @@ def render_detail(f: pd.DataFrame, histories: dict):
     row = options[options["code"] == code].iloc[0]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("현재가", f"{row.price:,.0f}원",
+    unit = UNIT.get(row.currency, row.currency)
+    c1.metric("현재가", f"{fmt_price(row.price, row.currency)}{unit}",
               f"{row.change:+.2f}%" if pd.notna(row.change) else None, delta_color="off")
-    c2.metric("52주 최고", f"{row.high52:,.0f}원", f"{row.gap:.1f}%", delta_color="off")
+    c2.metric("52주 최고", f"{fmt_price(row.high52, row.currency)}{unit}", f"{row.gap:.1f}%", delta_color="off")
     c3.metric("신고가까지", f"{row.to_high:+.1f}%",
               "오늘 신고가" if row.days_since_high == 0 else f"고점 후 {row.days_since_high:.0f}거래일",
               delta_color="off")
-    c4.metric("52주 최저", f"{row.low52:,.0f}원")
+    c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
     st.write(f"**{row['group']}**  \n{row.desc}")
 
     hist = histories.get(code, (None, data.empty_frame(), None))[1]
@@ -275,7 +297,10 @@ def render_detail(f: pd.DataFrame, histories: dict):
             "52주 최고": row.high52,
         })
         st.line_chart(chart, height=280, color=["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"])
-    st.link_button("네이버 금융에서 보기", f"https://finance.naver.com/item/main.naver?code={code}")
+    if data.is_kr(code):
+        st.link_button("네이버 금융에서 보기", f"https://finance.naver.com/item/main.naver?code={code}")
+    else:
+        st.link_button("야후 파이낸스에서 보기", row.url)
 
 
 def render_checks(df: pd.DataFrame, quote_error: str | None):
@@ -294,8 +319,8 @@ def render_checks(df: pd.DataFrame, quote_error: str | None):
 
 
 def render_board():
-    histories = load_histories(ALL_CODES)
-    quotes, quote_error = load_quotes(ALL_CODES)
+    histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
+    quotes, quote_error = load_quotes(KR_CODES)
     df = data.build_table(STOCKS, histories, quotes)
 
     interval = REFRESH[refresh_label]
@@ -327,8 +352,8 @@ def render_board():
     else:
         with st.container(key="desk_table"):
             render_table(f)
-            st.caption("노란 줄은 설정한 기간 안에 52주 신고가를 쓴 종목이에요. 설명은 2023~24년 자료 기준 요약이라 "
-                       "최신 사업 현황과 다를 수 있어요.")
+            st.caption("노란 줄은 설정한 기간 안에 52주 신고가를 쓴 종목이에요. 해외 종목은 야후 파이낸스 일봉 기준이라 "
+                       "15분 안팎 늦고, 가격은 현지 통화예요. 설명은 각 자료 작성 시점 기준 요약이에요.")
         with st.container(key="mobile_view"):
             render_cards(f, n_hot, n_near, n_aligned)
         render_detail(f, histories)

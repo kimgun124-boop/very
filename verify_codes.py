@@ -34,8 +34,9 @@ def find_candidates(name: str) -> list[tuple[str, str]]:
 
 def main():
     ok, bad = 0, []
-    histories = data.fetch_histories([s["code"] for s in STOCKS])
-    for s in STOCKS:
+    kr_stocks = [s for s in STOCKS if data.is_kr(s["code"])]  # 해외 티커는 네이버로 점검할 수 없어 제외
+    histories = data.fetch_histories([s["code"] for s in kr_stocks])
+    for s in kr_stocks:
         naver_name, hist, error = histories[s["code"]]
         match = data.name_matches(s["name"], naver_name)
         if hist.empty:
