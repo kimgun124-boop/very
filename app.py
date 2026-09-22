@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import html
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 import data
-from stocks import GROUP_ORDER, SECTOR_ORDER, STOCKS
+from stocks import GROUP_ORDER, SECTOR_ORDER, STOCKS, TAGS
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
@@ -20,7 +21,7 @@ REFRESH = {"끄기": None, "30초": 30, "1분": 60, "5분": 300}
 ALL_CODES = tuple(sorted({s["code"] for s in STOCKS}))
 KR_CODES = tuple(c for c in ALL_CODES if data.is_kr(c))
 OS_CODES = tuple(c for c in ALL_CODES if not data.is_kr(c))
-UNIT = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "AUD": "호주달러", "HKD": "홍콩달러", "TWD": "대만달러"}
+UNIT = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "AUD": "호주달러", "HKD": "홍콩달러", "TWD": "대만달러", "GBp": "펜스"}
 
 
 def fmt_price(value, currency: str) -> str:
@@ -86,6 +87,26 @@ st.markdown(
   [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
   [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
 }
+.idx-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.6rem; margin: 0 0 0.5rem; }
+.idx { background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px; padding: 0.7rem 0.9rem; }
+.idx-name { font-size: 0.85rem; color: #51616C; }
+.idx-name small { margin-left: 0.3rem; color: #8A979F; }
+.idx-val { font-size: 1.35rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
+.idx-chg { font-size: 0.85rem; font-weight: 700; margin-left: 0.35rem; font-variant-numeric: tabular-nums; }
+.idx-badge { display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 0.1rem 0.45rem;
+  border-radius: 6px; margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
+.idx-badge.on { background: #D9E8E6; color: #2E6B6F; }
+.idx-badge.off { background: #F4E1E2; color: #A2343B; }
+.idx-err { font-size: 0.85rem; color: #8A979F; margin-top: 0.3rem; }
+@media (max-width: 640px) {
+  .idx-row { gap: 0.35rem; }
+  .idx { padding: 0.5rem 0.55rem; }
+  .idx-name { font-size: 0.74rem; }
+  .idx-name small { display: none; }
+  .idx-val { font-size: 1.0rem; }
+  .idx-chg { display: block; margin-left: 0; font-size: 0.76rem; }
+  .idx-badge { font-size: 0.62rem; padding: 0.05rem 0.3rem; }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -102,6 +123,32 @@ def load_histories_overseas(codes: tuple[str, ...]):
     return data.fetch_histories(codes, workers=4)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_indexes():
+    return data.fetch_index_histories()
+
+
+def price_chart(chart: pd.DataFrame, colors: list[str], height: int = 260):
+    """y축을 0부터 시작하지 않는 선 차트(주가·지수용)."""
+    d = chart.copy()
+    d.index.name = "날짜"
+    long = d.reset_index().melt("날짜", var_name="구분", value_name="값").dropna()
+    c = (
+        alt.Chart(long)
+        .mark_line(strokeWidth=1.7)
+        .encode(
+            x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, grid=False)),
+            y=alt.Y("값:Q", title=None, scale=alt.Scale(zero=False)),
+            color=alt.Color("구분:N", scale=alt.Scale(domain=list(chart.columns), range=colors),
+                            legend=alt.Legend(orient="bottom", title=None)),
+            tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), alt.Tooltip("구분:N"),
+                     alt.Tooltip("값:Q", format=",.2f")],
+        )
+        .properties(height=height, width="container")
+    )
+    st.altair_chart(c)
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def load_quotes(codes: tuple[str, ...]):
     return data.fetch_quotes(codes)
@@ -115,6 +162,8 @@ with st.sidebar:
     group_choices = [g for g in GROUP_ORDER
                      if any(s["group"] == g and s["sector"] in active_sectors for s in STOCKS)]
     groups = st.multiselect("세부 분류", group_choices, placeholder="전체")
+    tags = st.multiselect("리포트 태그", list(TAGS), placeholder="선택 안 함",
+                          help="태그를 고르면 위의 산업·분류와 관계없이 전체 종목에서 그 리포트에 나온 종목만 보여줘요.")
     query = st.text_input("종목 검색", placeholder="이름이나 코드")
     max_drop = st.slider("52주 최고가에서 몇 % 이내만 볼까요", 0, 90, 90, step=5,
                          help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
@@ -137,9 +186,12 @@ with st.sidebar:
 
 # ─────────────────────────── 화면 조각 ───────────────────────────
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    f = df[df["sector"].isin(active_sectors)]
-    if groups:
-        f = f[f["group"].isin(groups)]
+    if tags:
+        f = df[df["tags"].apply(lambda ts: any(t in ts for t in tags))]
+    else:
+        f = df[df["sector"].isin(active_sectors)]
+        if groups:
+            f = f[f["group"].isin(groups)]
     if query.strip():
         q = query.strip().lower()
         f = f[f["name"].str.lower().str.contains(q, regex=False) | f["code"].str.contains(q, regex=False)]
@@ -148,6 +200,45 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     if only_aligned:
         f = f[f["aligned"] == True]  # noqa: E712
     return f.sort_values("gap", ascending=False, na_position="last")
+
+
+def render_market():
+    """코스피·코스닥·나스닥 요약과 차트. 배지는 지수가 60일선 위인지 아래인지."""
+    hist = load_indexes()
+    chips = []
+    for idx in data.INDEXES:
+        df, _err = hist.get(idx["symbol"], (data.empty_frame(), None))
+        sm = data.index_summary(df)
+        if not sm:
+            chips.append(f'<div class="idx"><div class="idx-name">{idx["name"]}</div>'
+                         f'<div class="idx-err">불러오지 못했어요</div></div>')
+            continue
+        color = UP if sm["change"] > 0 else (DOWN if sm["change"] < 0 else "#51616C")
+        if sm["above60"] is None:
+            badge = ""
+        elif sm["above60"]:
+            badge = f'<span class="idx-badge on">60일선 위 {sm["dist60"]:+.1f}%</span>'
+        else:
+            badge = f'<span class="idx-badge off">60일선 아래 {sm["dist60"]:+.1f}%</span>'
+        chips.append(
+            f'<div class="idx"><div class="idx-name">{idx["name"]}<small>{sm["date"]:%m/%d}</small></div>'
+            f'<span class="idx-val">{sm["last"]:,.2f}</span>'
+            f'<span class="idx-chg" style="color:{color}">{sm["change"]:+.2f}%</span><br>{badge}</div>'
+        )
+    st.markdown('<div class="idx-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
+
+    with st.expander("지수 차트 보기"):
+        tabs = st.tabs([i["name"] for i in data.INDEXES])
+        for tab, idx in zip(tabs, data.INDEXES):
+            with tab:
+                df, _err = hist.get(idx["symbol"], (data.empty_frame(), None))
+                if df.empty:
+                    st.caption("지수 데이터를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
+                    continue
+                h = df.set_index("date")["close"].astype(float)
+                chart = pd.DataFrame({"지수": h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
+                price_chart(chart, ["#16212B", "#2E6B6F", "#F2B134"], height=240)
+        st.caption("코스피·코스닥은 네이버 금융, 나스닥은 야후 파이낸스(15분 안팎 지연) 일봉이에요.")
 
 
 def render_radar(df: pd.DataFrame):
@@ -286,6 +377,8 @@ def render_detail(f: pd.DataFrame, histories: dict):
               delta_color="off")
     c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
     st.write(f"**{row['group']}**  \n{row.desc}")
+    if row.tags:
+        st.caption("리포트 태그: " + ", ".join(row.tags))
 
     hist = histories.get(code, (None, data.empty_frame(), None))[1]
     if not hist.empty:
@@ -296,7 +389,7 @@ def render_detail(f: pd.DataFrame, histories: dict):
             "60일선": h["close"].rolling(60).mean(),
             "52주 최고": row.high52,
         })
-        st.line_chart(chart, height=280, color=["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"])
+        price_chart(chart, ["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"], height=280)
     if data.is_kr(code):
         st.link_button("네이버 금융에서 보기", f"https://finance.naver.com/item/main.naver?code={code}")
     else:
@@ -333,6 +426,7 @@ def render_board():
     if data.MOCK:
         st.info("가짜 데이터로 보여주는 테스트 모드예요. 실제 시세를 보려면 STOCK_MOCK 설정 없이 실행하세요.")
 
+    render_market()
     render_radar(df)
     f = apply_filters(df)
 

@@ -93,7 +93,8 @@ def is_kr(code: str) -> bool:
 
 
 _SUFFIX_MARKET = {".T": ("JP", "JPY"), ".PA": ("FR", "EUR"), ".AS": ("NL", "EUR"),
-                  ".DE": ("DE", "EUR"), ".AX": ("AU", "AUD"), ".HK": ("HK", "HKD"), ".TW": ("TW", "TWD")}
+                  ".DE": ("DE", "EUR"), ".AX": ("AU", "AUD"), ".HK": ("HK", "HKD"), ".TW": ("TW", "TWD"),
+                  ".HE": ("FI", "EUR"), ".L": ("GB", "GBp")}
 
 
 def market_of(code: str) -> tuple[str, str]:
@@ -235,6 +236,42 @@ def fetch_history_overseas(ticker: str, count: int = 300) -> tuple[str | None, p
         return None, empty_frame(), f"야후 조회 실패: {exc.__class__.__name__}"
     df = normalize_yf(hist)
     return (None, df, None) if not df.empty else (None, df, "야후 응답에 일봉이 없음(티커 확인)")
+
+
+INDEXES = [
+    {"name": "코스피", "symbol": "KOSPI", "source": "naver"},
+    {"name": "코스닥", "symbol": "KOSDAQ", "source": "naver"},
+    {"name": "나스닥", "symbol": "^IXIC", "source": "yahoo"},
+]
+
+
+def fetch_index_histories() -> dict[str, tuple[pd.DataFrame, str | None]]:
+    """코스피·코스닥은 네이버 일봉(장중 갱신), 나스닥은 야후 일봉(지연)."""
+    out = {}
+    for idx in INDEXES:
+        if idx["source"] == "naver":
+            _, df, err = fetch_history(idx["symbol"], count=300)
+        else:
+            _, df, err = fetch_history_overseas(idx["symbol"])
+        out[idx["symbol"]] = (df, err)
+    return out
+
+
+def index_summary(df: pd.DataFrame) -> dict | None:
+    """현재 지수, 등락률, 60일선과의 거리."""
+    if df is None or len(df) < 2:
+        return None
+    close = df["close"].astype(float)
+    last, prev = float(close.iloc[-1]), float(close.iloc[-2])
+    ma60 = float(close.tail(60).mean()) if len(close) >= 60 else None
+    return {
+        "last": last,
+        "change": (last / prev - 1) * 100,
+        "ma60": ma60,
+        "above60": (last > ma60) if ma60 else None,
+        "dist60": (last / ma60 - 1) * 100 if ma60 else None,
+        "date": df["date"].iloc[-1],
+    }
 
 
 def fetch_histories(codes, workers: int = 8) -> dict[str, tuple]:
