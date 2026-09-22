@@ -19,7 +19,7 @@ import stocks as stock_list
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
-            "fetch_kr_shares", "fetch_fx", "format_krw")
+            "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
@@ -110,7 +110,15 @@ st.markdown(
   [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
   [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
 }
-.idx-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.6rem; margin: 0 0 0.5rem; }
+.idx-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin: 0 0 0.5rem; }
+.idx-badge.neutral { background: #E7EDEF; color: #51616C; }
+.flow { background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px; padding: 0.7rem 0.9rem; margin: 0 0 0.5rem; }
+.flow-title { font-size: 0.85rem; color: #51616C; margin-bottom: 0.35rem; }
+.flow table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.flow th { font-size: 0.78rem; color: #8A979F; font-weight: 600; text-align: right; padding: 0.15rem 0.3rem; }
+.flow th:first-child, .flow td:first-child { text-align: left; }
+.flow td { font-size: 0.92rem; font-weight: 700; text-align: right; padding: 0.25rem 0.3rem; border-top: 1px solid #EEF2F4; }
+.flow td small { display: block; font-size: 0.7rem; font-weight: 500; color: #8A979F; }
 .idx { background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px; padding: 0.7rem 0.9rem; }
 .idx-name { font-size: 0.85rem; color: #51616C; }
 .idx-name small { margin-left: 0.3rem; color: #8A979F; }
@@ -122,7 +130,9 @@ st.markdown(
 .idx-badge.off { background: #F4E1E2; color: #A2343B; }
 .idx-err { font-size: 0.85rem; color: #8A979F; margin-top: 0.3rem; }
 @media (max-width: 640px) {
-  .idx-row { gap: 0.35rem; }
+  .idx-row { gap: 0.35rem; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .flow { padding: 0.55rem 0.6rem; }
+  .flow td { font-size: 0.8rem; }
   .idx { padding: 0.5rem 0.55rem; }
   .idx-name { font-size: 0.74rem; }
   .idx-name small { display: none; }
@@ -173,6 +183,11 @@ def load_fx():
 @st.cache_data(ttl=120, show_spinner=False)
 def load_indexes():
     return data.fetch_index_histories()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_flows():
+    return data.fetch_investor_flows()
 
 
 def price_chart(chart: pd.DataFrame, colors: list[str], height: int = 260):
@@ -250,6 +265,62 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return f.sort_values("gap", ascending=False, na_position="last")
 
 
+def _flow_cell(v) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    color = UP if v > 0 else (DOWN if v < 0 else "#51616C")
+    return f'<span style="color:{color}">{v:+,.0f}</span>'
+
+
+def render_flows():
+    """코스피·코스닥 개인·외국인·기관 순매수(억원): 당일과 최근 5일 누적, 20일 막대 차트."""
+    flows = load_flows()
+    latest = [df["date"].iloc[-1] for df in flows.values() if not df.empty]
+    if not latest:
+        st.markdown('<div class="flow"><div class="flow-title">투자자별 수급을 불러오지 못했어요. '
+                    '잠시 뒤 자동으로 다시 시도해요.</div></div>', unsafe_allow_html=True)
+        return
+    rows = []
+    for market, df in flows.items():
+        if df.empty:
+            rows.append(f"<tr><td>{market}</td><td colspan='3'>-</td></tr>")
+            continue
+        last = df.iloc[-1]
+        cum5 = df.tail(5)[data.INVESTORS].sum()
+        cells = "".join(f"<td>{_flow_cell(last[n])}<small>5일 {cum5[n]:+,.0f}</small></td>" for n in data.INVESTORS)
+        rows.append(f"<tr><td>{market}</td>{cells}</tr>")
+    st.markdown(
+        f'<div class="flow"><div class="flow-title">투자자별 순매수 ({max(latest):%m/%d} 기준, 억원, 장중엔 잠정치)</div>'
+        f'<table><tr><th></th>{"".join(f"<th>{n}</th>" for n in data.INVESTORS)}</tr>{"".join(rows)}</table></div>',
+        unsafe_allow_html=True,
+    )
+    with st.expander("수급 추이 보기 (최근 20거래일)"):
+        tabs = st.tabs(list(flows))
+        for tab, (market, df) in zip(tabs, flows.items()):
+            with tab:
+                if df.empty:
+                    st.caption("데이터를 불러오지 못했어요.")
+                    continue
+                long = df.tail(20).melt("date", value_vars=data.INVESTORS, var_name="투자자", value_name="순매수")
+                chart = (
+                    alt.Chart(long)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False)),
+                        xOffset=alt.XOffset("투자자:N", sort=data.INVESTORS),
+                        y=alt.Y("순매수:Q", title="억원"),
+                        color=alt.Color("투자자:N", sort=data.INVESTORS,
+                                        scale=alt.Scale(domain=data.INVESTORS, range=["#9AA9B3", "#2E6B6F", "#F2B134"]),
+                                        legend=alt.Legend(orient="bottom", title=None)),
+                        tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "투자자:N",
+                                 alt.Tooltip("순매수:Q", format="+,.0f")],
+                    )
+                    .properties(height=240, width="container")
+                )
+                st.altair_chart(chart)
+        st.caption("네이버 금융 투자자별 매매동향 기준. 기관은 금융투자·연기금 등을 합친 기관계예요.")
+
+
 def render_market():
     """코스피·코스닥·나스닥 요약과 차트. 배지는 지수가 60일선 위인지 아래인지."""
     hist = load_indexes()
@@ -262,20 +333,26 @@ def render_market():
                          f'<div class="idx-err">불러오지 못했어요</div></div>')
             continue
         color = UP if sm["change"] > 0 else (DOWN if sm["change"] < 0 else "#51616C")
-        if sm["above60"] is None:
-            badge = ""
-        elif sm["above60"]:
-            badge = f'<span class="idx-badge on">60일선 위 {sm["dist60"]:+.1f}%</span>'
+        if idx.get("kind", "index") == "index":
+            if sm["above60"] is None:
+                badge = ""
+            elif sm["above60"]:
+                badge = f'<span class="idx-badge on">60일선 위 {sm["dist60"]:+.1f}%</span>'
+            else:
+                badge = f'<span class="idx-badge off">60일선 아래 {sm["dist60"]:+.1f}%</span>'
         else:
-            badge = f'<span class="idx-badge off">60일선 아래 {sm["dist60"]:+.1f}%</span>'
+            badge = (f'<span class="idx-badge neutral">20일 {sm["chg20"]:+.1f}%</span>'
+                     if sm.get("chg20") is not None else "")
         chips.append(
             f'<div class="idx"><div class="idx-name">{idx["name"]}<small>{sm["date"]:%m/%d}</small></div>'
-            f'<span class="idx-val">{sm["last"]:,.2f}</span>'
+            f'<span class="idx-val">{idx.get("unit", "")}{sm["last"]:,.2f}</span>'
             f'<span class="idx-chg" style="color:{color}">{sm["change"]:+.2f}%</span><br>{badge}</div>'
         )
     st.markdown('<div class="idx-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
 
-    with st.expander("지수 차트 보기"):
+    render_flows()
+
+    with st.expander("지수·환율·유가 차트 보기"):
         tabs = st.tabs([i["name"] for i in data.INDEXES])
         for tab, idx in zip(tabs, data.INDEXES):
             with tab:
@@ -284,9 +361,10 @@ def render_market():
                     st.caption("지수 데이터를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
                     continue
                 h = df.set_index("date")["close"].astype(float)
-                chart = pd.DataFrame({"지수": h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
+                chart = pd.DataFrame({idx["name"]: h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
                 price_chart(chart, ["#16212B", "#2E6B6F", "#F2B134"], height=240)
-        st.caption("코스피·코스닥은 네이버 금융, 나스닥은 야후 파이낸스(15분 안팎 지연) 일봉이에요.")
+        st.caption("코스피·코스닥은 네이버 금융, 나머지는 야후 파이낸스(15분 안팎 지연) 일봉이에요. "
+                   "유가는 근월물 선물 기준이에요.")
 
 
 def render_radar(df: pd.DataFrame):

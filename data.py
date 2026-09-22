@@ -239,23 +239,35 @@ def fetch_history_overseas(ticker: str, count: int = 300) -> tuple[str | None, p
     return (None, df, None) if not df.empty else (None, df, "야후 응답에 일봉이 없음(티커 확인)")
 
 
+# 시장 지표. kind: index(60일선 배지), fx·commodity(20일 변화율). scale: 표시 배율(100엔 기준 등)
 INDEXES = [
-    {"name": "코스피", "symbol": "KOSPI", "source": "naver"},
-    {"name": "코스닥", "symbol": "KOSDAQ", "source": "naver"},
-    {"name": "나스닥", "symbol": "^IXIC", "source": "yahoo"},
+    {"name": "코스피", "symbol": "KOSPI", "source": "naver", "kind": "index"},
+    {"name": "코스닥", "symbol": "KOSDAQ", "source": "naver", "kind": "index"},
+    {"name": "나스닥", "symbol": "^IXIC", "source": "yahoo", "kind": "index"},
+    {"name": "니케이225", "symbol": "^N225", "source": "yahoo", "kind": "index"},
+    {"name": "원/달러", "symbol": "USDKRW=X", "source": "yahoo", "kind": "fx"},
+    {"name": "원/엔(100엔)", "symbol": "JPYKRW=X", "source": "yahoo", "kind": "fx", "scale": 100},
+    {"name": "WTI 유가", "symbol": "CL=F", "source": "yahoo", "kind": "commodity", "unit": "$"},
+    {"name": "브렌트 유가", "symbol": "BZ=F", "source": "yahoo", "kind": "commodity", "unit": "$"},
 ]
 
 
 def fetch_index_histories() -> dict[str, tuple[pd.DataFrame, str | None]]:
-    """코스피·코스닥은 네이버 일봉(장중 갱신), 나스닥은 야후 일봉(지연)."""
-    out = {}
-    for idx in INDEXES:
+    """코스피·코스닥은 네이버 일봉(장중 갱신), 나머지는 야후 일봉(15분 안팎 지연)."""
+
+    def one(idx):
         if idx["source"] == "naver":
             _, df, err = fetch_history(idx["symbol"], count=300)
         else:
             _, df, err = fetch_history_overseas(idx["symbol"])
-        out[idx["symbol"]] = (df, err)
-    return out
+        scale = idx.get("scale", 1)
+        if scale != 1 and not df.empty:
+            df = df.copy()
+            df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]] * scale
+        return idx["symbol"], (df, err)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return dict(pool.map(one, INDEXES))
 
 
 def index_summary(df: pd.DataFrame) -> dict | None:
@@ -265,7 +277,9 @@ def index_summary(df: pd.DataFrame) -> dict | None:
     close = df["close"].astype(float)
     last, prev = float(close.iloc[-1]), float(close.iloc[-2])
     ma60 = float(close.tail(60).mean()) if len(close) >= 60 else None
+    chg20 = (last / float(close.iloc[-21]) - 1) * 100 if len(close) > 21 else None
     return {
+        "chg20": chg20,
         "last": last,
         "change": (last / prev - 1) * 100,
         "ma60": ma60,
@@ -613,6 +627,66 @@ def format_local_cap(value: float | None, currency: str) -> str:
         if value >= div:
             return f"{value / div:,.2f}{unit} {currency}"
     return f"{value:,.0f} {currency}"
+
+
+# ─────────────────────────── 투자자별 매매동향 ───────────────────────────
+INVESTOR_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
+INVESTOR_MARKETS = {"코스피": "01", "코스닥": "02"}
+INVESTORS = ["개인", "외국인", "기관"]
+
+
+def parse_investor_trend(text: str) -> list[dict]:
+    """네이버 투자자별 매매동향(일별, 억원) → [{date, 개인, 외국인, 기관}, ...]"""
+    header = [_strip_tags(h).replace(" ", "") for h in re.findall(r"<th[^>]*>(.*?)</th>", text, re.S)]
+
+    def col(name, default):
+        for i, h in enumerate(header):
+            if h.startswith(name):
+                return i
+        return default
+
+    idx = {"개인": col("개인", 1), "외국인": col("외국인", 2), "기관": col("기관", 3)}
+    rows = []
+    for tr in re.split(r"<tr[\s>]", text):
+        tds = [_strip_tags(t) for t in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if not tds:
+            continue
+        m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{2})", tds[0].strip())
+        if not m:
+            continue
+        row = {"date": pd.Timestamp(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))}
+        for name, i in idx.items():
+            row[name] = to_num(tds[i]) if i < len(tds) else None
+        if all(row[n] is not None for n in INVESTORS):
+            rows.append(row)
+    return rows
+
+
+def fetch_investor_flows(pages: int = 2) -> dict[str, pd.DataFrame]:
+    """코스피·코스닥 일별 개인·외국인·기관 순매수(억원). 장중에는 잠정치예요."""
+    out = {}
+    for market, sosok in INVESTOR_MARKETS.items():
+        if MOCK:
+            rng = _rng(market)
+            dates = pd.bdate_range(end=now_kst().date(), periods=20)
+            rows = []
+            for dt in dates:
+                f, i = rng.randint(-8000, 8000), rng.randint(-5000, 5000)
+                rows.append({"date": dt, "개인": -(f + i) + rng.randint(-300, 300), "외국인": f, "기관": i})
+            out[market] = pd.DataFrame(rows)
+            continue
+        rows = []
+        for page in range(1, pages + 1):
+            try:
+                r = session.get(INVESTOR_URL, params={"bizdate": now_kst().strftime("%Y%m%d"),
+                                                      "sosok": sosok, "page": page}, timeout=8)
+                r.raise_for_status()
+                rows += parse_investor_trend(decode(r.content))
+            except requests.RequestException:
+                break
+        df = pd.DataFrame(rows, columns=["date"] + INVESTORS)
+        out[market] = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    return out
 
 
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
