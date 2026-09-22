@@ -438,39 +438,43 @@ def _shares_from_item_page(code: str) -> int | None:
         return None
 
 
-def _yahoo_shares(ticker: str) -> int | None:
-    try:
-        import yfinance as yf
-    except ImportError:
-        return None
-    tk = yf.Ticker(ticker)
-    try:
-        fi = tk.fast_info
-        n = getattr(fi, "shares", None)
-        if n:
-            return int(n)
-    except Exception:
-        pass
-    try:
-        n = (tk.info or {}).get("sharesOutstanding")
-        return int(n) if n else None
-    except Exception:
-        return None
+NAVER_MOBILE = "https://m.stock.naver.com/api/stock"
+SEC_HEADERS = {
+    "User-Agent": os.environ.get("SEC_CONTACT", "ValueChainBoard personal-research contact@example.com"),
+    "Accept-Encoding": "gzip, deflate",
+}
+ADR_RATIO = {"TSM": 5.0}  # 미국 ADR 1주 = 원주 N주. 시총 계산 시 원주 수를 ADR 수로 환산
 
 
-def _yahoo_kr_shares(code: str) -> int | None:
-    for suffix in (".KS", ".KQ"):
-        n = _yahoo_shares(code + suffix)
-        if n:
-            return n
-    return None
+def parse_korean_amount(text: str | None) -> float | None:
+    """'472조 7,478억' / '8,718억' → 원."""
+    if not text:
+        return None
+    jo = re.search(r"([\d,.]+)\s*조", text)
+    eok = re.search(r"([\d,.]+)\s*억", text)
+    total = (to_num(jo.group(1)) or 0) * 1e12 if jo else 0.0
+    total += (to_num(eok.group(1)) or 0) * 1e8 if eok else 0.0
+    return total or None
+
+
+def _naver_mobile_shares(code: str) -> int | None:
+    """네이버 모바일 API의 시가총액 ÷ 종가로 상장주식수를 역산 (순위표·종목페이지 실패 시)."""
+    try:
+        info = session.get(f"{NAVER_MOBILE}/{code}/integration", timeout=8).json()
+        mv = next((i.get("value") for i in info.get("totalInfos", []) if i.get("code") == "marketValue"), None)
+        cap = parse_korean_amount(mv)
+        basic = session.get(f"{NAVER_MOBILE}/{code}/basic", timeout=8).json()
+        price = to_num(basic.get("closePrice"))
+        return int(round(cap / price)) if cap and price else None
+    except (requests.RequestException, ValueError, AttributeError):
+        return None
 
 
 def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
-    """국내 상장주식수: ① 네이버 시가총액 순위표 ② 종목 페이지 ③ 야후 순서로 채웁니다.
+    """국내 상장주식수: ① 네이버 시가총액 순위표 ② 종목 페이지 ③ 네이버 모바일 API 순서로 채웁니다.
     (결과, 출처별 개수) 를 돌려줘요."""
     codes = [c for c in codes if is_kr(c)]
-    diag = {"total": len(codes), "순위표": 0, "종목페이지": 0, "야후": 0}
+    diag = {"total": len(codes), "순위표": 0, "종목페이지": 0, "모바일": 0}
     if MOCK:
         return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}, {**diag, "순위표": len(codes)}
     shares: dict[str, int] = {}
@@ -484,31 +488,77 @@ def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
             shares.update(part)
     result = {c: shares[c] for c in codes if c in shares}
     diag["순위표"] = len(result)
-    missing = [c for c in codes if c not in result]
-    if missing:
+    for label, fn in (("종목페이지", _shares_from_item_page), ("모바일", _naver_mobile_shares)):
+        missing = [c for c in codes if c not in result]
+        if not missing:
+            break
         with ThreadPoolExecutor(max_workers=6) as pool:
-            for code, n in zip(missing, pool.map(_shares_from_item_page, missing)):
+            for code, n in zip(missing, pool.map(fn, missing)):
                 if n:
                     result[code] = n
-                    diag["종목페이지"] += 1
-    missing = [c for c in codes if c not in result]
-    if missing:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for code, n in zip(missing, pool.map(_yahoo_kr_shares, missing)):
-                if n:
-                    result[code] = n
-                    diag["야후"] += 1
+                    diag[label] += 1
     return result, diag
 
 
+def _sec_ticker_map() -> dict[str, str]:
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS, timeout=15)
+    r.raise_for_status()
+    return {str(v["ticker"]).upper(): f"{int(v['cik_str']):010d}" for v in r.json().values()}
+
+
+def _sec_concept(cik: str, taxonomy: str, concept: str) -> list[dict]:
+    url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/{taxonomy}/{concept}.json"
+    try:
+        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        units = r.json().get("units", {})
+        return units.get("shares") or []
+    except (requests.RequestException, ValueError):
+        return []
+
+
+def _sec_shares(cik: str) -> int | None:
+    """SEC 공시(XBRL)의 최신 발행주식수. 표지(dei) 값 → 희석 가중평균 주식수 순으로 시도."""
+    recent = (now_kst() - timedelta(days=500)).strftime("%Y-%m-%d")
+    vals = [v for v in _sec_concept(cik, "dei", "EntityCommonStockSharesOutstanding") if v.get("end", "") >= recent]
+    if vals:
+        latest = max(vals, key=lambda v: (v["end"], v.get("filed", "")))
+        return int(latest["val"])
+    for concept in ("WeightedAverageNumberOfDilutedSharesOutstanding", "CommonStockSharesOutstanding"):
+        vals = [v for v in _sec_concept(cik, "us-gaap", concept) if v.get("end", "") >= recent]
+        if vals:
+            # 같은 날짜면 기간이 짧은(분기) 값을 우선
+            latest = max(vals, key=lambda v: (v["end"], v.get("start") or "", v.get("filed", "")))
+            return int(latest["val"])
+    return None
+
+
 def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
-    """해외 종목 발행주식수(야후). (결과, 개수 정보)"""
+    """해외 종목 발행주식수. 미국 상장 종목은 SEC 공시에서, 그 밖의 시장은 아직 지원하지 않아요."""
     tickers = [t for t in tickers if not is_kr(t)]
+    us = [t for t in tickers if market_of(t)[0] == "US"]
+    diag = {"total": len(tickers), "SEC": 0, "미국 외": len(tickers) - len(us)}
     if MOCK:
-        return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}, {"total": len(tickers), "야후": len(tickers)}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        result = {t: n for t, n in zip(tickers, pool.map(_yahoo_shares, tickers)) if n}
-    return result, {"total": len(tickers), "야후": len(result)}
+        return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}, {**diag, "SEC": len(us)}
+    try:
+        cik_map = _sec_ticker_map()
+    except (requests.RequestException, ValueError):
+        return {}, diag
+    targets = [(t, cik_map[t.upper()]) for t in us if t.upper() in cik_map]
+
+    def one(item):
+        t, cik = item
+        n = _sec_shares(cik)
+        return (t, n / ADR_RATIO.get(t, 1.0) if n else None)
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:  # SEC 요청 제한(초당 10회) 안쪽으로
+        for t, n in pool.map(one, targets):
+            if n:
+                result[t] = int(n)
+    diag["SEC"] = len(result)
+    return result, diag
 
 
 def fetch_fx() -> dict[str, float]:
@@ -528,6 +578,16 @@ def fetch_fx() -> dict[str, float]:
                     continue
         except ImportError:
             pass
+        missing = [c for c in FX_TICKERS if c not in rates]
+        if missing:
+            try:  # 야후가 막히면 공개 환율 API로 보충
+                j = requests.get("https://open.er-api.com/v6/latest/KRW", timeout=8).json()
+                for cur in missing:
+                    per_krw = (j.get("rates") or {}).get(cur)
+                    if per_krw:
+                        rates[cur] = 1.0 / float(per_krw)
+            except (requests.RequestException, ValueError):
+                pass
     rates["KRW"] = 1.0
     if "GBP" in rates:
         rates["GBp"] = rates["GBP"] / 100

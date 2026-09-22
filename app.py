@@ -464,8 +464,9 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
             kr, os_ = shares_store.get("kr", {}), shares_store.get("os", {})
             st.write(
                 f"시가총액 없는 종목 {cap_missing}개. 상장주식수 조회 결과: 국내 {sum(v for k, v in kr.items() if k != 'total')}"
-                f"/{kr.get('total', 0)} (순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 야후 {kr.get('야후', 0)}), "
-                f"해외 {os_.get('야후', 0)}/{os_.get('total', 0)}. 실패했다면 10분 뒤 자동으로 다시 시도해요."
+                f"/{kr.get('total', 0)} (순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 모바일 {kr.get('모바일', 0)}), "
+                f"해외 SEC {os_.get('SEC', 0)}/{os_.get('total', 0) - os_.get('미국 외', 0)}. "
+                f"미국 외 해외 종목 {os_.get('미국 외', 0)}개는 아직 시가총액을 지원하지 않아요. 실패했다면 10분 뒤 다시 시도해요."
             )
         if quote_error:
             st.write(f"실시간 시세: {quote_error}. 일봉 마지막 값으로 대신 보여주고 있어요.")
