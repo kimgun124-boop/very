@@ -10,17 +10,25 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+import importlib
+import time
+
 import data
 import stocks as stock_list
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
-# 파일 일부만 새 버전으로 올렸을 때 알아보기 쉽게 안내하고 멈춥니다.
-_missing = [name for name in ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
-                              "fetch_kr_shares", "fetch_fx")
-            if not hasattr(data, name)]
+REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
+            "fetch_kr_shares", "fetch_fx", "format_krw")
+if any(not hasattr(data, n) for n in REQUIRED):
+    # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
+    data = importlib.reload(data)
+    stock_list = importlib.reload(stock_list)
+_missing = [n for n in REQUIRED if not hasattr(data, n)]
 if _missing:
-    st.error("data.py가 예전 버전이에요. GitHub에 app.py, data.py, stocks.py 세 파일을 같은 날 받은 것으로 함께 올려 주세요.")
+    st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
+             "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
+             f"(없는 기능: {', '.join(_missing)})")
     st.stop()
 
 STOCKS = stock_list.STOCKS
@@ -138,9 +146,23 @@ def load_histories_overseas(codes: tuple[str, ...]):
     return data.fetch_histories(codes, workers=4)
 
 
-@st.cache_data(ttl=43200, show_spinner="시가총액 계산용 상장주식수를 불러오는 중이에요. 하루 한 번만 받아요.")
-def load_shares(kr_codes: tuple[str, ...], os_codes: tuple[str, ...]):
-    return {**data.fetch_kr_shares(kr_codes), **data.fetch_overseas_shares(os_codes)}
+@st.cache_resource
+def _shares_store():
+    return {"t": 0.0, "ok": False, "data": {}, "kr": {}, "os": {}}
+
+
+def load_shares() -> dict:
+    """상장주식수: 잘 받아지면 12시간, 실패하면 10분 뒤에 다시 시도해요."""
+    store = _shares_store()
+    age = time.time() - store["t"]
+    if age < (43200 if store["ok"] else 600):
+        return store
+    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요. 하루 한 번만 받아요."):
+        kr, kr_diag = data.fetch_kr_shares(KR_CODES)
+        os_, os_diag = data.fetch_overseas_shares(OS_CODES)
+    store.update(t=time.time(), data={**kr, **os_}, kr=kr_diag, os=os_diag,
+                 ok=len(kr) >= 0.8 * max(1, len(KR_CODES)))
+    return store
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -206,7 +228,7 @@ with st.sidebar:
     if st.button("일봉까지 다시 받기", help="52주 최고가가 이상해 보일 때 눌러요."):
         load_histories.clear()
         load_histories_overseas.clear()
-        load_shares.clear()
+        _shares_store().update(t=0.0, ok=False)
         load_quotes.clear()
 
 
@@ -431,12 +453,20 @@ def render_detail(f: pd.DataFrame, histories: dict):
         st.link_button("야후 파이낸스에서 보기", row.url)
 
 
-def render_checks(df: pd.DataFrame, quote_error: str | None):
+def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
-    if failed.empty and mismatch.empty and not quote_error:
+    cap_missing = int(df["cap_krw"].isna().sum())
+    if failed.empty and mismatch.empty and not quote_error and cap_missing == 0:
         return
-    with st.expander(f"데이터 점검 필요 {len(failed) + len(mismatch)}건"):
+    with st.expander(f"데이터 점검 필요 {len(failed) + len(mismatch) + (1 if cap_missing else 0)}건"):
+        if cap_missing and shares_store:
+            kr, os_ = shares_store.get("kr", {}), shares_store.get("os", {})
+            st.write(
+                f"시가총액 없는 종목 {cap_missing}개. 상장주식수 조회 결과: 국내 {sum(v for k, v in kr.items() if k != 'total')}"
+                f"/{kr.get('total', 0)} (순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 야후 {kr.get('야후', 0)}), "
+                f"해외 {os_.get('야후', 0)}/{os_.get('total', 0)}. 실패했다면 10분 뒤 자동으로 다시 시도해요."
+            )
         if quote_error:
             st.write(f"실시간 시세: {quote_error}. 일봉 마지막 값으로 대신 보여주고 있어요.")
         for r in failed.itertuples():
@@ -449,7 +479,10 @@ def render_checks(df: pd.DataFrame, quote_error: str | None):
 def render_board():
     histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
     quotes, quote_error = load_quotes(KR_CODES)
-    df = data.build_table(STOCKS, histories, quotes, load_shares(KR_CODES, OS_CODES), load_fx())
+    shares_store = load_shares()
+    df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx())
+    df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
+    df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 
     interval = REFRESH[refresh_label]
     refresh_text = f"{refresh_label}마다 새로 불러와요." if interval else "자동 새로고침은 꺼져 있어요."
@@ -486,7 +519,7 @@ def render_board():
         with st.container(key="mobile_view"):
             render_cards(f, n_hot, n_near, n_aligned)
         render_detail(f, histories)
-    render_checks(df, quote_error)
+    render_checks(df, quote_error, shares_store)
 
 
 st.title("밸류체인 신고가 보드")

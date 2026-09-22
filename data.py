@@ -395,24 +395,27 @@ def _strip_tags(html_text: str) -> str:
 
 def parse_market_sum(text: str) -> tuple[dict[str, int], int]:
     """네이버 시가총액 순위 페이지 → ({코드: 상장주식수}, 마지막 페이지 번호)."""
+    last = re.search(r'class="pgRR".*?page=(\d+)', text, re.S)
+    last_page = int(last.group(1)) if last else 1
+    table = re.search(r'<table[^>]*class="type_2"[^>]*>(.*?)</table>', text, re.S)
+    if table:
+        text = table.group(1)
     header = [_strip_tags(h) for h in re.findall(r"<th[^>]*>(.*?)</th>", text, re.S)]
-    try:
-        idx = header.index("상장주식수")
-    except ValueError:
-        return {}, 1
+    idx = next((i for i, h in enumerate(header) if "상장주식수" in h), None)
+    if idx is None:
+        return {}, last_page
     out: dict[str, int] = {}
     for row in re.split(r"<tr[\s>]", text):
         m = re.search(r"code=(\d{6})", row)
         if not m:
             continue
         tds = [_strip_tags(t) for t in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
-        if len(tds) < len(header):
+        if len(tds) <= idx:
             continue
         shares = to_num(tds[idx])
         if shares:
             out[m.group(1)] = int(shares * 1000)  # 표 단위: 천주
-    last = re.search(r'class="pgRR".*?page=(\d+)', text, re.S)
-    return out, int(last.group(1)) if last else 1
+    return out, last_page
 
 
 def _market_sum_page(sosok: int, page: int) -> tuple[dict[str, int], int]:
@@ -429,17 +432,47 @@ def _shares_from_item_page(code: str) -> int | None:
     try:
         r = session.get(ITEM_MAIN_URL, params={"code": code}, timeout=8)
         r.raise_for_status()
-        m = re.search(r"상장주식수</th>\s*<td[^>]*>\s*<em>([\d,]+)</em>", decode(r.content))
+        m = re.search(r"상장주식수[\s\S]{0,300}?<em[^>]*>\s*([\d,]{4,})\s*</em>", decode(r.content))
         return int(m.group(1).replace(",", "")) if m else None
     except requests.RequestException:
         return None
 
 
-def fetch_kr_shares(codes) -> dict[str, int]:
-    """국내 상장주식수. 코스피·코스닥 시가총액 순위 페이지를 한 번에 훑고, 빠진 종목만 개별 조회."""
+def _yahoo_shares(ticker: str) -> int | None:
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+    tk = yf.Ticker(ticker)
+    try:
+        fi = tk.fast_info
+        n = getattr(fi, "shares", None)
+        if n:
+            return int(n)
+    except Exception:
+        pass
+    try:
+        n = (tk.info or {}).get("sharesOutstanding")
+        return int(n) if n else None
+    except Exception:
+        return None
+
+
+def _yahoo_kr_shares(code: str) -> int | None:
+    for suffix in (".KS", ".KQ"):
+        n = _yahoo_shares(code + suffix)
+        if n:
+            return n
+    return None
+
+
+def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
+    """국내 상장주식수: ① 네이버 시가총액 순위표 ② 종목 페이지 ③ 야후 순서로 채웁니다.
+    (결과, 출처별 개수) 를 돌려줘요."""
     codes = [c for c in codes if is_kr(c)]
+    diag = {"total": len(codes), "순위표": 0, "종목페이지": 0, "야후": 0}
     if MOCK:
-        return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}
+        return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}, {**diag, "순위표": len(codes)}
     shares: dict[str, int] = {}
     jobs = []
     for sosok in (0, 1):  # 0: 코스피, 1: 코스닥
@@ -449,37 +482,33 @@ def fetch_kr_shares(codes) -> dict[str, int]:
     with ThreadPoolExecutor(max_workers=8) as pool:
         for part, _ in pool.map(lambda job: _market_sum_page(*job), jobs):
             shares.update(part)
-    missing = [c for c in codes if c not in shares]
+    result = {c: shares[c] for c in codes if c in shares}
+    diag["순위표"] = len(result)
+    missing = [c for c in codes if c not in result]
     if missing:
         with ThreadPoolExecutor(max_workers=6) as pool:
             for code, n in zip(missing, pool.map(_shares_from_item_page, missing)):
                 if n:
-                    shares[code] = n
-    return {c: shares[c] for c in codes if c in shares}
+                    result[code] = n
+                    diag["종목페이지"] += 1
+    missing = [c for c in codes if c not in result]
+    if missing:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for code, n in zip(missing, pool.map(_yahoo_kr_shares, missing)):
+                if n:
+                    result[code] = n
+                    diag["야후"] += 1
+    return result, diag
 
 
-def fetch_overseas_shares(tickers) -> dict[str, int]:
-    """해외 종목 발행주식수(야후)."""
+def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
+    """해외 종목 발행주식수(야후). (결과, 개수 정보)"""
     tickers = [t for t in tickers if not is_kr(t)]
     if MOCK:
-        return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {}
-
-    def one(t):
-        try:
-            fi = yf.Ticker(t).fast_info
-            n = getattr(fi, "shares", None)
-            if not n:
-                n = fi["shares"]
-            return int(n) if n else None
-        except Exception:
-            return None
-
+        return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}, {"total": len(tickers), "야후": len(tickers)}
     with ThreadPoolExecutor(max_workers=4) as pool:
-        return {t: n for t, n in zip(tickers, pool.map(one, tickers)) if n}
+        result = {t: n for t, n in zip(tickers, pool.map(_yahoo_shares, tickers)) if n}
+    return result, {"total": len(tickers), "야후": len(result)}
 
 
 def fetch_fx() -> dict[str, float]:
