@@ -36,10 +36,46 @@ st.markdown(
         padding: 0.6rem 0.8rem; min-width: 11rem; max-width: 22rem; }
 .chip-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.8rem; }
 .chip-group { color: #FFFFFF; font-weight: 700; font-size: 0.95rem; }
-.chip-count { color: #F2B134; font-weight: 800; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.chip-count { white-space: nowrap; flex-shrink: 0; color: #F2B134; font-weight: 800; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
 .chip-count small { font-size: 0.72rem; font-weight: 600; margin-left: 0.1rem; }
 .chip-names { color: #B9C7CF; font-size: 0.8rem; line-height: 1.45; margin-top: 0.2rem; }
 .radar-empty { color: #9FB0BA; font-size: 0.9rem; }
+.st-key-mobile_view { display: none; }
+.m-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; margin: 0 0 0.8rem; }
+.m-kpis div { background: #E7EDEF; border-radius: 10px; padding: 0.5rem 0.3rem; text-align: center; }
+.m-kpis span { display: block; font-size: 0.68rem; color: #51616C; line-height: 1.25; }
+.m-kpis b { font-size: 1.15rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
+.cards { display: flex; flex-direction: column; gap: 0.5rem; }
+.stApp a.card { display: block; background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px;
+  padding: 0.7rem 0.85rem; text-decoration: none; color: #16212B; }
+.stApp a.card.hot { background: #FFF6DA; border-color: #EFD48A; }
+.c-top, .c-mid, .c-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; }
+.c-name, .c-price { font-weight: 700; font-size: 1.02rem; }
+.c-price, .c-chg, .c-meta { font-variant-numeric: tabular-nums; }
+.c-mid { font-size: 0.78rem; color: #51616C; margin-top: 0.1rem; }
+.c-chg { font-weight: 700; }
+.c-bar { height: 5px; background: #E3E9EC; border-radius: 3px; margin: 0.5rem 0 0.35rem; overflow: hidden; }
+.c-bar i { display: block; height: 100%; background: #2E6B6F; border-radius: 3px; }
+.c-meta { font-size: 0.78rem; color: #51616C; }
+.c-meta b { color: #16212B; }
+.c-desc { font-size: 0.76rem; color: #6B7A84; margin-top: 0.3rem; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.c-tag { display: inline-block; font-size: 0.66rem; font-weight: 700; padding: 0.05rem 0.4rem;
+  border-radius: 6px; margin-left: 0.35rem; vertical-align: 2px; }
+.c-tag.new { background: #F2B134; color: #16212B; }
+.c-tag.al { background: #D9E8E6; color: #2E6B6F; }
+@media (max-width: 640px) {
+  .st-key-desk_kpis, .st-key-desk_table { display: none !important; }
+  .st-key-mobile_view { display: flex !important; }
+  .stApp h1 { font-size: 1.6rem !important; }
+  .radar { padding: 0.85rem 0.9rem; }
+  .chip { flex: 1 1 calc(50% - 0.3rem); max-width: none; min-width: 0; padding: 0.5rem 0.6rem; }
+  .chip-group { font-size: 0.85rem; }
+  .chip-count { font-size: 1.1rem; }
+  .chip-names { font-size: 0.72rem; }
+  [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
+  [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -173,6 +209,42 @@ def render_table(f: pd.DataFrame):
     )
 
 
+def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
+    """휴대폰 화면용: 표 대신 카드 목록. CSS가 좁은 화면에서만 보여줘요."""
+    kpis = (
+        f'<div class="m-kpis"><div><span>종목</span><b>{len(f)}</b></div>'
+        f'<div><span>최근 {recent_days}일 신고가</span><b>{n_hot}</b></div>'
+        f'<div><span>10% 이내</span><b>{n_near}</b></div>'
+        f'<div><span>정배열</span><b>{n_aligned}</b></div></div>'
+    )
+    cards = []
+    for r in f[f["price"].notna()].itertuples():
+        hot = pd.notna(r.days_since_high) and r.days_since_high <= recent_days
+        if pd.isna(r.change) or r.change == 0:
+            chg = '<span class="c-chg">-</span>' if pd.isna(r.change) else '<span class="c-chg">0.00%</span>'
+        else:
+            color = UP if r.change > 0 else DOWN
+            chg = f'<span class="c-chg" style="color:{color}">{r.change:+.2f}%</span>'
+        tags = ""
+        if hot:
+            tags += f'<span class="c-tag new">신고가 {int(r.days_since_high)}일</span>'
+        if r.aligned:
+            tags += '<span class="c-tag al">정배열</span>'
+        cards.append(
+            f'<a class="card{" hot" if hot else ""}" target="_blank" '
+            f'href="https://m.stock.naver.com/domestic/stock/{r.code}/total">'
+            f'<div class="c-top"><span class="c-name">{html.escape(r.name)}{tags}</span>'
+            f'<span class="c-price">{r.price:,.0f}</span></div>'
+            f'<div class="c-mid"><span>{html.escape(r.group)}</span>{chg}</div>'
+            f'<div class="c-bar"><i style="width:{max(2.0, min(100.0, r.pos)):.0f}%"></i></div>'
+            f'<div class="c-meta"><span>52주 최고 {r.high52:,.0f} ({r.gap:.1f}%)</span>'
+            f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
+            f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
+        )
+    st.markdown(kpis + '<div class="cards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+    st.caption("카드를 누르면 네이버 증권 종목 화면이 열려요.")
+
+
 def render_detail(f: pd.DataFrame, histories: dict):
     options = f[f["price"].notna()]
     if options.empty:
@@ -239,18 +311,26 @@ def render_board():
     render_radar(df)
     f = apply_filters(df)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("보고 있는 종목", f"{len(f)}개")
-    c2.metric(f"최근 {recent_days}거래일 신고가", f"{int((f['days_since_high'] <= recent_days).sum())}개")
-    c3.metric("신고가까지 10% 이내", f"{int((f['to_high'] <= 10).sum())}개")
-    c4.metric("정배열", f"{int((f['aligned'] == True).sum())}개")  # noqa: E712
+    n_hot = int((f["days_since_high"] <= recent_days).sum())
+    n_near = int((f["to_high"] <= 10).sum())
+    n_aligned = int((f["aligned"] == True).sum())  # noqa: E712
+
+    with st.container(key="desk_kpis"):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("보고 있는 종목", f"{len(f)}개")
+        c2.metric(f"최근 {recent_days}거래일 신고가", f"{n_hot}개")
+        c3.metric("신고가까지 10% 이내", f"{n_near}개")
+        c4.metric("정배열", f"{n_aligned}개")
 
     if f.empty:
         st.info("조건에 맞는 종목이 없어요. 왼쪽에서 산업이나 하락폭 조건을 넓혀 보세요.")
     else:
-        render_table(f)
-        st.caption("노란 줄은 설정한 기간 안에 52주 신고가를 쓴 종목이에요. 설명은 2023~24년 자료 기준 요약이라 "
-                   "최신 사업 현황과 다를 수 있어요.")
+        with st.container(key="desk_table"):
+            render_table(f)
+            st.caption("노란 줄은 설정한 기간 안에 52주 신고가를 쓴 종목이에요. 설명은 2023~24년 자료 기준 요약이라 "
+                       "최신 사업 현황과 다를 수 있어요.")
+        with st.container(key="mobile_view"):
+            render_cards(f, n_hot, n_near, n_aligned)
         render_detail(f, histories)
     render_checks(df, quote_error)
 
