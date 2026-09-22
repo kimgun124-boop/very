@@ -11,9 +11,24 @@ import pandas as pd
 import streamlit as st
 
 import data
-from stocks import GROUP_ORDER, SECTOR_ORDER, STOCKS, TAGS
+import stocks as stock_list
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
+
+# 파일 일부만 새 버전으로 올렸을 때 알아보기 쉽게 안내하고 멈춥니다.
+_missing = [name for name in ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
+                              "fetch_kr_shares", "fetch_fx")
+            if not hasattr(data, name)]
+if _missing:
+    st.error("data.py가 예전 버전이에요. GitHub에 app.py, data.py, stocks.py 세 파일을 같은 날 받은 것으로 함께 올려 주세요.")
+    st.stop()
+
+STOCKS = stock_list.STOCKS
+GROUP_ORDER = stock_list.GROUP_ORDER
+SECTOR_ORDER = stock_list.SECTOR_ORDER
+TAGS = getattr(stock_list, "TAGS", {})
+for _s in STOCKS:
+    _s.setdefault("tags", [])
 
 UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
 NEW_HIGH_BG = "#FFF1C9"                # 신고가 행 강조
@@ -123,6 +138,16 @@ def load_histories_overseas(codes: tuple[str, ...]):
     return data.fetch_histories(codes, workers=4)
 
 
+@st.cache_data(ttl=43200, show_spinner="시가총액 계산용 상장주식수를 불러오는 중이에요. 하루 한 번만 받아요.")
+def load_shares(kr_codes: tuple[str, ...], os_codes: tuple[str, ...]):
+    return {**data.fetch_kr_shares(kr_codes), **data.fetch_overseas_shares(os_codes)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fx():
+    return data.fetch_fx()
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def load_indexes():
     return data.fetch_index_histories()
@@ -181,6 +206,7 @@ with st.sidebar:
     if st.button("일봉까지 다시 받기", help="52주 최고가가 이상해 보일 때 눌러요."):
         load_histories.clear()
         load_histories_overseas.clear()
+        load_shares.clear()
         load_quotes.clear()
 
 
@@ -270,6 +296,7 @@ def render_table(f: pd.DataFrame):
         "시장": f["market"],
         "분류": f["group"],
         "현재가": f["price"],
+        "시가총액": f["cap_krw"],
         "등락률": f["change"],
         "52주 최고": f["high52"],
         "괴리율": f["gap"],
@@ -296,6 +323,7 @@ def render_table(f: pd.DataFrame):
         .format({
             "현재가": "{:,.2f}", "52주 최고": "{:,.2f}",
             "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
+            "시가총액": data.format_krw,
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
         }, na_rep="-")
         .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, ["현재가", "52주 최고"]], na_rep="-")
@@ -314,6 +342,7 @@ def render_table(f: pd.DataFrame):
             "괴리율": st.column_config.Column(help="현재가가 52주 최고가보다 몇 % 낮은지"),
             "신고가까지": st.column_config.Column(help="52주 최고가를 넘으려면 필요한 상승률"),
             "신고가 후": st.column_config.Column(help="52주 최고가를 찍은 뒤 지난 거래일 수. 0이면 오늘"),
+            "시가총액": st.column_config.Column(help="상장주식수 × 현재가. 해외 종목은 원화로 환산. 머리글을 누르면 큰 순서로 정렬돼요."),
             "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
             "설명": st.column_config.TextColumn(width="large"),
         },
@@ -351,6 +380,7 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             f'<div class="c-bar"><i style="width:{max(2.0, min(100.0, r.pos)):.0f}%"></i></div>'
             f'<div class="c-meta"><span>52주 최고 {fmt_price(r.high52, r.currency)} ({r.gap:.1f}%)</span>'
             f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
+            f'<div class="c-meta" style="margin-top:0.15rem"><span>시가총액 <b>{data.format_krw(r.cap_krw)}</b></span></div>'
             f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
         )
     st.markdown(kpis + '<div class="cards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
@@ -376,6 +406,11 @@ def render_detail(f: pd.DataFrame, histories: dict):
               "오늘 신고가" if row.days_since_high == 0 else f"고점 후 {row.days_since_high:.0f}거래일",
               delta_color="off")
     c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
+    if pd.notna(row.cap_local):
+        cap_text = f"시가총액 {data.format_local_cap(row.cap_local, row.currency)}"
+        if row.currency != "KRW" and pd.notna(row.cap_krw):
+            cap_text += f" (약 {data.format_krw(row.cap_krw)}원)"
+        st.markdown(f"**{cap_text}**  \n상장주식수 {row.shares:,.0f}주")
     st.write(f"**{row['group']}**  \n{row.desc}")
     if row.tags:
         st.caption("리포트 태그: " + ", ".join(row.tags))
@@ -414,7 +449,7 @@ def render_checks(df: pd.DataFrame, quote_error: str | None):
 def render_board():
     histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
     quotes, quote_error = load_quotes(KR_CODES)
-    df = data.build_table(STOCKS, histories, quotes)
+    df = data.build_table(STOCKS, histories, quotes, load_shares(KR_CODES, OS_CODES), load_fx())
 
     interval = REFRESH[refresh_label]
     refresh_text = f"{refresh_label}마다 새로 불러와요." if interval else "자동 새로고침은 꺼져 있어요."

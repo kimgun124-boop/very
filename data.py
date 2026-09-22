@@ -3,6 +3,7 @@
 - 실시간 시세: polling.finance.naver.com (여러 종목을 한 번에 조회)
 - 일봉(약 1년치): fchart.stock.naver.com, 실패하면 api.finance.naver.com/siseJson
 - 해외 종목(코드가 6자리 숫자가 아닌 것): 야후 파이낸스(yfinance) 일봉, 15분 안팎 지연
+- 시가총액: 상장주식수(하루 한 번 조회) × 현재가로 실시간 계산. 해외는 환율로 원화 환산도 함께
 
 개인 참고용입니다. 네이버 응답 형식이 바뀌면 parse_* 함수만 고치면 됩니다.
 환경변수 STOCK_MOCK=1 로 실행하면 인터넷 없이 가짜 데이터로 화면을 확인할 수 있어요.
@@ -381,18 +382,169 @@ def name_matches(expected: str, naver_name: str | None) -> bool | None:
     return a in b or b in a
 
 
-def build_table(stocks: list[dict], histories: dict, quotes: dict) -> pd.DataFrame:
+# ─────────────────────────── 시가총액 ───────────────────────────
+MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
+ITEM_MAIN_URL = "https://finance.naver.com/item/main.naver"
+FX_TICKERS = {"USD": "USDKRW=X", "JPY": "JPYKRW=X", "EUR": "EURKRW=X", "AUD": "AUDKRW=X",
+              "GBP": "GBPKRW=X", "HKD": "HKDKRW=X", "TWD": "TWDKRW=X"}
+
+
+def _strip_tags(html_text: str) -> str:
+    return re.sub(r"<[^>]+>", "", html_text).replace("&nbsp;", " ").strip()
+
+
+def parse_market_sum(text: str) -> tuple[dict[str, int], int]:
+    """네이버 시가총액 순위 페이지 → ({코드: 상장주식수}, 마지막 페이지 번호)."""
+    header = [_strip_tags(h) for h in re.findall(r"<th[^>]*>(.*?)</th>", text, re.S)]
+    try:
+        idx = header.index("상장주식수")
+    except ValueError:
+        return {}, 1
+    out: dict[str, int] = {}
+    for row in re.split(r"<tr[\s>]", text):
+        m = re.search(r"code=(\d{6})", row)
+        if not m:
+            continue
+        tds = [_strip_tags(t) for t in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+        if len(tds) < len(header):
+            continue
+        shares = to_num(tds[idx])
+        if shares:
+            out[m.group(1)] = int(shares * 1000)  # 표 단위: 천주
+    last = re.search(r'class="pgRR".*?page=(\d+)', text, re.S)
+    return out, int(last.group(1)) if last else 1
+
+
+def _market_sum_page(sosok: int, page: int) -> tuple[dict[str, int], int]:
+    try:
+        r = session.get(MARKET_SUM_URL, params={"sosok": sosok, "page": page}, timeout=8)
+        r.raise_for_status()
+        return parse_market_sum(decode(r.content))
+    except requests.RequestException:
+        return {}, 1
+
+
+def _shares_from_item_page(code: str) -> int | None:
+    """종목 메인 페이지의 '상장주식수' (순위 페이지에 없을 때만 사용)."""
+    try:
+        r = session.get(ITEM_MAIN_URL, params={"code": code}, timeout=8)
+        r.raise_for_status()
+        m = re.search(r"상장주식수</th>\s*<td[^>]*>\s*<em>([\d,]+)</em>", decode(r.content))
+        return int(m.group(1).replace(",", "")) if m else None
+    except requests.RequestException:
+        return None
+
+
+def fetch_kr_shares(codes) -> dict[str, int]:
+    """국내 상장주식수. 코스피·코스닥 시가총액 순위 페이지를 한 번에 훑고, 빠진 종목만 개별 조회."""
+    codes = [c for c in codes if is_kr(c)]
+    if MOCK:
+        return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}
+    shares: dict[str, int] = {}
+    jobs = []
+    for sosok in (0, 1):  # 0: 코스피, 1: 코스닥
+        first, last = _market_sum_page(sosok, 1)
+        shares.update(first)
+        jobs += [(sosok, p) for p in range(2, last + 1)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for part, _ in pool.map(lambda job: _market_sum_page(*job), jobs):
+            shares.update(part)
+    missing = [c for c in codes if c not in shares]
+    if missing:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for code, n in zip(missing, pool.map(_shares_from_item_page, missing)):
+                if n:
+                    shares[code] = n
+    return {c: shares[c] for c in codes if c in shares}
+
+
+def fetch_overseas_shares(tickers) -> dict[str, int]:
+    """해외 종목 발행주식수(야후)."""
+    tickers = [t for t in tickers if not is_kr(t)]
+    if MOCK:
+        return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+
+    def one(t):
+        try:
+            fi = yf.Ticker(t).fast_info
+            n = getattr(fi, "shares", None)
+            if not n:
+                n = fi["shares"]
+            return int(n) if n else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return {t: n for t, n in zip(tickers, pool.map(one, tickers)) if n}
+
+
+def fetch_fx() -> dict[str, float]:
+    """통화별 원화 환율. GBp(펜스)는 파운드의 1/100."""
+    if MOCK:
+        rates = {"USD": 1380.0, "JPY": 9.3, "EUR": 1500.0, "AUD": 900.0, "GBP": 1750.0, "HKD": 177.0, "TWD": 43.0}
+    else:
+        rates = {}
+        try:
+            import yfinance as yf
+            for cur, t in FX_TICKERS.items():
+                try:
+                    h = yf.Ticker(t).history(period="5d")
+                    if not h.empty:
+                        rates[cur] = float(h["Close"].dropna().iloc[-1])
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+    rates["KRW"] = 1.0
+    if "GBP" in rates:
+        rates["GBp"] = rates["GBP"] / 100
+    return rates
+
+
+def format_krw(won: float | None) -> str:
+    """원 단위 금액 → '1,569.7조' / '8,718억'."""
+    if won is None or pd.isna(won):
+        return "-"
+    eok = won / 1e8
+    return f"{eok / 1e4:,.1f}조" if eok >= 1e4 else f"{eok:,.0f}억"
+
+
+def format_local_cap(value: float | None, currency: str) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    if currency == "KRW":
+        return format_krw(value)
+    if currency == "GBp":
+        value, currency = value / 100, "GBP"
+    for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if value >= div:
+            return f"{value / div:,.2f}{unit} {currency}"
+    return f"{value:,.0f} {currency}"
+
+
+def build_table(stocks: list[dict], histories: dict, quotes: dict,
+                shares: dict | None = None, fx: dict | None = None) -> pd.DataFrame:
     rows = []
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
         metrics = compute_metrics(hist, quotes.get(s["code"]))
         market, currency = market_of(s["code"])
+        n_shares = (shares or {}).get(s["code"])
+        cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
+        rate = (fx or {}).get(currency)
         rows.append({
             **s,
             **metrics,
             "market": market,
             "currency": currency,
             "url": quote_url(s["code"]),
+            "shares": n_shares,
+            "cap_local": cap_local,
+            "cap_krw": cap_local * rate if (cap_local and rate) else None,
             "naver_name": naver_name,
             "name_ok": name_matches(s["name"], naver_name),
             "error": error if metrics["price"] is None else None,
