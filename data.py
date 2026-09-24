@@ -4,6 +4,9 @@
 - 일봉(약 1년치): fchart.stock.naver.com, 실패하면 api.finance.naver.com/siseJson
 - 해외 종목(코드가 6자리 숫자가 아닌 것): 야후 파이낸스(yfinance) 일봉, 15분 안팎 지연
 - 시가총액: 상장주식수(하루 한 번 조회) × 현재가로 실시간 계산. 해외는 환율로 원화 환산도 함께
+- 코스피·코스닥 요약(지수·상승/보합/하락 종목 수·투자자별 순매수): stock.naver.com 지수 API
+- 투자자별 매매동향: 시장 전체는 기관 세부(연기금·투신 등)까지, 종목별은 개인·외국인·기관
+  (2026년 9월 네이버 PC 금융 페이지 개편으로 예전 HTML 페이지 대신 JSON API를 씁니다)
 
 개인 참고용입니다. 네이버 응답 형식이 바뀌면 parse_* 함수만 고치면 됩니다.
 환경변수 STOCK_MOCK=1 로 실행하면 인터넷 없이 가짜 데이터로 화면을 확인할 수 있어요.
@@ -88,14 +91,18 @@ def chunks(items, size):
         yield items[i : i + size]
 
 
+_KR_CODE = re.compile(r"\d[0-9A-Z]{5}")
+
+
 def is_kr(code: str) -> bool:
-    """6자리 숫자면 국내 종목, 그 외(NVDA, 6857.T 등)는 해외 종목."""
-    return len(code) == 6 and code.isdigit()
+    """6자리 국내 코드(005930, 새 형식 0009K0 포함)면 국내, 그 외(NVDA, 6857.T 등)는 해외."""
+    return bool(code) and bool(_KR_CODE.fullmatch(code))
 
 
 _SUFFIX_MARKET = {".T": ("JP", "JPY"), ".PA": ("FR", "EUR"), ".AS": ("NL", "EUR"),
                   ".DE": ("DE", "EUR"), ".AX": ("AU", "AUD"), ".HK": ("HK", "HKD"), ".TW": ("TW", "TWD"),
-                  ".HE": ("FI", "EUR"), ".L": ("GB", "GBp")}
+                  ".HE": ("FI", "EUR"), ".L": ("GB", "GBp"), ".SZ": ("CN", "CNY"), ".SS": ("CN", "CNY"),
+                  ".SW": ("CH", "CHF")}
 
 
 def market_of(code: str) -> tuple[str, str]:
@@ -400,7 +407,7 @@ def name_matches(expected: str, naver_name: str | None) -> bool | None:
 MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
 ITEM_MAIN_URL = "https://finance.naver.com/item/main.naver"
 FX_TICKERS = {"USD": "USDKRW=X", "JPY": "JPYKRW=X", "EUR": "EURKRW=X", "AUD": "AUDKRW=X",
-              "GBP": "GBPKRW=X", "HKD": "HKDKRW=X", "TWD": "TWDKRW=X"}
+              "GBP": "GBPKRW=X", "HKD": "HKDKRW=X", "TWD": "TWDKRW=X", "CNY": "CNYKRW=X", "CHF": "CHFKRW=X"}
 
 
 def _strip_tags(html_text: str) -> str:
@@ -578,7 +585,8 @@ def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
 def fetch_fx() -> dict[str, float]:
     """통화별 원화 환율. GBp(펜스)는 파운드의 1/100."""
     if MOCK:
-        rates = {"USD": 1380.0, "JPY": 9.3, "EUR": 1500.0, "AUD": 900.0, "GBP": 1750.0, "HKD": 177.0, "TWD": 43.0}
+        rates = {"USD": 1380.0, "JPY": 9.3, "EUR": 1500.0, "AUD": 900.0, "GBP": 1750.0, "HKD": 177.0, "TWD": 43.0,
+                 "CNY": 190.0, "CHF": 1560.0}
     else:
         rates = {}
         try:
@@ -629,14 +637,183 @@ def format_local_cap(value: float | None, currency: str) -> str:
     return f"{value:,.0f} {currency}"
 
 
-# ─────────────────────────── 투자자별 매매동향 ───────────────────────────
-INVESTOR_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"
+# ─────────────────────────── 네이버 새 JSON API ───────────────────────────
+STOCK_API = "https://stock.naver.com/api"
+M_API = "https://m.stock.naver.com/api"
+INDEX_POLLING_URL = "https://polling.finance.naver.com/api/realtime/domestic/index"
+AUTOCOMPLETE_M_URL = "https://m.stock.naver.com/front-api/search/autoComplete"
+JSON_HEADERS = {"Accept": "application/json", "Referer": "https://stock.naver.com/"}
+
+
+def _get_json(urls, params=None, timeout: int = 8):
+    """주소 여러 개를 차례로 시도해 처음 성공한 JSON을 돌려줘요. 모두 실패하면 None."""
+    for url in urls:
+        try:
+            r = session.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            return r.json()
+        except (requests.RequestException, ValueError):
+            continue
+    return None
+
+
+def _num(v) -> float | None:
+    """'+2,746,972' / '-4,822' / '1,234억' 같은 네이버 문자열 숫자 → float."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.search(r"[+-]?[\d,]*\.?\d+", str(v))
+    return to_num(m.group(0)) if m else None
+
+
+# ─────────────────────────── 코스피·코스닥 요약 ───────────────────────────
+MARKETS = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
+
+
+def parse_index_overview(basic: dict | None, integ: dict | None, polling: dict | None = None) -> dict:
+    """지수 basic·integration(·polling) 응답 → 화면용 요약."""
+    basic = basic or {}
+    integ = integ or {}
+    pol = ((polling or {}).get("datas") or [{}])[0] if polling else {}
+    last = _num(basic.get("closePrice")) or _num(pol.get("closePrice"))
+    diff = _num(basic.get("compareToPreviousClosePrice"))
+    if diff is None:
+        diff = _num(pol.get("compareToPreviousClosePrice"))
+    rate = _num(basic.get("fluctuationsRatio"))
+    if rate is None:
+        rate = _num(pol.get("fluctuationsRatio"))
+    direction = ((basic.get("compareToPreviousPrice") or pol.get("compareToPreviousPrice") or {}).get("name") or "")
+    if diff is not None and direction == "FALLING" and diff > 0:  # 부호 없이 오는 경우
+        diff, rate = -diff, -abs(rate or 0)
+    ud = integ.get("upDownStockInfo") or {}
+    breadth = {k: _num(ud.get(f)) for k, f in (("상한", "upperCount"), ("상승", "riseCount"), ("보합", "steadyCount"),
+                                                ("하락", "fallCount"), ("하한", "lowerCount"))}
+    if all(v is None for v in breadth.values()):
+        breadth = None
+    dt = integ.get("dealTrendInfo") or {}
+    deal = {"개인": _num(dt.get("personalValue")), "외국인": _num(dt.get("foreignValue")),
+            "기관": _num(dt.get("institutionalValue")), "bizdate": dt.get("bizdate")}
+    if all(deal[k] is None for k in INVESTORS):
+        deal = None
+    elif max(abs(deal[k] or 0) for k in INVESTORS) > 5e6:  # 백만원 단위로 오면 억원으로
+        deal.update({k: (deal[k] / 100 if deal[k] is not None else None) for k in INVESTORS})
+    pt = integ.get("programTrendInfo") or {}
+    program = _num(pt.get("indexTotalReal"))
+    status = basic.get("marketStatus") or pol.get("marketStatus")
+    return {"last": last, "diff": diff, "rate": rate, "time": basic.get("localTradedAt") or pol.get("localTradedAt"),
+            "breadth": breadth, "deal": deal, "program": program, "status": status}
+
+
+def fetch_market_overview() -> dict[str, dict]:
+    """{'코스피': {...}, '코스닥': {...}} — 지수, 전일대비, 등락률, 상승·보합·하락 종목 수, 투자자별 순매수(억원)."""
+    if MOCK:
+        out = {}
+        for name, code in MARKETS.items():
+            rng = _rng(code + now_kst().strftime("%Y%m%d%H"))
+            last = 7080.92 if code == "KOSPI" else 844.48
+            diff = round(last * rng.uniform(-0.015, 0.015), 2)
+            total = 930 if code == "KOSPI" else 1770
+            rise = rng.randint(int(total * 0.25), int(total * 0.6))
+            steady = rng.randint(40, 90)
+            f, i = rng.randint(-8000, 8000), rng.randint(-6000, 6000)
+            out[name] = {"last": last, "diff": diff, "rate": diff / (last - diff) * 100, "time": now_kst().isoformat(),
+                         "breadth": {"상한": rng.randint(0, 5), "상승": rise, "보합": steady,
+                                     "하락": total - rise - steady, "하한": rng.randint(0, 2)},
+                         "deal": {"개인": -(f + i) + rng.randint(-500, 500), "외국인": f, "기관": i,
+                                  "bizdate": now_kst().strftime("%Y%m%d")},
+                         "program": rng.randint(-3000, 3000), "status": "OPEN"}
+        return out
+
+    def one(item):
+        name, code = item
+        basic = _get_json([f"{STOCK_API}/securityFe/api/index/{code}/basic", f"{M_API}/index/{code}/basic"])
+        integ = _get_json([f"{STOCK_API}/securityFe/api/index/{code}/integration", f"{M_API}/index/{code}/integration"])
+        polling = None
+        if not basic or basic.get("closePrice") is None:
+            polling = _get_json([f"{INDEX_POLLING_URL}/{code}"])
+        return name, parse_index_overview(basic, integ, polling)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return dict(pool.map(one, MARKETS.items()))
+
+
+def market_mood(overview: dict) -> tuple[str, float] | None:
+    """코스피+코스닥 상승 종목 비율로 매긴 '오늘의 시장' 분위기. (문구, 0~1)"""
+    up = down = 0.0
+    for sm in overview.values():
+        b = (sm or {}).get("breadth") or {}
+        up += (b.get("상승") or 0) + (b.get("상한") or 0)
+        down += (b.get("하락") or 0) + (b.get("하한") or 0)
+    if up + down == 0:
+        return None
+    ratio = up / (up + down)
+    for cut, label in ((0.3, "안 좋아요"), (0.43, "조금 안 좋아요"), (0.57, "보통이에요"), (0.7, "좋아요")):
+        if ratio < cut:
+            return label, ratio
+    return "아주 좋아요", ratio
+
+
+# ─────────────────────────── 투자자별 매매동향(시장 전체) ───────────────────────────
+INVESTOR_URL = "https://finance.naver.com/sise/investorDealTrendDay.naver"   # 예전 페이지(대비용)
 INVESTOR_MARKETS = {"코스피": "01", "코스닥": "02"}
 INVESTORS = ["개인", "외국인", "기관"]
+INST_DETAIL = ["금융투자", "보험", "투신(사모)", "은행", "기타금융", "연기금", "기타법인"]
+_GUBUN = {"1000": "금융투자", "2000": "보험", "3000": "투신(사모)", "3100": "투신(사모)", "4000": "은행",
+          "5000": "기타금융", "6000": "연기금", "7000": "기타법인", "7100": "기타법인",
+          "8000": "개인", "9000": "외국인", "9001": "외국인"}
+
+
+def parse_market_trend(payload) -> pd.DataFrame:
+    """stock.naver.com 시장 투자자별 매매동향 → date, 개인, 외국인, 기관, 금융투자 … 기타법인 (원 단위 그대로)."""
+    content = (payload or {}).get("content") if isinstance(payload, dict) else payload
+    rows = []
+    for c in content or []:
+        bd = str(c.get("bizdate") or "")
+        if not re.fullmatch(r"\d{8}", bd):
+            continue
+        row = {"date": pd.Timestamp(int(bd[:4]), int(bd[4:6]), int(bd[6:]))}
+        for k in ["개인", "외국인"] + INST_DETAIL:
+            row[k] = 0.0
+        seen = False
+        for a in c.get("netAmounts") or []:
+            key = _GUBUN.get(str(a.get("investorGubun")))
+            v = _num(a.get("diffValue"))
+            if key and v is not None:
+                row[key] += v
+                seen = True
+        if seen:
+            row["기관"] = sum(row[k] for k in INST_DETAIL if k != "기타법인")
+            rows.append(row)
+    cols = ["date"] + INVESTORS + INST_DETAIL
+    return pd.DataFrame(rows, columns=cols).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+
+def _scale_to_eok(df: pd.DataFrame, ref: dict | None) -> pd.DataFrame:
+    """API 금액 단위를 억원으로 맞춰요. 지수 요약의 당일 순매수(억원)가 있으면 그걸로 단위를 맞추고,
+    없으면 크기로 짐작해요(원 → ÷1억, 백만원 → ÷100)."""
+    if df.empty:
+        return df
+    cols = INVESTORS + INST_DETAIL
+    div = None
+    if ref and ref.get("bizdate"):
+        hit = df[df["date"] == pd.to_datetime(str(ref["bizdate"]), format="%Y%m%d", errors="coerce")]
+        if not hit.empty:
+            ratios = [abs(hit.iloc[0][k] / ref[k]) for k in INVESTORS if ref.get(k) and hit.iloc[0][k]]
+            if ratios:
+                r = sorted(ratios)[len(ratios) // 2]
+                div = min((1, 100, 1e8), key=lambda d: abs((r / d) - 1) if r else 9e9)
+    if div is None:
+        med = max(df[k].abs().median() for k in INVESTORS)
+        div = 1e8 if med > 1e9 else (100 if med > 5e4 else 1)
+    out = df.copy()
+    out[cols] = out[cols] / div
+    return out
 
 
 def parse_investor_trend(text: str) -> list[dict]:
-    """네이버 투자자별 매매동향(일별, 억원) → [{date, 개인, 외국인, 기관}, ...]"""
+    """(예전) 네이버 투자자별 매매동향 HTML(일별, 억원) → [{date, 개인, 외국인, 기관}, ...]"""
     header = [_strip_tags(h).replace(" ", "") for h in re.findall(r"<th[^>]*>(.*?)</th>", text, re.S)]
 
     def col(name, default):
@@ -662,31 +839,169 @@ def parse_investor_trend(text: str) -> list[dict]:
     return rows
 
 
-def fetch_investor_flows(pages: int = 2) -> dict[str, pd.DataFrame]:
-    """코스피·코스닥 일별 개인·외국인·기관 순매수(억원). 장중에는 잠정치예요."""
+def fetch_investor_flows(overview: dict | None = None) -> dict[str, pd.DataFrame]:
+    """코스피·코스닥 일별 투자자별 순매수(억원): 개인·외국인·기관 + 기관 세부(금융투자·투신·연기금 등)."""
+    cols = ["date"] + INVESTORS + INST_DETAIL
     out = {}
-    for market, sosok in INVESTOR_MARKETS.items():
+    for market, code in MARKETS.items():
         if MOCK:
             rng = _rng(market)
-            dates = pd.bdate_range(end=now_kst().date(), periods=20)
             rows = []
-            for dt in dates:
-                f, i = rng.randint(-8000, 8000), rng.randint(-5000, 5000)
-                rows.append({"date": dt, "개인": -(f + i) + rng.randint(-300, 300), "외국인": f, "기관": i})
-            out[market] = pd.DataFrame(rows)
+            for dt in pd.bdate_range(end=now_kst().date(), periods=20):
+                det = {k: float(rng.randint(-2500, 2500)) for k in INST_DETAIL}
+                inst = sum(v for k, v in det.items() if k != "기타법인")
+                f = float(rng.randint(-8000, 8000))
+                rows.append({"date": dt, "개인": -(f + inst + det["기타법인"]), "외국인": f, "기관": inst, **det})
+            out[market] = pd.DataFrame(rows, columns=cols)
             continue
-        rows = []
-        for page in range(1, pages + 1):
+        payload = _get_json([f"{STOCK_API}/domestic/market/trend/daily"],
+                            params={"tradeType": "KRX", "marketType": code, "bizdate": now_kst().strftime("%Y%m%d"),
+                                    "startIdx": 0, "pageSize": 30})
+        df = parse_market_trend(payload)
+        if not df.empty:
+            out[market] = _scale_to_eok(df, ((overview or {}).get(market) or {}).get("deal"))
+            continue
+        rows = []   # 새 API가 안 되면 예전 HTML 페이지로 한 번 더
+        for page in (1, 2):
             try:
                 r = session.get(INVESTOR_URL, params={"bizdate": now_kst().strftime("%Y%m%d"),
-                                                      "sosok": sosok, "page": page}, timeout=8)
+                                                      "sosok": INVESTOR_MARKETS[market], "page": page}, timeout=8)
                 r.raise_for_status()
                 rows += parse_investor_trend(decode(r.content))
             except requests.RequestException:
                 break
         df = pd.DataFrame(rows, columns=["date"] + INVESTORS)
-        out[market] = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+        for k in INST_DETAIL:
+            df[k] = float("nan")
+        out[market] = df[cols].drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return out
+
+
+# ─────────────────────────── 투자자별 매매동향(종목별) ───────────────────────────
+TREND_COLS = ["date", "close", "개인", "외국인", "기관", "외국인보유율", "개인금액", "외국인금액", "기관금액"]
+_trend_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+TREND_TTL = 600
+
+
+def parse_stock_trend(payload) -> pd.DataFrame:
+    """종목 trend 응답(배열) → date, close, 개인·외국인·기관 순매수 수량(주), 외국인보유율, 금액 추정(억원)."""
+    items = payload if isinstance(payload, list) else ((payload or {}).get("content") or (payload or {}).get("result") or [])
+    rows = []
+    for it in items or []:
+        bd = re.sub(r"\D", "", str(it.get("bizdate") or it.get("localTradedAt") or ""))[:8]
+        if len(bd) != 8:
+            continue
+        close = _num(it.get("closePrice"))
+        row = {"date": pd.Timestamp(int(bd[:4]), int(bd[4:6]), int(bd[6:])), "close": close,
+               "개인": _num(it.get("individualPureBuyQuant")), "외국인": _num(it.get("foreignerPureBuyQuant")),
+               "기관": _num(it.get("organPureBuyQuant")), "외국인보유율": _num(it.get("frgnHoldRatio") or it.get("foreignerHoldRatio"))}
+        if row["개인"] is None and row["외국인"] is not None and row["기관"] is not None:
+            row["개인"] = None  # 개인이 없는 응답도 있어요(기타법인 때문에 역산하지 않음)
+        for k in INVESTORS:
+            row[f"{k}금액"] = row[k] * close / 1e8 if (row[k] is not None and close) else None
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=TREND_COLS)
+    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+
+def mock_trend(code: str, days: int = 20) -> pd.DataFrame:
+    rng = _rng("trend" + code)
+    hist = mock_history(code).tail(days)
+    rows = []
+    hold = rng.uniform(2, 50)
+    for d, c in zip(hist["date"], hist["close"]):
+        f, i = rng.randint(-300_000, 300_000), rng.randint(-200_000, 200_000)
+        hold = max(0.1, hold + rng.uniform(-0.3, 0.3))
+        rows.append({"date": d, "close": c, "개인": -(f + i), "외국인": f, "기관": i, "외국인보유율": hold,
+                     "개인금액": -(f + i) * c / 1e8, "외국인금액": f * c / 1e8, "기관금액": i * c / 1e8})
+    return pd.DataFrame(rows, columns=TREND_COLS)
+
+
+def fetch_stock_trend(code: str, days: int = 20) -> pd.DataFrame:
+    """종목 하나의 최근 일별 개인·외국인·기관 순매수. 10분 동안 기억해요."""
+    import time as _time
+    hit = _trend_cache.get(code)
+    if hit and _time.time() - hit[0] < TREND_TTL:
+        return hit[1]
+    if MOCK:
+        df = mock_trend(code, days)
+    else:
+        payload = _get_json([f"{STOCK_API}/domestic/detail/{code}/trend", f"{M_API}/stock/{code}/trend"],
+                            params={"tradeType": "KRX", "startIdx": 0, "pageSize": days}, timeout=6)
+        df = parse_stock_trend(payload)
+    _trend_cache[code] = (_time.time(), df)
+    return df
+
+
+def fetch_stock_trends(codes, workers: int = 8) -> dict[str, pd.DataFrame]:
+    codes = [c for c in codes if is_kr(c)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(zip(codes, pool.map(fetch_stock_trend, codes)))
+
+
+def trend_summary(df: pd.DataFrame | None) -> dict:
+    """표에 넣을 값: 최근 거래일 순매수 금액(억원), 5일 누적, 외국인·기관 연속 순매수 일수."""
+    out = {"flow_date": None, **{f"flow_{k}": None for k in INVESTORS}, **{f"flow5_{k}": None for k in INVESTORS},
+           "streak_외국인": None, "streak_기관": None}
+    if df is None or df.empty:
+        return out
+    last = df.iloc[-1]
+    out["flow_date"] = last["date"]
+    for k in INVESTORS:
+        out[f"flow_{k}"] = last[f"{k}금액"]
+        s5 = df.tail(5)[f"{k}금액"].dropna()
+        out[f"flow5_{k}"] = float(s5.sum()) if not s5.empty else None
+    for k in ("외국인", "기관"):
+        n = 0
+        for v in reversed(df[k].tolist()):
+            if v is None or pd.isna(v) or v == 0:
+                break
+            if n == 0:
+                sign = v > 0
+            elif (v > 0) != sign:
+                break
+            n += 1
+        out[f"streak_{k}"] = (n if sign else -n) if n else 0
+    return out
+
+
+# ─────────────────────────── 이름으로 코드 찾기 ───────────────────────────
+def search_stock(name: str) -> list[tuple[str, str]]:
+    """네이버 검색 자동완성 → [(코드, 이름), ...] (국내 종목만)."""
+    found: list[tuple[str, str]] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            code, nm = node.get("code"), node.get("name")
+            if isinstance(code, str) and isinstance(nm, str) and is_kr(code) and (code, nm) not in found:
+                found.append((code, nm))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(_get_json([AUTOCOMPLETE_M_URL], params={"query": name, "target": "stock"}, timeout=6))
+    if not found:
+        walk(_get_json([AUTOCOMPLETE_URL], params={"q": name, "target": "stock"}, timeout=6))
+    return found
+
+
+def resolve_codes(names) -> tuple[dict[str, str], dict[str, list[tuple[str, str]]]]:
+    """이름이 똑같은(공백·괄호 무시) 국내 종목만 코드로 인정해요. (찾은 것, 못 찾은 것의 후보)"""
+    names = list(names)
+    if MOCK:
+        return {n: f"9{int(hashlib.md5(n.encode()).hexdigest()[:5], 16) % 100000:05d}" for n in names}, {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(search_stock, names))
+    ok, miss = {}, {}
+    for n, cands in zip(names, results):
+        exact = [c for c, nm in cands if normalize_name(nm) == normalize_name(n)]
+        if exact:
+            ok[n] = exact[0]
+        else:
+            miss[n] = cands[:3]
+    return ok, miss
 
 
 def build_table(stocks: list[dict], histories: dict, quotes: dict,

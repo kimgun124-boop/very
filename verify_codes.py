@@ -8,6 +8,11 @@ from __future__ import annotations
 import data
 from stocks import STOCKS
 
+try:
+    from stocks import PENDING
+except ImportError:
+    PENDING = []
+
 
 def find_candidates(name: str) -> list[tuple[str, str]]:
     try:
@@ -53,6 +58,14 @@ def main():
             print(f"    후보: {nm} {code}")
     if bad:
         print("\nstocks.py에서 해당 줄의 코드를 후보 코드로 바꾸면 돼요. 사명만 바뀐 경우는 그대로 둬도 괜찮아요.")
+
+    if PENDING:
+        found, miss = data.resolve_codes([r[2] for r in PENDING])
+        print(f"\n코드를 \"\"로 둔 종목 {len(PENDING)}개: 찾음 {len(found)}개 / 못 찾음 {len(miss)}개")
+        for name, code in found.items():
+            print(f"- {name}: {code}   (stocks.py의 \"\" 자리에 넣어 두면 앱이 검색하지 않아도 돼요)")
+        for name, cands in miss.items():
+            print(f"- {name}: 못 찾음" + ("".join(f"\n    후보: {nm} {c}" for c, nm in cands) if cands else ""))
 
 
 if __name__ == "__main__":
