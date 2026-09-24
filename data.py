@@ -464,7 +464,7 @@ SEC_HEADERS = {
     "User-Agent": os.environ.get("SEC_CONTACT", "ValueChainBoard personal-research contact@example.com"),
     "Accept-Encoding": "gzip, deflate",
 }
-ADR_RATIO = {"TSM": 5.0}  # 미국 ADR 1주 = 원주 N주. 시총 계산 시 원주 수를 ADR 수로 환산
+ADR_RATIO = {"TSM": 5.0, "NGG": 5.0, "LI": 2.0, "NTES": 5.0}  # 미국 ADR 1주 = 원주 N주. 원주 수를 ADR 수로 환산
 
 
 def parse_korean_amount(text: str | None) -> float | None:
@@ -491,24 +491,43 @@ def _naver_mobile_shares(code: str) -> int | None:
         return None
 
 
+def _detail_api_shares(code: str) -> int | None:
+    """stock.naver.com 종목 상세 API의 상장주식수(listedStockCnt). 2026년 9월 개편 뒤 가장 확실한 출처예요."""
+    info = _get_json([f"{STOCK_API}/domestic/detail/{code}/detail"], params={"codeType": "KRX"}, timeout=8)
+    if not isinstance(info, dict):
+        return None
+    n = _num(info.get("listedStockCnt"))
+    return int(n) if n and n > 0 else None
+
+
 def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
-    """국내 상장주식수: ① 네이버 시가총액 순위표 ② 종목 페이지 ③ 네이버 모바일 API 순서로 채웁니다.
+    """국내 상장주식수: ① 네이버 종목 상세 API ② 시가총액 순위표 ③ 종목 페이지 ④ 모바일 API 순서로 채워요.
     (결과, 출처별 개수) 를 돌려줘요."""
     codes = [c for c in codes if is_kr(c)]
-    diag = {"total": len(codes), "순위표": 0, "종목페이지": 0, "모바일": 0}
+    diag = {"total": len(codes), "상세API": 0, "순위표": 0, "종목페이지": 0, "모바일": 0}
     if MOCK:
         return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}, {**diag, "순위표": len(codes)}
-    shares: dict[str, int] = {}
-    jobs = []
-    for sosok in (0, 1):  # 0: 코스피, 1: 코스닥
-        first, last = _market_sum_page(sosok, 1)
-        shares.update(first)
-        jobs += [(sosok, p) for p in range(2, last + 1)]
+    result: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for part, _ in pool.map(lambda job: _market_sum_page(*job), jobs):
-            shares.update(part)
-    result = {c: shares[c] for c in codes if c in shares}
-    diag["순위표"] = len(result)
+        for code, n in zip(codes, pool.map(_detail_api_shares, codes)):
+            if n:
+                result[code] = n
+    diag["상세API"] = len(result)
+    missing = [c for c in codes if c not in result]
+    if len(missing) > 20:  # 순위표는 페이지를 많이 받아야 해서, 많이 비었을 때만
+        shares: dict[str, int] = {}
+        jobs = []
+        for sosok in (0, 1):  # 0: 코스피, 1: 코스닥
+            first, last = _market_sum_page(sosok, 1)
+            shares.update(first)
+            jobs += [(sosok, p) for p in range(2, last + 1)] if first else []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for part, _ in pool.map(lambda job: _market_sum_page(*job), jobs):
+                shares.update(part)
+        for c in missing:
+            if c in shares:
+                result[c] = shares[c]
+                diag["순위표"] += 1
     for label, fn in (("종목페이지", _shares_from_item_page), ("모바일", _naver_mobile_shares)):
         missing = [c for c in codes if c not in result]
         if not missing:
@@ -544,8 +563,10 @@ def _sec_shares(cik: str) -> int | None:
     recent = (now_kst() - timedelta(days=500)).strftime("%Y-%m-%d")
     vals = [v for v in _sec_concept(cik, "dei", "EntityCommonStockSharesOutstanding") if v.get("end", "") >= recent]
     if vals:
-        latest = max(vals, key=lambda v: (v["end"], v.get("filed", "")))
-        return int(latest["val"])
+        latest = max(vals, key=lambda v: (v.get("filed", ""), v["end"]))
+        # 같은 공시·같은 날짜에 주식 종류(Class A/B/C)별로 따로 적힌 경우 합쳐요
+        same = {v["val"] for v in vals if v.get("accn") == latest.get("accn") and v["end"] == latest["end"]}
+        return int(sum(same))
     for concept in ("WeightedAverageNumberOfDilutedSharesOutstanding", "CommonStockSharesOutstanding"):
         vals = [v for v in _sec_concept(cik, "us-gaap", concept) if v.get("end", "") >= recent]
         if vals:
@@ -555,17 +576,101 @@ def _sec_shares(cik: str) -> int | None:
     return None
 
 
+def _parse_amount(text) -> tuple[float | None, bool]:
+    """'4조 3,211억 USD' / '350.2B' / 12345 → (값, 원화 여부)."""
+    if text is None:
+        return None, False
+    if isinstance(text, (int, float)):
+        return float(text), False
+    t = str(text)
+    krw = "원" in t or "KRW" in t
+    if "조" in t or "억" in t:
+        return parse_korean_amount(t), krw
+    m = re.search(r"([\d,.]+)\s*([TBMK])\b", t, re.I)
+    if m:
+        mult = {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3}[m.group(2).upper()]
+        return (to_num(m.group(1)) or 0) * mult or None, krw
+    return _num(t), krw
+
+
+def _find_fields(node, found: dict):
+    """해외 기본정보 응답 안에서 상장주식수·시가총액·현재가를 찾아요(필드 위치가 바뀌어도 되도록)."""
+    if isinstance(node, dict):
+        code = str(node.get("code") or node.get("key") or "")
+        if code in ("marketValue", "marketCap", "시가총액", "시총") and "value" in node:
+            found.setdefault("cap", node.get("value"))
+        for k, v in node.items():
+            kl = k.lower()
+            if kl in ("countoflistedstock", "listedstockcnt", "listedshares", "sharesoutstanding"):
+                found.setdefault("shares", v)
+            elif kl in ("marketvalue", "marketcap", "marketsum") and not isinstance(v, (dict, list)):
+                found.setdefault("cap", v)
+            elif kl == "closeprice" and "price" not in found:
+                found["price"] = v
+            else:
+                _find_fields(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _find_fields(v, found)
+
+
+def _naver_codes(ticker: str) -> list[str]:
+    """야후 티커 → 네이버 해외주식 로이터 코드 후보. 네이버는 미국·일본·중국·홍콩(·베트남)만 다뤄요."""
+    t = ticker.upper()
+    if t.endswith((".T", ".HK", ".SZ", ".SS")):
+        return [t]
+    if "." not in t:
+        return [f"{t}.O", t, f"{t}.N", f"{t}.K"]
+    return []
+
+
+def _naver_foreign_shares(ticker: str, fx: dict | None = None) -> int | None:
+    for rc in _naver_codes(ticker):
+        info = _get_json([f"{STOCK_API}/securityService/stock/{rc}/basic"], timeout=6)
+        if not isinstance(info, dict) or not info:
+            continue
+        found: dict = {}
+        _find_fields(info, found)
+        n = _num(found.get("shares"))
+        if n and n > 1000:
+            return int(n)
+        cap, is_krw = _parse_amount(found.get("cap"))
+        price = _num(found.get("price"))
+        if cap and price:
+            if is_krw:
+                rate = (fx or {}).get(market_of(ticker)[1])
+                if not rate:
+                    continue
+                cap = cap / rate
+            return int(round(cap / price))
+    return None
+
+
+def _yahoo_shares(ticker: str) -> int | None:
+    """야후 발행주식수(클라우드 서버에서는 막히는 경우가 많아 마지막에 시도)."""
+    def job():
+        import yfinance as yf
+        n = yf.Ticker(ticker).fast_info.get("shares")
+        return int(n) if n else None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(job).result(timeout=12)
+    except Exception:  # 차단·시간 초과·미지원 모두 '없음'으로
+        return None
+
+
 def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
-    """해외 종목 발행주식수. 미국 상장 종목은 SEC 공시에서, 그 밖의 시장은 아직 지원하지 않아요."""
+    """해외 발행주식수: ① 미국 상장은 SEC 공시 ② 네이버 해외주식(미국·일본·중국·홍콩) ③ 야후 순서로 채워요."""
     tickers = [t for t in tickers if not is_kr(t)]
     us = [t for t in tickers if market_of(t)[0] == "US"]
-    diag = {"total": len(tickers), "SEC": 0, "미국 외": len(tickers) - len(us)}
+    diag = {"total": len(tickers), "SEC": 0, "네이버": 0, "야후": 0, "미국 외": len(tickers) - len(us)}
     if MOCK:
         return {t: _rng(t).randint(50_000_000, 5_000_000_000) for t in tickers}, {**diag, "SEC": len(us)}
+    result: dict[str, int] = {}
     try:
         cik_map = _sec_ticker_map()
     except (requests.RequestException, ValueError):
-        return {}, diag
+        cik_map = {}
     targets = [(t, cik_map[t.upper()]) for t in us if t.upper() in cik_map]
 
     def one(item):
@@ -573,12 +678,25 @@ def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
         n = _sec_shares(cik)
         return (t, n / ADR_RATIO.get(t, 1.0) if n else None)
 
-    result = {}
     with ThreadPoolExecutor(max_workers=4) as pool:  # SEC 요청 제한(초당 10회) 안쪽으로
         for t, n in pool.map(one, targets):
             if n:
                 result[t] = int(n)
     diag["SEC"] = len(result)
+
+    missing = [t for t in tickers if t not in result]
+    fx = fetch_fx() if any(_naver_codes(t) for t in missing) else {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for t, n in zip(missing, pool.map(lambda t: _naver_foreign_shares(t, fx), missing)):
+            if n:
+                result[t] = n
+                diag["네이버"] += 1
+    missing = [t for t in tickers if t not in result]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for t, n in zip(missing, pool.map(_yahoo_shares, missing)):
+            if n:
+                result[t] = n
+                diag["야후"] += 1
     return result, diag
 
 

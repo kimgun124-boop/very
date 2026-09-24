@@ -219,20 +219,38 @@ def load_histories_overseas(codes: tuple[str, ...]):
 
 @st.cache_resource
 def _shares_store():
-    return {"t": 0.0, "ok": False, "data": {}, "kr": {}, "os": {}}
+    return {"t": 0.0, "t_retry": 0.0, "data": {}, "kr": {}, "os": {}, "fails": {}}
 
 
 def load_shares() -> dict:
-    """상장주식수: 잘 받아지면 12시간, 실패하면 10분 뒤에 다시 시도해요."""
+    """상장주식수: 12시간마다 전체를 다시 받고, 빠진 종목은 10분마다 그것만 다시 시도해요(종목당 3번까지)."""
     store = _shares_store()
-    age = time.time() - store["t"]
-    if age < (43200 if store["ok"] else 600):
+    store.setdefault("fails", {})
+    store.setdefault("t_retry", 0.0)
+    now = time.time()
+    full = now - store["t"] >= 43200
+    missing = [c for c in ALL_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
+    if not full and not (missing and now - store["t_retry"] >= 600):
         return store
-    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요. 하루 한 번만 받아요."):
-        kr, kr_diag = data.fetch_kr_shares(KR_CODES)
-        os_, os_diag = data.fetch_overseas_shares(OS_CODES)
-    store.update(t=time.time(), data={**kr, **os_}, kr=kr_diag, os=os_diag,
-                 ok=len(kr) >= 0.8 * max(1, len(KR_CODES)))
+    kr_t = KR_CODES if full else tuple(c for c in missing if data.is_kr(c))
+    os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
+    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요."):
+        kr, kr_diag = data.fetch_kr_shares(kr_t) if kr_t else ({}, {})
+        os_, os_diag = data.fetch_overseas_shares(os_t) if os_t else ({}, {})
+    got = {**kr, **os_}
+    if full:
+        store["fails"] = {}
+    for c in kr_t + os_t:
+        if c not in got:
+            store["fails"][c] = store["fails"].get(c, 0) + 1
+    store["data"] = {**store["data"], **got}
+    if kr_t:
+        store["kr"] = kr_diag
+    if os_t:
+        store["os"] = os_diag
+    store["t_retry"] = now
+    if full:
+        store["t"] = now if len(kr) >= 0.8 * max(1, len(KR_CODES)) else now - 43200 + 600
     return store
 
 
@@ -557,6 +575,13 @@ def render_radar(df: pd.DataFrame):
     )
 
 
+def _eok_num(v) -> str:
+    """억원 값: 10억 미만은 소수 첫째 자리까지."""
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{v:+,.1f}" if abs(v) < 10 else f"{v:+,.0f}"
+
+
 FLOW_HELP = ("네이버 종목별 투자자 매매동향의 순매수 수량 × 그날 종가로 환산한 추정 금액(억원). "
              "최근 거래일 값이고, 장중에는 전 거래일 값일 수 있어요. 5일은 최근 5거래일 합계예요.")
 
@@ -567,11 +592,13 @@ def render_table(f: pd.DataFrame):
         "코드": f["code"],
         "시장": f["market"],
         "분류": f["group"],
+        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
         "현재가": f["price"],
-        "시가총액": f["cap_krw"],
+        "시가총액(원)": f["cap_krw"],
         "등락률": f["change"],
-        **({"외국인(억)": f["flow_외국인"], "기관(억)": f["flow_기관"], "개인(억)": f["flow_개인"],
-            "외국인 5일": f["flow5_외국인"], "기관 5일": f["flow5_기관"]} if show_flow else {}),
+        **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
+            "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
+            "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
         "52주 최고": f["high52"],
         "괴리율": f["gap"],
         "신고가까지": f["to_high"],
@@ -582,7 +609,7 @@ def render_table(f: pd.DataFrame):
     })
 
     whole_rows = view.index[f["currency"].isin(["KRW", "JPY"]).values]
-    flow_cols = [c for c in ("외국인(억)", "기관(억)", "개인(억)", "외국인 5일", "기관 5일") if c in view.columns]
+    flow_cols = [c for c in view.columns if c.endswith("(억원)")]
     for c in flow_cols:
         view[c] = pd.to_numeric(view[c], errors="coerce")
 
@@ -600,11 +627,11 @@ def render_table(f: pd.DataFrame):
         .format({
             "현재가": "{:,.2f}", "52주 최고": "{:,.2f}",
             "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
-            "시가총액": data.format_krw,
+            "시가총액(원)": data.format_krw,
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
         }, na_rep="-")
         .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, ["현재가", "52주 최고"]], na_rep="-")
-        .format("{:+,.0f}", subset=flow_cols, na_rep="-")
+        .format(_eok_num, subset=flow_cols, na_rep="-")
         .map(color_sign, subset=["등락률"] + flow_cols)
         .map(lambda _: "font-weight: 600", subset=["종목"])
         .apply(mark_new_high, axis=1)
@@ -620,7 +647,10 @@ def render_table(f: pd.DataFrame):
             "괴리율": st.column_config.Column(help="현재가가 52주 최고가보다 몇 % 낮은지"),
             "신고가까지": st.column_config.Column(help="52주 최고가를 넘으려면 필요한 상승률"),
             "신고가 후": st.column_config.Column(help="52주 최고가를 찍은 뒤 지난 거래일 수. 0이면 오늘"),
-            "시가총액": st.column_config.Column(help="상장주식수 × 현재가. 해외 종목은 원화로 환산. 머리글을 누르면 큰 순서로 정렬돼요."),
+            "시가총액(원)": st.column_config.Column(help="상장주식수 × 현재가, 원화 기준(조·억). 해외 종목은 환율로 환산. "
+                                                           "상장주식수를 못 받은 종목은 '-'이고, 10분마다 다시 시도해요."),
+            "통화": st.column_config.Column(help="현재가·52주 최고가의 단위. 국내는 원, 해외는 각 시장 통화"),
+            "현재가": st.column_config.Column(help="통화 열의 단위예요"),
             "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
             "설명": st.column_config.TextColumn(width="large"),
             **{c: st.column_config.Column(help=FLOW_HELP) for c in flow_cols},
@@ -659,9 +689,10 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             f'<div class="c-bar"><i style="width:{max(2.0, min(100.0, r.pos)):.0f}%"></i></div>'
             f'<div class="c-meta"><span>52주 최고 {fmt_price(r.high52, r.currency)} ({r.gap:.1f}%)</span>'
             f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
-            f'<div class="c-meta" style="margin-top:0.15rem"><span>시가총액 <b>{data.format_krw(r.cap_krw)}</b></span></div>'
-            + (f'<div class="c-flow">수급 {r.flow_date:%m/%d} · 외 {_flow_cell(r.flow_외국인)}억 · '
-               f'기 {_flow_cell(r.flow_기관)}억 · 개 {_flow_cell(r.flow_개인)}억</div>'
+            f'<div class="c-meta" style="margin-top:0.15rem"><span>시가총액 <b>{data.format_krw(r.cap_krw)}{"원" if pd.notna(r.cap_krw) else ""}</b></span></div>'
+            + (f'<div class="c-flow">수급 {r.flow_date:%m/%d} (억원) · 외 {_flow_cell(r.flow_외국인)} · '
+               f'기 {_flow_cell(r.flow_기관)} · 개 {_flow_cell(r.flow_개인)}'
+               f'<br>5일 누적 · 외 {_flow_cell(r.flow5_외국인)} · 기 {_flow_cell(r.flow5_기관)} · 개 {_flow_cell(r.flow5_개인)}</div>'
                if show_flow and pd.notna(getattr(r, "flow_date", None)) else "")
             + f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
         )
@@ -801,12 +832,18 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
             hint = ", ".join(f"{nm} {c}" for c, nm in cands) if cands else "후보 없음"
             st.write(f"코드 못 찾음: {name} — 네이버 검색 후보: {hint}")
         if cap_missing and shares_store:
+            miss = df[df["cap_krw"].isna()]
             kr, os_ = shares_store.get("kr", {}), shares_store.get("os", {})
-            st.write(
-                f"시가총액 없는 종목 {cap_missing}개. 상장주식수 조회 결과: 국내 {sum(v for k, v in kr.items() if k != 'total')}"
-                f"/{kr.get('total', 0)} (순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 모바일 {kr.get('모바일', 0)}), "
-                f"해외 SEC {os_.get('SEC', 0)}/{os_.get('total', 0) - os_.get('미국 외', 0)}. "
-                f"미국 외 해외 종목 {os_.get('미국 외', 0)}개는 아직 시가총액을 지원하지 않아요. 실패했다면 10분 뒤 다시 시도해요."
+            by_market = miss.groupby("market")["name"].apply(list)
+            parts = [f"{m} {len(v)}개: {', '.join(v[:15])}{' 외' if len(v) > 15 else ''}" for m, v in by_market.items()]
+            st.write(f"시가총액 없는 종목 {cap_missing}개 — " + " / ".join(parts))
+            st.caption(
+                f"최근 조회 결과: 국내 {sum(v for k, v in kr.items() if k != 'total')}/{kr.get('total', 0)} "
+                f"(상세API {kr.get('상세API', 0)}, 순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 모바일 {kr.get('모바일', 0)}), "
+                f"해외 {os_.get('SEC', 0) + os_.get('네이버', 0) + os_.get('야후', 0)}/{os_.get('total', 0)} "
+                f"(SEC {os_.get('SEC', 0)}, 네이버 {os_.get('네이버', 0)}, 야후 {os_.get('야후', 0)}). "
+                "빠진 종목은 10분마다 다시 시도해요(종목당 3번까지, 12시간마다 전체 새로 받기). "
+                "대만·유럽·호주 종목은 네이버가 다루지 않고 야후가 막히면 '-'로 남을 수 있어요."
             )
         if quote_error:
             st.write(f"실시간 시세: {quote_error}. 일봉 마지막 값으로 대신 보여주고 있어요.")
@@ -861,7 +898,8 @@ def render_board():
             render_table(f)
             st.caption("노란 줄은 설정한 기간 안에 52주 신고가를 쓴 종목이에요. 해외 종목은 야후 파이낸스 일봉 기준이라 "
                        "15분 안팎 늦고, 가격은 현지 통화예요. 설명은 각 자료 작성 시점 기준 요약이에요. "
-                       "수급 열은 순매수 수량 × 종가로 환산한 추정 금액(억원)이에요.")
+                       "단위: 현재가·52주 최고는 통화 열 기준, 시가총액은 원화(조·억), 등락률·괴리율은 %, "
+                       "수급 열은 억원(1억 원 = 100,000,000원)으로 순매수 수량 × 종가로 환산한 추정치예요.")
         with st.container(key="mobile_view"):
             render_cards(f, n_hot, n_near, n_aligned)
         render_detail(f, histories, trends)
