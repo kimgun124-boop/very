@@ -323,7 +323,7 @@ with st.sidebar:
                          help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
     only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
     only_holding = st.toggle("신고가 돌파 유지 종목만",
-                             help="52주 신고가를 처음 쓴 뒤 종가가 한 번도 기준가 아래로 내려가지 않은 종목만")
+                             help="직전 52주 신고가를 돌파한 뒤 종가가 한 번도 그 아래로 내려가지 않은 종목만")
     min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
     only_earn = st.toggle("영업이익·EPS 정배열만",
                           help="최근 실적 연도부터 컨센서스(E)까지 영업이익과 EPS가 해마다 모두 증가한 국내 종목만. "
@@ -339,11 +339,7 @@ with st.sidebar:
     recent_days = st.slider("신고가로 인정할 기간(거래일)", 1, 20, 5)
     min_count = st.slider("분류 안 신고가 종목 수", 2, 5, 2)
 
-    st.divider()
-    st.caption("신고가 돌파 유지 기준")
-    bo_mode = st.radio("유지 판정 기준가", list(data.BO_MODES), format_func=data.BO_MODES.get, index=0,
-                       help="돌파선: 첫 신고가일에 넘어선 직전 52주 최고가. 첫 신고가일 종가: 그날 종가. "
-                            "종가가 이 가격 아래로 한 번이라도 내려가면 '이탈'이에요.")
+    bo_mode = "line"   # 돌파선 = 돌파한 날 넘어선 직전 52주 최고가
 
     st.divider()
     refresh_label = st.radio("자동 새로고침", list(REFRESH), index=1, horizontal=True)
@@ -611,10 +607,8 @@ RS_HELP = ("종합 RS(1~99). 오닐 방식 가중 수익률(3개월 40% + 6·9·
 
 
 def _bo_text(r) -> str | None:
-    if r.get("bo_status") == "유지":
-        return f"유지 {int(r['bo_days'])}일"
-    if r.get("bo_status") == "이탈":
-        return f"이탈 ({int(r['bo_days'])}일 유지)"
+    if r.get("bo_status") in ("유지", "이탈"):
+        return f"{r['bo_status']} {int(r['bo_days'])}일"
     return None
 
 
@@ -646,8 +640,7 @@ def render_table(f: pd.DataFrame):
         "신고가까지": f["to_high"],
         "52주 위치": f["pos"],
         "신고가 후": f["days_since_high"],
-        "돌파 유지": f.apply(_bo_text, axis=1),
-        "기준가 대비": f["bo_vs"].where(f["bo_status"] == "유지"),
+        "돌파 유지/이탈": f.apply(_bo_text, axis=1),
         "RS": f["rs"],
         "RS(1M)": f["rs_1m"],
         "RS(3M)": f["rs_3m"],
@@ -678,7 +671,7 @@ def render_table(f: pd.DataFrame):
             "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
             "시가총액(원)": data.format_krw,
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
-            "기준가 대비": "{:+.1f}%", "RS": "{:.0f}", "RS(1M)": "{:.0f}", "RS(3M)": "{:.0f}", "RS(6M)": "{:.0f}",
+            "RS": "{:.0f}", "RS(1M)": "{:.0f}", "RS(3M)": "{:.0f}", "RS(6M)": "{:.0f}",
             "ATR%(2주)": "{:.1f}%",
         }, na_rep="-")
         .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, ["현재가", "52주 최고"]], na_rep="-")
@@ -687,7 +680,8 @@ def render_table(f: pd.DataFrame):
         .map(lambda _: "font-weight: 600", subset=["종목", "RS"])
         .map(_rs_color, subset=["RS", "RS(1M)", "RS(3M)", "RS(6M)"])
         .map(lambda v: f"color: {UP}; font-weight: 600" if isinstance(v, str) and v.startswith("유지")
-             else (f"color: {DOWN}" if isinstance(v, str) and v.startswith("이탈") else ""), subset=["돌파 유지"])
+             else (f"color: {DOWN}; font-weight: 600" if isinstance(v, str) and v.startswith("이탈") else ""),
+             subset=["돌파 유지/이탈"])
         .apply(mark_new_high, axis=1)
     )
     st.dataframe(
@@ -706,9 +700,9 @@ def render_table(f: pd.DataFrame):
             "통화": st.column_config.Column(help="현재가·52주 최고가의 단위. 국내는 원, 해외는 각 시장 통화"),
             "현재가": st.column_config.Column(help="통화 열의 단위예요"),
             "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
-            "돌파 유지": st.column_config.Column(help="52주 신고가를 처음 쓴 뒤 종가가 기준가 위에 머문 거래일 수. "
-                                                  "한 번이라도 종가가 기준가 아래면 '이탈'(유지 일수는 이탈 전까지)"),
-            "기준가 대비": st.column_config.Column(help="유지 중인 종목의 현재가가 돌파 기준가보다 몇 % 위인지"),
+            "돌파 유지/이탈": st.column_config.Column(
+                help="유지 N일: 직전 52주 신고가를 돌파한 날부터 종가가 그 가격 위에 머문 거래일 수(돌파일 = 1일). "
+                     "이탈 N일: 종가가 그 가격 아래로 떨어진 날부터 지난 거래일 수(떨어진 날 = 1일)"),
             "RS": st.column_config.Column(help=RS_HELP),
             "RS(1M)": st.column_config.Column(help="단기 RS. 최근 1개월(21거래일) 수익률 순위(1~99)"),
             "RS(3M)": st.column_config.Column(help="최근 3개월(63거래일) 수익률 순위(1~99)"),
@@ -750,7 +744,7 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
         if r.aligned:
             tags += '<span class="c-tag al">정배열</span>'
         if r.bo_status == "유지":
-            tags += f'<span class="c-tag new">돌파유지 {int(r.bo_days)}일</span>'
+            tags += f'<span class="c-tag new">유지 {int(r.bo_days)}일</span>'
         cards.append(
             f'<a class="card{" hot" if hot else ""}" target="_blank" '
             f'href="{r.url}">'
@@ -864,12 +858,12 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
               f"1개월 {row.ret_1m:+.1f}%" if pd.notna(row.ret_1m) else None, delta_color="off")
     d3.metric("ATR%(2주)", _pct(row.atr_pct), "손절폭은 8%와 ATR 중 큰 값", delta_color="off")
     if isinstance(row.bo_status, str):
-        d4.metric("신고가 돌파 유지", f"{'유지' if row.bo_status == '유지' else '이탈'} {int(row.bo_days)}일",
-                  f"첫 신고가 {row.bo_date:%m/%d} · 기준가 {fmt_price(row.bo_level, row.currency)}"
-                  + (f" · {row.bo_vs:+.1f}%" if row.bo_status == "유지" else f" · {row.bo_break_date:%m/%d} 이탈"),
+        d4.metric("52주 신고가 돌파", f"{row.bo_status} {int(row.bo_days)}일",
+                  f"{row.bo_date:%m/%d} 돌파 · 돌파선 {fmt_price(row.bo_level, row.currency)}"
+                  + (f" · {row.bo_break_date:%m/%d} 이탈({int(row.bo_held)}일 유지 후)" if row.bo_status == "이탈" else ""),
                   delta_color="off")
     else:
-        d4.metric("신고가 돌파 유지", "-", "최근 1년 안에 52주 신고가 없음", delta_color="off")
+        d4.metric("52주 신고가 돌파", "-", "최근 1년 안에 돌파 없음", delta_color="off")
     if pd.notna(row.cap_local):
         cap_text = f"시가총액 {data.format_local_cap(row.cap_local, row.currency)}"
         if row.currency != "KRW" and pd.notna(row.cap_krw):
@@ -894,14 +888,15 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
             })
             colors = ["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"]
             if isinstance(row.bo_status, str) and pd.notna(row.bo_level):
-                chart["돌파 기준가"] = row.bo_level
+                chart["돌파선"] = row.bo_level
                 colors.append(UP)
             price_chart(chart, colors, height=280)
             hist_rows = row.get("bo_history")
             hist_rows = hist_rows if isinstance(hist_rows, list) else []
             if hist_rows:
-                st.caption(f"52주 신고가 돌파 기록 (기준: {data.BO_MODES[bo_mode]}, 종가가 기준가 아래면 이탈)")
-                st.dataframe(pd.DataFrame(hist_rows).style.format({"기준가": "{:,.2f}"}), hide_index=True)
+                st.caption("52주 신고가 돌파 기록 (종가가 돌파선 아래로 내려간 날이 이탈일)")
+                st.dataframe(pd.DataFrame(hist_rows).astype({"이탈일": str})
+                             .style.format({"돌파선(직전 52주 최고)": "{:,.0f}"}), hide_index=True)
     with tab_earn:
         render_earnings(code, row.currency)
     with tab_flow:

@@ -413,7 +413,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
 
 # ─────────────────────────── RS · ATR · 신고가 돌파 유지 ───────────────────────────
 ATR_DAYS = 10          # 2주(10거래일) ATR
-BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_history")
+BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_held", "bo_history")
 BO_MODES = {
     "line": "돌파선(직전 52주 최고가)",
     "close": "첫 신고가일 종가",
@@ -463,7 +463,8 @@ def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> d
     - 신고가일: 그날 고가가 직전 250거래일 최고가를 넘은 날
     - 기준가: mode="line"이면 그날 넘어선 직전 52주 최고가(돌파선), "close"면 신고가 첫날의 종가
     - 한 번이라도 종가가 기준가 아래로 내려가면 '이탈'로 끝나고, 그 뒤 새로 신고가를 쓰면 새 돌파로 다시 셉니다
-    - 유지 거래일: 첫 신고가일 다음 날부터 지금까지 지난 거래일 수(오늘 첫 돌파면 0)
+    - 유지 N일: 돌파한 날을 1일째로, 종가가 돌파선 위에 머문 거래일 수
+    - 이탈 N일: 종가가 돌파선 아래로 내려간 날을 1일째로, 지금까지 지난 거래일 수
     """
     out = {k: None for k in BO_KEYS}
     if h is None or len(h) < 60:
@@ -496,22 +497,23 @@ def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> d
         return out
     last_i = len(h) - 1
     hist_rows = []
+    def held(e):  # 돌파일부터 종가가 돌파선 위였던 거래일 수
+        return (last_i - e["start"] + 1) if e["broken"] is None else (e["broken"] - e["start"])
+
     for e in episodes[-6:]:
-        end = e["broken"] if e["broken"] is not None else last_i
-        held = (end - e["start"]) - (1 if e["broken"] is not None else 0)
         hist_rows.append({
-            "첫 신고가일": dates.iloc[e["start"]].date(),
-            "기준가": e["level"],
-            "유지 거래일": max(0, held),
-            "결과": "유지 중" if e["broken"] is None else f"{dates.iloc[e['broken']]:%m/%d} 이탈",
+            "돌파일": dates.iloc[e["start"]].date(),
+            "돌파선(직전 52주 최고)": e["level"],
+            "유지": f"{held(e)}일",
+            "이탈일": "-" if e["broken"] is None else dates.iloc[e["broken"]].date(),
         })
     e = episodes[-1]
     active = e["broken"] is None
-    end = last_i if active else e["broken"]
     out.update(
         bo_date=dates.iloc[e["start"]].date(),
         bo_level=e["level"],
-        bo_days=max(0, (end - e["start"]) - (0 if active else 1)),
+        bo_days=held(e) if active else (last_i - e["broken"] + 1),
+        bo_held=held(e),
         bo_status="유지" if active else "이탈",
         bo_vs=(close[-1] / e["level"] - 1) * 100 if e["level"] else None,
         bo_break_date=None if active else dates.iloc[e["broken"]].date(),
