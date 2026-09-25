@@ -20,7 +20,9 @@ st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈",
 
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
             "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
-            "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL")
+            "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
+            "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
+            "fetch_financials", "fetch_financials_many", "earnings_trend")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
@@ -207,7 +209,7 @@ st.markdown(
 )
 
 
-@st.cache_data(ttl=1800, show_spinner="1년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
+@st.cache_data(ttl=1800, show_spinner="2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
 def load_histories(codes: tuple[str, ...]):
     return data.fetch_histories(codes)
 
@@ -320,6 +322,14 @@ with st.sidebar:
     max_drop = st.slider("52주 최고가에서 몇 % 이내만 볼까요", 0, 90, 90, step=5,
                          help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
     only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
+    only_holding = st.toggle("신고가 돌파 유지 종목만",
+                             help="52주 신고가를 처음 쓴 뒤 종가가 한 번도 기준가 아래로 내려가지 않은 종목만")
+    min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
+    only_earn = st.toggle("영업이익·EPS 정배열만",
+                          help="최근 실적 연도부터 컨센서스(E)까지 영업이익과 EPS가 해마다 모두 증가한 국내 종목만. "
+                               "전망(E)이 없는 종목·적자 종목·해외 종목은 빠져요. 처음 켤 때 종목 수에 따라 30초~1분 걸려요.")
+    earn_years = st.radio("실적 정배열 판정: 최근 실적 몇 년부터", [2, 3], index=1, horizontal=True,
+                          format_func=lambda n: f"{n}년 + 전망(E)")
     show_flow = st.toggle("종목별 수급 열 보기", value=True,
                           help="국내 종목의 최근 거래일 개인·외국인·기관 순매수(억원, 종가로 환산한 추정치)와 5일 누적을 표에 붙여요. "
                                "보고 있는 종목 중 앞쪽 150개까지만 불러와요.")
@@ -328,6 +338,12 @@ with st.sidebar:
     st.caption("주도섹터 기준")
     recent_days = st.slider("신고가로 인정할 기간(거래일)", 1, 20, 5)
     min_count = st.slider("분류 안 신고가 종목 수", 2, 5, 2)
+
+    st.divider()
+    st.caption("신고가 돌파 유지 기준")
+    bo_mode = st.radio("유지 판정 기준가", list(data.BO_MODES), format_func=data.BO_MODES.get, index=0,
+                       help="돌파선: 첫 신고가일에 넘어선 직전 52주 최고가. 첫 신고가일 종가: 그날 종가. "
+                            "종가가 이 가격 아래로 한 번이라도 내려가면 '이탈'이에요.")
 
     st.divider()
     refresh_label = st.radio("자동 새로고침", list(REFRESH), index=1, horizontal=True)
@@ -355,6 +371,10 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         f = f[f["gap"].notna() & (f["gap"] >= -max_drop)]
     if only_aligned:
         f = f[f["aligned"] == True]  # noqa: E712
+    if only_holding:
+        f = f[f["bo_status"] == "유지"]
+    if min_rs > 0:
+        f = f[f["rs"].notna() & (f["rs"] >= min_rs)]
     return f.sort_values("gap", ascending=False, na_position="last")
 
 
@@ -586,6 +606,28 @@ FLOW_HELP = ("네이버 종목별 투자자 매매동향의 순매수 수량 × 
              "최근 거래일 값이고, 장중에는 전 거래일 값일 수 있어요. 5일은 최근 5거래일 합계예요.")
 
 
+RS_HELP = ("종합 RS(1~99). 오닐 방식 가중 수익률(3개월 40% + 6·9·12개월 각 20%)을 보드 안 국내 종목끼리 순위 매긴 백분위. "
+           "해외 종목은 해외 종목끼리. 전 종목 기준 사이트 RS와는 숫자가 다를 수 있어요")
+
+
+def _bo_text(r) -> str | None:
+    if r.get("bo_status") == "유지":
+        return f"유지 {int(r['bo_days'])}일"
+    if r.get("bo_status") == "이탈":
+        return f"이탈 ({int(r['bo_days'])}일 유지)"
+    return None
+
+
+def _rs_color(v):
+    if pd.isna(v):
+        return ""
+    if v >= 80:
+        return f"color: {UP}; font-weight: 600"
+    if v < 40:
+        return f"color: {DOWN}"
+    return ""
+
+
 def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
         "종목": f["name"],
@@ -604,6 +646,13 @@ def render_table(f: pd.DataFrame):
         "신고가까지": f["to_high"],
         "52주 위치": f["pos"],
         "신고가 후": f["days_since_high"],
+        "돌파 유지": f.apply(_bo_text, axis=1),
+        "기준가 대비": f["bo_vs"].where(f["bo_status"] == "유지"),
+        "RS": f["rs"],
+        "RS(1M)": f["rs_1m"],
+        "RS(3M)": f["rs_3m"],
+        "RS(6M)": f["rs_6m"],
+        "ATR%(2주)": f["atr_pct"],
         "정배열": f["aligned"],
         "설명": f["desc"],
     })
@@ -629,11 +678,16 @@ def render_table(f: pd.DataFrame):
             "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
             "시가총액(원)": data.format_krw,
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
+            "기준가 대비": "{:+.1f}%", "RS": "{:.0f}", "RS(1M)": "{:.0f}", "RS(3M)": "{:.0f}", "RS(6M)": "{:.0f}",
+            "ATR%(2주)": "{:.1f}%",
         }, na_rep="-")
         .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, ["현재가", "52주 최고"]], na_rep="-")
         .format(_eok_num, subset=flow_cols, na_rep="-")
         .map(color_sign, subset=["등락률"] + flow_cols)
-        .map(lambda _: "font-weight: 600", subset=["종목"])
+        .map(lambda _: "font-weight: 600", subset=["종목", "RS"])
+        .map(_rs_color, subset=["RS", "RS(1M)", "RS(3M)", "RS(6M)"])
+        .map(lambda v: f"color: {UP}; font-weight: 600" if isinstance(v, str) and v.startswith("유지")
+             else (f"color: {DOWN}" if isinstance(v, str) and v.startswith("이탈") else ""), subset=["돌파 유지"])
         .apply(mark_new_high, axis=1)
     )
     st.dataframe(
@@ -652,10 +706,26 @@ def render_table(f: pd.DataFrame):
             "통화": st.column_config.Column(help="현재가·52주 최고가의 단위. 국내는 원, 해외는 각 시장 통화"),
             "현재가": st.column_config.Column(help="통화 열의 단위예요"),
             "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
+            "돌파 유지": st.column_config.Column(help="52주 신고가를 처음 쓴 뒤 종가가 기준가 위에 머문 거래일 수. "
+                                                  "한 번이라도 종가가 기준가 아래면 '이탈'(유지 일수는 이탈 전까지)"),
+            "기준가 대비": st.column_config.Column(help="유지 중인 종목의 현재가가 돌파 기준가보다 몇 % 위인지"),
+            "RS": st.column_config.Column(help=RS_HELP),
+            "RS(1M)": st.column_config.Column(help="단기 RS. 최근 1개월(21거래일) 수익률 순위(1~99)"),
+            "RS(3M)": st.column_config.Column(help="최근 3개월(63거래일) 수익률 순위(1~99)"),
+            "RS(6M)": st.column_config.Column(help="최근 6개월(126거래일) 수익률 순위(1~99)"),
+            "ATR%(2주)": st.column_config.Column(help="최근 10거래일 평균 진폭 ÷ 현재가. 손절폭 잡을 때 참고(8%보다 크면 ATR로 확대)"),
             "설명": st.column_config.TextColumn(width="large"),
             **{c: st.column_config.Column(help=FLOW_HELP) for c in flow_cols},
         },
     )
+
+
+def _n(v) -> str:
+    return "-" if pd.isna(v) else f"{v:.0f}"
+
+
+def _pct(v) -> str:
+    return "-" if pd.isna(v) else f"{v:.1f}%"
 
 
 def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
@@ -679,6 +749,8 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             tags += f'<span class="c-tag new">신고가 {int(r.days_since_high)}일</span>'
         if r.aligned:
             tags += '<span class="c-tag al">정배열</span>'
+        if r.bo_status == "유지":
+            tags += f'<span class="c-tag new">돌파유지 {int(r.bo_days)}일</span>'
         cards.append(
             f'<a class="card{" hot" if hot else ""}" target="_blank" '
             f'href="{r.url}">'
@@ -690,6 +762,8 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             f'<div class="c-meta"><span>52주 최고 {fmt_price(r.high52, r.currency)} ({r.gap:.1f}%)</span>'
             f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
             f'<div class="c-meta" style="margin-top:0.15rem"><span>시가총액 <b>{data.format_krw(r.cap_krw)}{"원" if pd.notna(r.cap_krw) else ""}</b></span></div>'
+            f'<div class="c-meta" style="margin-top:0.15rem"><span>RS <b>{_n(r.rs)}</b> · 1M {_n(r.rs_1m)}</span>'
+            f'<span>ATR(2주) <b>{_pct(r.atr_pct)}</b></span></div>'
             + (f'<div class="c-flow">수급 {r.flow_date:%m/%d} (억원) · 외 {_flow_cell(r.flow_외국인)} · '
                f'기 {_flow_cell(r.flow_기관)} · 개 {_flow_cell(r.flow_개인)}'
                f'<br>5일 누적 · 외 {_flow_cell(r.flow5_외국인)} · 기 {_flow_cell(r.flow5_기관)} · 개 {_flow_cell(r.flow5_개인)}</div>'
@@ -783,6 +857,19 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
               "오늘 신고가" if row.days_since_high == 0 else f"고점 후 {row.days_since_high:.0f}거래일",
               delta_color="off")
     c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("종합 RS", _n(row.rs), f"3M {_n(row.rs_3m)} · 6M {_n(row.rs_6m)}", delta_color="off", help=RS_HELP)
+    d2.metric("단기 RS(1M)", _n(row.rs_1m),
+              f"1개월 {row.ret_1m:+.1f}%" if pd.notna(row.ret_1m) else None, delta_color="off")
+    d3.metric("ATR%(2주)", _pct(row.atr_pct), "손절폭은 8%와 ATR 중 큰 값", delta_color="off")
+    if isinstance(row.bo_status, str):
+        d4.metric("신고가 돌파 유지", f"{'유지' if row.bo_status == '유지' else '이탈'} {int(row.bo_days)}일",
+                  f"첫 신고가 {row.bo_date:%m/%d} · 기준가 {fmt_price(row.bo_level, row.currency)}"
+                  + (f" · {row.bo_vs:+.1f}%" if row.bo_status == "유지" else f" · {row.bo_break_date:%m/%d} 이탈"),
+                  delta_color="off")
+    else:
+        d4.metric("신고가 돌파 유지", "-", "최근 1년 안에 52주 신고가 없음", delta_color="off")
     if pd.notna(row.cap_local):
         cap_text = f"시가총액 {data.format_local_cap(row.cap_local, row.currency)}"
         if row.currency != "KRW" and pd.notna(row.cap_krw):
@@ -793,7 +880,8 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
         st.caption("리포트 태그: " + ", ".join(row.tags))
 
     notes = row.get("notes") or []
-    tab_chart, tab_flow, tab_notes = st.tabs(["차트", "수급(개인·외국인·기관)", f"자료 메모 {len(notes)}"])
+    tab_chart, tab_earn, tab_flow, tab_notes = st.tabs(["차트", "실적(영업이익·EPS)", "수급(개인·외국인·기관)",
+                                                        f"자료 메모 {len(notes)}"])
     with tab_chart:
         hist = histories.get(code, (None, data.empty_frame(), None))[1]
         if not hist.empty:
@@ -804,7 +892,18 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
                 "60일선": h["close"].rolling(60).mean(),
                 "52주 최고": row.high52,
             })
-            price_chart(chart, ["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"], height=280)
+            colors = ["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"]
+            if isinstance(row.bo_status, str) and pd.notna(row.bo_level):
+                chart["돌파 기준가"] = row.bo_level
+                colors.append(UP)
+            price_chart(chart, colors, height=280)
+            hist_rows = row.get("bo_history")
+            hist_rows = hist_rows if isinstance(hist_rows, list) else []
+            if hist_rows:
+                st.caption(f"52주 신고가 돌파 기록 (기준: {data.BO_MODES[bo_mode]}, 종가가 기준가 아래면 이탈)")
+                st.dataframe(pd.DataFrame(hist_rows).style.format({"기준가": "{:,.2f}"}), hide_index=True)
+    with tab_earn:
+        render_earnings(code, row.currency)
     with tab_flow:
         render_stock_flow(code, trends)
     with tab_notes:
@@ -854,11 +953,45 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
         st.caption("코드가 틀렸거나 사명이 바뀐 경우예요. verify.bat을 실행하면 올바른 코드를 찾아줘요.")
 
 
+def load_financials(codes: tuple[str, ...]) -> dict:
+    """종목별 연간 영업이익·EPS. data 쪽에서 종목마다 12시간 기억해요."""
+    with st.spinner(f"영업이익·EPS 실적과 전망을 불러오는 중이에요({len(codes)}종목, 처음 한 번만 오래 걸려요)."):
+        return data.fetch_financials_many(codes)
+
+
+def add_earnings(f: pd.DataFrame, fins: dict) -> pd.DataFrame:
+    res = [data.earnings_trend(fins.get(c), earn_years) for c in f["code"]]
+    keys = list(data.earnings_trend(None))
+    return f.assign(**{k: [r[k] for r in res] for k in keys}) if len(f) else f.assign(**{k: [] for k in keys})
+
+
+def render_earnings(code: str, currency: str):
+    """종목 자세히 보기: 연간 매출·영업이익·EPS와 정배열 판정."""
+    if not data.is_kr(code):
+        st.caption("해외 종목은 실적 정배열 판정을 하지 않아요.")
+        return
+    fin = data.fetch_financials(code)
+    if fin is None or fin.empty:
+        st.caption("실적 자료를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
+        return
+    tr = data.earnings_trend(fin, earn_years)
+    mark = {True: "✅ 정배열", False: "❌ 아님", None: "판정 불가(전망 없음/자료 부족)"}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("영업이익·EPS 정배열", mark[tr["earn_ok"]], tr["earn_span"], delta_color="off")
+    c2.metric("영업이익", mark[tr["op_ok"]])
+    c3.metric("EPS", mark[tr["eps_ok"]])
+    view = fin.set_index("period")[[c for c in ("sales", "op", "eps") if c in fin]].T
+    view.index = [{"sales": "매출액(억원)", "op": "영업이익(억원)", "eps": "EPS(원)"}[i] for i in view.index]
+    st.dataframe(view.style.format("{:,.0f}", na_rep="-"))
+    st.caption("네이버 증권 기업실적분석(연결 우선) 기준, (E)는 컨센서스 전망치예요. "
+               "네이버는 보통 전망을 1~2년만 줘서 3년 치 전망을 보여주는 사이트와 판정이 다를 수 있어요.")
+
+
 def render_board():
     histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
     quotes, quote_error = load_quotes(KR_CODES)
     shares_store = load_shares()
-    df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx())
+    df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode)
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 
@@ -875,6 +1008,10 @@ def render_board():
     render_market()
     render_radar(df)
     f = apply_filters(df)
+    if only_earn:
+        fins = load_financials(tuple(c for c in f["code"] if data.is_kr(c)))
+        f = add_earnings(f, fins)
+        f = f[f["earn_ok"] == True]  # noqa: E712
     trends = load_trends(tuple([c for c in f["code"] if data.is_kr(c)][:150])) if show_flow else {}
     summ = [data.trend_summary(trends.get(c)) for c in f["code"]]
     flow_keys = list(data.trend_summary(None))
@@ -883,13 +1020,15 @@ def render_board():
     n_hot = int((f["days_since_high"] <= recent_days).sum())
     n_near = int((f["to_high"] <= 10).sum())
     n_aligned = int((f["aligned"] == True).sum())  # noqa: E712
+    n_holding = int((f["bo_status"] == "유지").sum())
 
     with st.container(key="desk_kpis"):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("보고 있는 종목", f"{len(f)}개")
         c2.metric(f"최근 {recent_days}거래일 신고가", f"{n_hot}개")
-        c3.metric("신고가까지 10% 이내", f"{n_near}개")
-        c4.metric("정배열", f"{n_aligned}개")
+        c3.metric("신고가 돌파 유지", f"{n_holding}개")
+        c4.metric("신고가까지 10% 이내", f"{n_near}개")
+        c5.metric("정배열", f"{n_aligned}개")
 
     if f.empty:
         st.info("조건에 맞는 종목이 없어요. 왼쪽에서 산업이나 하락폭 조건을 넓혀 보세요.")

@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import random
+import time as _time
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
@@ -163,7 +164,7 @@ def parse_polling(text: str) -> dict[str, dict]:
 
 
 # ─────────────────────────── 네트워크 조회 ───────────────────────────
-def fetch_history(code: str, count: int = 300) -> tuple[str | None, pd.DataFrame, str | None]:
+def fetch_history(code: str, count: int = 520) -> tuple[str | None, pd.DataFrame, str | None]:
     """(네이버 종목명, 일봉, 오류메시지)"""
     if MOCK:
         return None, mock_history(code, count), None
@@ -230,7 +231,7 @@ def normalize_yf(hist: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def fetch_history_overseas(ticker: str, count: int = 300) -> tuple[str | None, pd.DataFrame, str | None]:
+def fetch_history_overseas(ticker: str, count: int = 520) -> tuple[str | None, pd.DataFrame, str | None]:
     """야후 파이낸스 일봉. (종목명은 확인하지 않으므로 None)"""
     if MOCK:
         return None, mock_history(ticker, count), None
@@ -239,7 +240,7 @@ def fetch_history_overseas(ticker: str, count: int = 300) -> tuple[str | None, p
     except ImportError:
         return None, empty_frame(), "yfinance가 설치되지 않음(requirements.txt 확인)"
     try:
-        hist = yf.Ticker(ticker).history(period="14mo", interval="1d", auto_adjust=False)
+        hist = yf.Ticker(ticker).history(period="26mo", interval="1d", auto_adjust=False)
     except Exception as exc:  # 야후 쪽 일시 오류·요청 제한
         return None, empty_frame(), f"야후 조회 실패: {exc.__class__.__name__}"
     df = normalize_yf(hist)
@@ -326,13 +327,15 @@ def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
 
 
 # ─────────────────────────── 지표 계산 ───────────────────────────
-def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None) -> dict:
+def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line") -> dict:
     """현재가·등락률·52주 최고/최저·괴리율·신고가 경과일·정배열 여부."""
     today = today or now_kst().date()
     res = {
         "price": None, "prev": None, "change": None, "high52": None, "low52": None,
         "gap": None, "to_high": None, "pos": None, "days_since_high": None,
         "aligned": None, "source": None,
+        "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
+        **{k: None for k in BO_KEYS},
     }
     if hist is None or hist.empty:
         return res
@@ -389,7 +392,132 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         aligned=aligned,
         source=source,
     )
+
+    # 현재가·장중 고가를 오늘 일봉에 반영한 사본으로 ATR·수익률·돌파 유지를 계산해요.
+    h = hist[["date", "high", "low", "close"]].astype({"high": float, "low": float, "close": float}).reset_index(drop=True)
+    if last_is_today:
+        h.loc[h.index[-1], "close"] = price
+        if q_high:
+            h.loc[h.index[-1], "high"] = max(float(h["high"].iloc[-1]), float(q_high))
+        if q_low:
+            h.loc[h.index[-1], "low"] = min(float(h["low"].iloc[-1]), float(q_low))
+    res["atr_pct"] = atr_pct(h, ATR_DAYS)
+    rets = {}
+    for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
+        rets[key] = (price / float(h["close"].iloc[-1 - n]) - 1) * 100 if len(h) > n else None
+    res.update(ret_1m=rets["ret_1m"], ret_3m=rets["ret_3m"], ret_6m=rets["ret_6m"])
+    res["rs_raw"] = rs_raw_score(rets)
+    res.update(breakout_hold(h, bo_mode))
     return res
+
+
+# ─────────────────────────── RS · ATR · 신고가 돌파 유지 ───────────────────────────
+ATR_DAYS = 10          # 2주(10거래일) ATR
+BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_history")
+BO_MODES = {
+    "line": "돌파선(직전 52주 최고가)",
+    "close": "첫 신고가일 종가",
+}
+
+
+def atr_pct(h: pd.DataFrame, n: int = ATR_DAYS) -> float | None:
+    """최근 n거래일 평균 진폭(ATR)을 현재가 대비 %로. 진폭 = max(고가, 전일종가) − min(저가, 전일종가)."""
+    if len(h) < n + 1:
+        return None
+    prev = h["close"].shift(1)
+    tr = pd.concat([h["high"], prev], axis=1).max(axis=1) - pd.concat([h["low"], prev], axis=1).min(axis=1)
+    atr = tr.tail(n).mean()
+    last = h["close"].iloc[-1]
+    return float(atr / last * 100) if last else None
+
+
+def rs_raw_score(rets: dict) -> float | None:
+    """종합 RS 원점수. 오닐(IBD) 방식: 최근 3개월 가중 2배 + 6·9·12개월.
+    분기 수익률 기준 = 0.4×3M + 0.2×6M + 0.2×9M + 0.2×12M. 1년이 안 된 종목은 있는 기간만으로 가중치를 나눠요."""
+    parts = [(0.4, rets.get("ret_3m")), (0.2, rets.get("ret_6m")), (0.2, rets.get("ret_9m")), (0.2, rets.get("ret_12m"))]
+    parts = [(w, r) for w, r in parts if r is not None]
+    if not parts:
+        return None
+    wsum = sum(w for w, _ in parts)
+    return sum(w * r for w, r in parts) / wsum
+
+
+def add_rs_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """RS 점수(1~99). 국내는 보드의 국내 종목끼리, 해외는 해외 종목끼리 수익률 순위를 백분위로 바꿔요."""
+    df = df.copy()
+    kr = df["code"].map(is_kr)
+    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m")):
+        df[col] = None
+        for mask in (kr, ~kr):
+            vals = pd.to_numeric(df.loc[mask, raw], errors="coerce")
+            if vals.notna().sum() >= 2:
+                pct = vals.rank(pct=True, method="average")
+                df.loc[mask, col] = (pct * 98 + 1).round().where(vals.notna())
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> dict:
+    """52주 신고가를 처음 쓴 날부터 그 기준가 위(종가 기준)에 계속 머물러 있는지.
+
+    - 신고가일: 그날 고가가 직전 250거래일 최고가를 넘은 날
+    - 기준가: mode="line"이면 그날 넘어선 직전 52주 최고가(돌파선), "close"면 신고가 첫날의 종가
+    - 한 번이라도 종가가 기준가 아래로 내려가면 '이탈'로 끝나고, 그 뒤 새로 신고가를 쓰면 새 돌파로 다시 셉니다
+    - 유지 거래일: 첫 신고가일 다음 날부터 지금까지 지난 거래일 수(오늘 첫 돌파면 0)
+    """
+    out = {k: None for k in BO_KEYS}
+    if h is None or len(h) < 60:
+        return out
+    high = h["high"].values
+    close = h["close"].values
+    dates = h["date"]
+    # 일봉이 충분하면 꼭 직전 250거래일을 다 채운 날부터만 신고가로 봐요(상장 1년이 안 된 종목은 60일부터).
+    minp = lookback if len(h) >= lookback + 20 else 60
+    prior = h["high"].shift(1).rolling(lookback, min_periods=minp).max().values
+    episodes = []
+    cur = None
+    for t in range(len(h)):
+        if cur is not None:
+            if close[t] < cur["level"]:
+                cur["broken"] = t
+                episodes.append(cur)
+                cur = None
+            continue
+        if prior[t] == prior[t] and high[t] > prior[t]:   # prior가 NaN이 아닐 때
+            level = prior[t] if mode == "line" else close[t]
+            cur = {"start": t, "level": float(level), "broken": None}
+            if mode == "line" and close[t] < level:        # 장중에만 넘고 종가는 못 지킨 날
+                cur["broken"] = t
+                episodes.append(cur)
+                cur = None
+    if cur is not None:
+        episodes.append(cur)
+    if not episodes:
+        return out
+    last_i = len(h) - 1
+    hist_rows = []
+    for e in episodes[-6:]:
+        end = e["broken"] if e["broken"] is not None else last_i
+        held = (end - e["start"]) - (1 if e["broken"] is not None else 0)
+        hist_rows.append({
+            "첫 신고가일": dates.iloc[e["start"]].date(),
+            "기준가": e["level"],
+            "유지 거래일": max(0, held),
+            "결과": "유지 중" if e["broken"] is None else f"{dates.iloc[e['broken']]:%m/%d} 이탈",
+        })
+    e = episodes[-1]
+    active = e["broken"] is None
+    end = last_i if active else e["broken"]
+    out.update(
+        bo_date=dates.iloc[e["start"]].date(),
+        bo_level=e["level"],
+        bo_days=max(0, (end - e["start"]) - (0 if active else 1)),
+        bo_status="유지" if active else "이탈",
+        bo_vs=(close[-1] / e["level"] - 1) * 100 if e["level"] else None,
+        bo_break_date=None if active else dates.iloc[e["broken"]].date(),
+        bo_history=hist_rows[::-1],
+    )
+    return out
 
 
 def normalize_name(name: str | None) -> str:
@@ -1123,11 +1251,11 @@ def resolve_codes(names) -> tuple[dict[str, str], dict[str, list[tuple[str, str]
 
 
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
-                shares: dict | None = None, fx: dict | None = None) -> pd.DataFrame:
+                shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line") -> pd.DataFrame:
     rows = []
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
-        metrics = compute_metrics(hist, quotes.get(s["code"]))
+        metrics = compute_metrics(hist, quotes.get(s["code"]), bo_mode=bo_mode)
         market, currency = market_of(s["code"])
         n_shares = (shares or {}).get(s["code"])
         cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
@@ -1145,7 +1273,7 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict,
             "name_ok": name_matches(s["name"], naver_name),
             "error": error if metrics["price"] is None else None,
         })
-    return pd.DataFrame(rows)
+    return add_rs_ranks(pd.DataFrame(rows))
 
 
 def leading_groups(df: pd.DataFrame, recent_days: int, min_count: int = 2):
@@ -1175,7 +1303,7 @@ def _rng(code: str) -> random.Random:
     return random.Random(int(hashlib.md5(code.encode()).hexdigest()[:8], 16))
 
 
-def mock_history(code: str, count: int = 300) -> pd.DataFrame:
+def mock_history(code: str, count: int = 520) -> pd.DataFrame:
     rng = _rng(code)
     dates = pd.bdate_range(end=now_kst().date(), periods=count)
     price = rng.uniform(3_000, 200_000)
@@ -1196,3 +1324,161 @@ def mock_quote(code: str) -> dict:
     last = hist.iloc[-1]
     return {"price": float(last["close"]), "prev": float(hist.iloc[-2]["close"]),
             "high": float(last["high"]), "low": float(last["low"]), "status": "OPEN"}
+
+
+# ─────────────────────────── 실적(영업이익·EPS) 정배열 ───────────────────────────
+FIN_TTL = 12 * 3600          # 실적은 자주 안 바뀌어서 종목마다 12시간 기억
+_fin_cache: dict[str, tuple[float, dict | None]] = {}
+FIN_ROWS = {"영업이익": "op", "EPS": "eps", "매출액": "sales"}
+
+
+def _fin_label(title: str) -> str | None:
+    t = re.sub(r"\s+", "", title or "")
+    if t.startswith("영업이익") and "률" not in t and "증가" not in t:
+        return "op"
+    if t.startswith("EPS"):
+        return "eps"
+    if t.startswith("매출액") and "증가" not in t:
+        return "sales"
+    return None
+
+
+def _period_label(title: str, is_est: bool) -> str:
+    m = re.search(r"(\d{4})[.\-/]?(\d{1,2})?", title or "")
+    if not m:
+        return title
+    return m.group(1) + ("(E)" if is_est else "")
+
+
+def parse_fin_mobile(obj) -> pd.DataFrame:
+    """네이버 모바일 finance/annual JSON → period·is_est·op·eps·sales 표."""
+    info = (obj or {}).get("financeInfo") or obj or {}
+    titles = info.get("trTitleList") or []
+    rows = info.get("rowList") or []
+    if not titles or not rows:
+        return pd.DataFrame()
+    recs = []
+    for t in titles:
+        key = t.get("key")
+        is_est = str(t.get("isConsensus", "N")).upper() == "Y" or "(E)" in str(t.get("title", ""))
+        rec = {"key": key, "period": _period_label(str(t.get("title", key)), is_est), "is_est": is_est}
+        for row in rows:
+            lab = _fin_label(row.get("title", ""))
+            if not lab or lab in rec:
+                continue
+            cell = (row.get("columns") or {}).get(key) or {}
+            rec[lab] = _num(cell.get("value") if isinstance(cell, dict) else cell)
+        recs.append(rec)
+    return pd.DataFrame(recs).sort_values("key").reset_index(drop=True)
+
+
+def parse_fin_html(text: str) -> pd.DataFrame:
+    """네이버 PC 종목 메인의 '기업실적분석' 표에서 연간 열만 뽑아요(앞 4열이 연간)."""
+    m = re.search(r'class="section cop_analysis".*?</table>', text or "", re.S)
+    if not m:
+        return pd.DataFrame()
+    block = m.group(0)
+    thead = re.search(r"<thead>(.*?)</thead>", block, re.S)
+    tbody = re.search(r"<tbody>(.*?)</tbody>", block, re.S)
+    if not thead or not tbody:
+        return pd.DataFrame()
+    heads = [_strip_tags(h).strip() for h in re.findall(r"<th[^>]*>(.*?)</th>", thead.group(1), re.S)]
+    periods = [h for h in heads if re.match(r"\d{4}\.\d{2}", h)]
+    annual = periods[:4]
+    if not annual:
+        return pd.DataFrame()
+    recs = [{"key": re.sub(r"\D", "", p)[:6], "period": _period_label(p, "(E)" in p), "is_est": "(E)" in p}
+            for p in annual]
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tbody.group(1), re.S):
+        th = re.search(r"<th[^>]*>(.*?)</th>", tr, re.S)
+        if not th:
+            continue
+        lab = _fin_label(_strip_tags(th.group(1)))
+        if not lab or lab in recs[0]:
+            continue
+        tds = [_strip_tags(td).strip() for td in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        for i, rec in enumerate(recs):
+            rec[lab] = _num(tds[i]) if i < len(tds) else None
+    return pd.DataFrame(recs)
+
+
+def fetch_financials(code: str) -> pd.DataFrame | None:
+    """연간 매출액·영업이익(억원)·EPS(원), 실적과 컨센서스(E). 모바일 API → PC 페이지 순서로 시도."""
+    if not is_kr(code):
+        return None
+    now = _time.time()
+    hit = _fin_cache.get(code)
+    if hit and now - hit[0] < FIN_TTL:
+        return hit[1]
+    if MOCK:
+        df = mock_financials(code)
+    else:
+        df = pd.DataFrame()
+        obj = _get_json([f"https://m.stock.naver.com/api/stock/{code}/finance/annual"])
+        if obj:
+            try:
+                df = parse_fin_mobile(obj)
+            except Exception:  # 응답 형식이 바뀐 경우
+                df = pd.DataFrame()
+        if df.empty or df.get("op") is None or df["op"].isna().all():
+            try:
+                r = session.get("https://finance.naver.com/item/main.naver", params={"code": code}, timeout=8)
+                df = parse_fin_html(decode(r.content))
+            except requests.RequestException:
+                df = pd.DataFrame()
+    df = df if (df is not None and not df.empty) else None
+    _fin_cache[code] = (now, df)
+    return df
+
+
+def fetch_financials_many(codes, workers: int = 8) -> dict[str, pd.DataFrame | None]:
+    codes = [c for c in codes if is_kr(c)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(zip(codes, pool.map(fetch_financials, codes)))
+
+
+def earnings_trend(df: pd.DataFrame | None, actual_years: int = 3) -> dict:
+    """영업이익·EPS가 최근 실적 N년 + 컨센서스(E) 전 구간에서 해마다 증가(정배열)하는지.
+
+    - 실적 연도는 최근 actual_years년, 전망(E)은 있는 만큼 전부
+    - 전망(E)이 하나도 없으면 판정 불가(None) — 앞으로도 우상향인지 확인할 수 없어서
+    - 마지막 실적 연도 값이 0 이하(적자)면 정배열로 보지 않아요
+    """
+    out = {"earn_ok": None, "op_ok": None, "eps_ok": None, "earn_span": None, "n_est": 0}
+    if df is None or df.empty or "op" not in df or "eps" not in df:
+        return out
+    act = df[~df["is_est"]].dropna(subset=["op", "eps"], how="all").tail(actual_years)
+    est = df[df["is_est"]]
+    out["n_est"] = int(est[["op", "eps"]].notna().any(axis=1).sum())
+    seq = pd.concat([act, est])
+
+    def rising(col):
+        vals = seq[col].dropna().tolist()
+        n_act = act[col].notna().sum()
+        n_est = est[col].notna().sum()
+        if n_act < actual_years or n_est == 0:
+            return None
+        if act[col].dropna().iloc[-1] <= 0:
+            return False
+        return all(b > a for a, b in zip(vals, vals[1:]))
+
+    out["op_ok"], out["eps_ok"] = rising("op"), rising("eps")
+    if out["op_ok"] is None or out["eps_ok"] is None:
+        out["earn_ok"] = None
+    else:
+        out["earn_ok"] = bool(out["op_ok"] and out["eps_ok"])
+    periods = seq["period"].tolist()
+    out["earn_span"] = f"{periods[0]}~{periods[-1]}" if periods else None
+    return out
+
+
+def mock_financials(code: str) -> pd.DataFrame:
+    rng = _rng(code + "fin")
+    op, eps, base = rng.uniform(100, 5000), rng.uniform(300, 8000), 2023
+    recs = []
+    for i in range(6):
+        g = rng.uniform(-0.15, 0.4)
+        op, eps = op * (1 + g), eps * (1 + g + rng.uniform(-0.05, 0.05))
+        recs.append({"key": f"{base + i}12", "period": f"{base + i}" + ("(E)" if i >= 3 else ""),
+                     "is_est": i >= 3, "op": round(op), "eps": round(eps), "sales": round(op * 12)})
+    return pd.DataFrame(recs)
