@@ -23,7 +23,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
             "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
             "fetch_financials", "fetch_financials_many", "earnings_trend",
-            "fetch_monthlies", "newhigh_flags")
+            "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
@@ -161,6 +161,19 @@ st.markdown(
   .idx-chg { display: block; margin-left: 0; font-size: 0.76rem; }
   .idx-badge { font-size: 0.62rem; padding: 0.05rem 0.3rem; }
 }
+.sig { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.7rem 0.9rem;
+       margin-bottom: 0.6rem; display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.6rem 1.2rem; }
+.sig-mk { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.9rem; }
+.sig-name { font-weight: 800; font-size: 1rem; color: #16212B; min-width: 3.2rem; }
+.sig-item { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: #51616C; }
+.tl { display: inline-flex; gap: 3px; background: #1C2530; border-radius: 999px; padding: 3px 6px; }
+.tl i { width: 15px; height: 15px; border-radius: 50%; background: #D9DEE2; font-style: normal; font-size: 0.6rem;
+        font-weight: 800; color: #FFFFFF; display: inline-flex; align-items: center; justify-content: center; }
+.tl i.G { background: #1FA75A; } .tl i.Y { background: #F2B134; color: #3A2A00; } .tl i.R { background: #D6333B; }
+.sig-txt.G { color: #1B8A4B; font-weight: 700; } .sig-txt.Y { color: #A87400; font-weight: 700; }
+.sig-txt.R { color: #C0262E; font-weight: 700; }
+.sig-rs { font-size: 0.8rem; color: #51616C; } .sig-rs b { color: #16212B; font-size: 0.92rem; }
+@media (max-width: 640px) { .sig { grid-template-columns: 1fr; } }
 .mk-row { display: grid; grid-template-columns: 1fr 1fr 1.05fr; gap: 0; background: #FFFFFF;
   border: 1px solid #E3E8EB; border-radius: 14px; overflow: hidden; margin: 0 0 0.6rem; }
 .mk { padding: 0.95rem 1.2rem 0.85rem; border-right: 1px solid #EEF1F3; }
@@ -531,10 +544,50 @@ def render_flows():
                    "기타법인은 기관에 넣지 않아요. 장중 값은 잠정치예요.")
 
 
-def render_market():
-    """맨 위 시장 요약: 코스피·코스닥 카드 + 오늘의 시장, 그 아래 해외 지수·환율·유가."""
+def _light(sig: dict | None) -> str:
+    """G·Y·R 세 칸 신호등. 켜진 칸에만 색과 글자."""
+    on = sig["code"] if sig else None
+    return '<span class="tl">' + "".join(
+        f'<i class="{c}">{c}</i>' if c == on else "<i></i>" for c in ("G", "Y", "R")) + "</span>"
+
+
+def _sig_item(label: str, sig: dict | None, n: int) -> str:
+    if not sig:
+        return f'<span class="sig-item">{label} {_light(None)} <span>-</span></span>'
+    slope = "상승" if sig["rising"] else "하락"
+    return (f'<span class="sig-item" title="{n}일선 {sig["ma"]:,.2f}, {n}일선 기울기 {slope}">{label} {_light(sig)} '
+            f'<span class="sig-txt {sig["code"]}">{sig["text"]}</span>'
+            f'<span>{n}일선 {sig["dist"]:+.1f}%</span></span>')
+
+
+def _signal_panel(hist: dict, board: pd.DataFrame | None) -> str:
+    """시장신호: 코스피·코스닥 단기(20일선)·장기(60일선) 신호등 + 지수 RS."""
+    cells = ""
+    for name, sym in data.MARKETS.items():
+        df = hist.get(sym, (data.empty_frame(), None))[0]
+        s20, s60 = data.ma_signal(df, 20), data.ma_signal(df, 60)
+        rs = data.index_rs(df, board) if board is not None else {}
+        n = lambda v: "-" if v is None else f"{v:.0f}"  # noqa: E731
+        cells += (f'<div class="sig-mk"><span class="sig-name">{name}</span>'
+                  f'{_sig_item("단기", s20, 20)}{_sig_item("장기", s60, 60)}'
+                  f'<span class="sig-rs">RS <b>{n(rs.get("rs"))}</b> · 1M {n(rs.get("rs_1m"))} · '
+                  f'3M {n(rs.get("rs_3m"))} · 6M {n(rs.get("rs_6m"))}</span></div>')
+    return f'<div class="sig">{cells}</div>'
+
+
+def render_market(board: pd.DataFrame | None = None):
+    """맨 위 시장 요약: 시장신호(신호등·지수 RS) → 코스피·코스닥 카드 + 오늘의 시장 → 해외 지수·환율·유가."""
     overview = load_overview()
     hist = load_indexes()
+    st.markdown(_signal_panel(hist, board), unsafe_allow_html=True)
+    with st.expander("시장신호 읽는 법"):
+        st.markdown(
+            "- **단기 = 20일선, 장기 = 60일선** 기준이에요.\n"
+            "- 🟢 **초록**: 지수가 선 위 + 선이 올라가는 중(5거래일 전보다 높음) → 상승 추세\n"
+            "- 🟡 **노랑**: 둘 중 하나만 맞음(선 위인데 선이 꺾였거나, 선 아래인데 선은 아직 오르는 중) → 경계\n"
+            "- 🔴 **빨강**: 지수가 선 아래 + 선이 내려가는 중 → 하락 추세\n"
+            "- **지수 RS**: 지수 수익률을 보드 안 국내 종목들과 같은 잣대(종합·1M·3M·6M)로 줄 세운 1~99. "
+            "종목 RS가 지수 RS보다 높으면 시장보다 강한 종목이에요.")
     hist_sm = {idx["name"]: data.index_summary(hist.get(idx["symbol"], (data.empty_frame(), None))[0])
                for idx in data.INDEXES}
     cards = "".join(_market_card(name, overview.get(name), hist_sm.get(name)) for name in data.MARKETS)
@@ -1041,7 +1094,7 @@ def render_board():
     if data.MOCK:
         st.info("가짜 데이터로 보여주는 테스트 모드예요. 실제 시세를 보려면 STOCK_MOCK 설정 없이 실행하세요.")
 
-    render_market()
+    render_market(df)
     render_radar(df)
     f = apply_filters(df)
     if only_earn:

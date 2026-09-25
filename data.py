@@ -265,7 +265,7 @@ def fetch_index_histories() -> dict[str, tuple[pd.DataFrame, str | None]]:
 
     def one(idx):
         if idx["source"] == "naver":
-            _, df, err = fetch_history(idx["symbol"], count=300)
+            _, df, err = fetch_history(idx["symbol"], count=320)
         else:
             _, df, err = fetch_history_overseas(idx["symbol"])
         scale = idx.get("scale", 1)
@@ -1562,4 +1562,48 @@ def newhigh_flags(h: pd.DataFrame, monthly: pd.DataFrame | None = None) -> dict:
         hist_max = max(hist_max, float(mm["high"].max()))
     out["ath_price"] = hist_max
     out["ath_ok"] = mon_ok
+    return out
+
+
+# ─────────────────────────── 시장신호(지수 신호등 · 지수 RS) ───────────────────────────
+SIGNAL_TEXT = {"G": "상승 추세", "Y": "경계", "R": "하락 추세"}
+
+
+def ma_signal(df: pd.DataFrame | None, n: int = 20, slope_days: int = 5) -> dict | None:
+    """지수와 n일선으로 매긴 신호등.
+
+    - 초록(G): 지수가 n일선 위 + n일선이 올라가는 중(5거래일 전보다 높음)
+    - 빨강(R): 지수가 n일선 아래 + n일선이 내려가는 중
+    - 노랑(Y): 둘 중 하나만 맞을 때(선 위인데 선이 꺾였거나, 선 아래인데 선은 아직 올라가는 중)
+    """
+    if df is None or len(df) < n + slope_days:
+        return None
+    close = df["close"].astype(float)
+    ma = close.rolling(n).mean()
+    last, ma_now, ma_prev = float(close.iloc[-1]), float(ma.iloc[-1]), float(ma.iloc[-1 - slope_days])
+    above, rising = last >= ma_now, ma_now >= ma_prev
+    code = "G" if (above and rising) else ("R" if (not above and not rising) else "Y")
+    return {"code": code, "text": SIGNAL_TEXT[code], "ma": ma_now, "dist": (last / ma_now - 1) * 100,
+            "above": above, "rising": rising}
+
+
+def index_rs(index_df: pd.DataFrame | None, board: pd.DataFrame) -> dict:
+    """지수의 RS: 지수 수익률을 보드 국내 종목들 수익률 분포에 놓고 1~99로. 종목 RS와 같은 잣대."""
+    out = {"rs": None, "rs_1m": None, "rs_3m": None, "rs_6m": None}
+    if index_df is None or len(index_df) < 30 or board is None or board.empty:
+        return out
+    close = index_df["close"].astype(float).reset_index(drop=True)
+    last = float(close.iloc[-1])
+    rets = {}
+    for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
+        rets[key] = (last / float(close.iloc[-1 - n]) - 1) * 100 if len(close) > n else None
+    mine = {"rs": rs_raw_score(rets), "rs_1m": rets["ret_1m"], "rs_3m": rets["ret_3m"], "rs_6m": rets["ret_6m"]}
+    kr = board[board["code"].map(is_kr)]
+    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m")):
+        v = mine[col]
+        vals = pd.to_numeric(kr.get(raw), errors="coerce").dropna() if raw in kr else pd.Series(dtype=float)
+        if v is None or len(vals) < 2:
+            continue
+        pct = ((vals < v).sum() + 0.5 * (vals == v).sum()) / len(vals)
+        out[col] = round(pct * 98 + 1)
     return out
