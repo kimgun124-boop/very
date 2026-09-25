@@ -327,7 +327,8 @@ def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
 
 
 # ─────────────────────────── 지표 계산 ───────────────────────────
-def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line") -> dict:
+def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line",
+                    monthly: pd.DataFrame | None = None) -> dict:
     """현재가·등락률·52주 최고/최저·괴리율·신고가 경과일·정배열 여부."""
     today = today or now_kst().date()
     res = {
@@ -336,6 +337,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         "aligned": None, "source": None,
         "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
         **{k: None for k in BO_KEYS},
+        **{k: None for k in NH_KEYS},
     }
     if hist is None or hist.empty:
         return res
@@ -408,11 +410,12 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     res.update(ret_1m=rets["ret_1m"], ret_3m=rets["ret_3m"], ret_6m=rets["ret_6m"])
     res["rs_raw"] = rs_raw_score(rets)
     res.update(breakout_hold(h, bo_mode))
+    res.update(newhigh_flags(h, monthly))
     return res
 
 
 # ─────────────────────────── RS · ATR · 신고가 돌파 유지 ───────────────────────────
-ATR_DAYS = 10          # 2주(10거래일) ATR
+ATR_DAYS = 20          # 20거래일 ATR
 BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_held", "bo_history")
 BO_MODES = {
     "line": "돌파선(직전 52주 최고가)",
@@ -458,13 +461,12 @@ def add_rs_ranks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> dict:
-    """52주 신고가를 처음 쓴 날부터 그 기준가 위(종가 기준)에 계속 머물러 있는지.
+    """직전 52주 최고가를 기준으로 '유지' 또는 '이탈'이 며칠째인지.
 
-    - 신고가일: 그날 고가가 직전 250거래일 최고가를 넘은 날
-    - 기준가: mode="line"이면 그날 넘어선 직전 52주 최고가(돌파선), "close"면 신고가 첫날의 종가
-    - 한 번이라도 종가가 기준가 아래로 내려가면 '이탈'로 끝나고, 그 뒤 새로 신고가를 쓰면 새 돌파로 다시 셉니다
-    - 유지 N일: 돌파한 날을 1일째로, 종가가 돌파선 위에 머문 거래일 수
-    - 이탈 N일: 종가가 돌파선 아래로 내려간 날을 1일째로, 지금까지 지난 거래일 수
+    - 유지: 종가가 직전 52주 최고가(그날 이전 250거래일 최고가)를 넘어선 날(돌파일)을 1일째로,
+      그 뒤 종가가 한 번도 그 가격 아래로 내려가지 않은 거래일 수. 기준가 = 돌파한 직전 52주 최고가
+    - 이탈: 유지 중이 아니면 기준가 = 지금의 52주 최고가. 그 가격 위에서 마감한 마지막 날 다음 날
+      (위에서 마감한 적이 없으면 최고가를 찍은 날)을 1일째로 센 거래일 수
     """
     out = {k: None for k in BO_KEYS}
     if h is None or len(h) < 60:
@@ -472,53 +474,55 @@ def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> d
     high = h["high"].values
     close = h["close"].values
     dates = h["date"]
-    # 일봉이 충분하면 꼭 직전 250거래일을 다 채운 날부터만 신고가로 봐요(상장 1년이 안 된 종목은 60일부터).
-    minp = lookback if len(h) >= lookback + 20 else 60
+    n = len(h)
+    minp = lookback if n >= lookback + 20 else 60
     prior = h["high"].shift(1).rolling(lookback, min_periods=minp).max().values
-    episodes = []
+
+    runs = []          # 유지 구간: 돌파일, 돌파선, 이탈일
     cur = None
-    for t in range(len(h)):
+    for t in range(n):
         if cur is not None:
             if close[t] < cur["level"]:
                 cur["broken"] = t
-                episodes.append(cur)
+                runs.append(cur)
                 cur = None
             continue
-        if prior[t] == prior[t] and high[t] > prior[t]:   # prior가 NaN이 아닐 때
-            level = prior[t] if mode == "line" else close[t]
-            cur = {"start": t, "level": float(level), "broken": None}
-            if mode == "line" and close[t] < level:        # 장중에만 넘고 종가는 못 지킨 날
-                cur["broken"] = t
-                episodes.append(cur)
-                cur = None
+        if prior[t] == prior[t] and close[t] > prior[t]:    # 종가로 직전 52주 최고가 돌파
+            cur = {"start": t, "level": float(prior[t]), "broken": None}
     if cur is not None:
-        episodes.append(cur)
-    if not episodes:
-        return out
-    last_i = len(h) - 1
-    hist_rows = []
-    def held(e):  # 돌파일부터 종가가 돌파선 위였던 거래일 수
-        return (last_i - e["start"] + 1) if e["broken"] is None else (e["broken"] - e["start"])
+        runs.append(cur)
 
-    for e in episodes[-6:]:
-        hist_rows.append({
-            "돌파일": dates.iloc[e["start"]].date(),
-            "돌파선(직전 52주 최고)": e["level"],
-            "유지": f"{held(e)}일",
-            "이탈일": "-" if e["broken"] is None else dates.iloc[e["broken"]].date(),
-        })
-    e = episodes[-1]
-    active = e["broken"] is None
-    out.update(
-        bo_date=dates.iloc[e["start"]].date(),
-        bo_level=e["level"],
-        bo_days=held(e) if active else (last_i - e["broken"] + 1),
-        bo_held=held(e),
-        bo_status="유지" if active else "이탈",
-        bo_vs=(close[-1] / e["level"] - 1) * 100 if e["level"] else None,
-        bo_break_date=None if active else dates.iloc[e["broken"]].date(),
-        bo_history=hist_rows[::-1],
-    )
+    last = n - 1
+    hist_rows = [{
+        "돌파일": dates.iloc[r["start"]].date(),
+        "돌파한 직전 52주 최고가": r["level"],
+        "유지": f"{(last - r['start'] + 1) if r['broken'] is None else (r['broken'] - r['start'])}일",
+        "이탈일": "-" if r["broken"] is None else dates.iloc[r["broken"]].date(),
+    } for r in runs[-6:]][::-1]
+
+    if cur is not None:                                   # 지금 유지 중
+        out.update(
+            bo_status="유지", bo_level=cur["level"], bo_date=dates.iloc[cur["start"]].date(),
+            bo_days=last - cur["start"] + 1, bo_held=last - cur["start"] + 1,
+            bo_vs=(close[-1] / cur["level"] - 1) * 100,
+        )
+    else:                                                 # 지금의 52주 최고가 아래
+        win = h.tail(lookback)
+        peak_i = int(win["high"].values.argmax()) + (n - len(win))
+        # 같은 최고가가 여러 번이면 가장 최근 날
+        ref = float(high[peak_i])
+        same = [i for i in range(n - len(win), n) if high[i] >= ref]
+        peak_i = same[-1] if same else peak_i
+        above = [i for i in range(peak_i, n) if close[i] >= ref]
+        first_below = (above[-1] + 1) if above else peak_i
+        out.update(
+            bo_status="이탈", bo_level=ref, bo_date=dates.iloc[peak_i].date(),
+            bo_days=max(1, last - first_below + 1),
+            bo_vs=(close[-1] / ref - 1) * 100,
+            bo_break_date=dates.iloc[min(first_below, last)].date(),
+            bo_held=(runs[-1]["broken"] - runs[-1]["start"]) if runs and runs[-1]["broken"] is not None else None,
+        )
+    out["bo_history"] = hist_rows
     return out
 
 
@@ -1253,11 +1257,13 @@ def resolve_codes(names) -> tuple[dict[str, str], dict[str, list[tuple[str, str]
 
 
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
-                shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line") -> pd.DataFrame:
+                shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line",
+                monthlies: dict | None = None) -> pd.DataFrame:
     rows = []
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
-        metrics = compute_metrics(hist, quotes.get(s["code"]), bo_mode=bo_mode)
+        metrics = compute_metrics(hist, quotes.get(s["code"]), bo_mode=bo_mode,
+                                  monthly=(monthlies or {}).get(s["code"]))
         market, currency = market_of(s["code"])
         n_shares = (shares or {}).get(s["code"])
         cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
@@ -1484,3 +1490,76 @@ def mock_financials(code: str) -> pd.DataFrame:
         recs.append({"key": f"{base + i}12", "period": f"{base + i}" + ("(E)" if i >= 3 else ""),
                      "is_est": i >= 3, "op": round(op), "eps": round(eps), "sales": round(op * 12)})
     return pd.DataFrame(recs)
+
+
+# ─────────────────────────── 일·주·월봉 신고가(52주 · 역대) ───────────────────────────
+NH_KEYS = ("nh52_d", "nh52_w", "nh52_m", "ath_d", "ath_w", "ath_m", "ath_price", "ath_ok")
+
+
+def fetch_monthly(code: str, count: int = 600) -> pd.DataFrame:
+    """상장 이후 전체 월봉(역대 최고가 계산용). 국내는 네이버, 해외는 야후."""
+    if MOCK:
+        d = mock_history(code, 520)
+        return d.groupby(d["date"].dt.to_period("M")).agg(date=("date", "first"), high=("high", "max")).reset_index(drop=True)
+    try:
+        if is_kr(code):
+            r = session.get(FCHART_URL, params={"symbol": code, "timeframe": "month", "count": count, "requestType": 0},
+                            timeout=8)
+            r.raise_for_status()
+            return parse_fchart(decode(r.content))[1]
+        import yfinance as yf
+        return normalize_yf(yf.Ticker(code).history(period="max", interval="1mo", auto_adjust=False))
+    except Exception:
+        return empty_frame()
+
+
+def fetch_monthlies(codes, workers: int = 8) -> dict[str, pd.DataFrame]:
+    codes = list(codes)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(zip(codes, pool.map(fetch_monthly, codes)))
+
+
+def newhigh_flags(h: pd.DataFrame, monthly: pd.DataFrame | None = None) -> dict:
+    """지금 봉(오늘 일봉·이번 주 주봉·이번 달 월봉)의 고가가 52주 신고가인지, 역대 신고가인지.
+
+    - 52주: 그 봉이 시작되기 전 52주(364일) 최고가를 그 봉 고가가 넘었는지
+    - 역대: 그 봉이 시작되기 전 상장 이후 전체 최고가를 넘었는지(월봉으로 과거 전체를 봐요)
+    """
+    out = {k: None for k in NH_KEYS}
+    if h is None or h.empty:
+        return out
+    d = h.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    today = d["date"].iloc[-1].normalize()
+    starts = {
+        "d": today,
+        "w": today - pd.Timedelta(days=today.weekday()),
+        "m": today.replace(day=1),
+    }
+    mon_ok = monthly is not None and not monthly.empty
+    if mon_ok:
+        mm = monthly.copy()
+        mm["date"] = pd.to_datetime(mm["date"])
+    for k, st_ in starts.items():
+        bar = d[d["date"] >= st_]
+        before = d[d["date"] < st_]
+        if bar.empty:
+            continue
+        bar_high = float(bar["high"].max())
+        w52 = before[before["date"] >= st_ - pd.Timedelta(days=364)]
+        if len(before) >= 200 and not w52.empty:
+            out[f"nh52_{k}"] = bool(bar_high > float(w52["high"].max()))
+        # 역대: 일봉에 있는 과거 + 월봉에 있는 그 이전 전체
+        cands = [float(before["high"].max())] if not before.empty else []
+        if mon_ok:
+            old = mm[mm["date"] < starts["m"]]
+            if not old.empty:
+                cands.append(float(old["high"].max()))
+        if cands and (mon_ok or len(before) < 200):
+            out[f"ath_{k}"] = bool(bar_high > max(cands))
+    hist_max = float(d["high"].max())
+    if mon_ok:
+        hist_max = max(hist_max, float(mm["high"].max()))
+    out["ath_price"] = hist_max
+    out["ath_ok"] = mon_ok
+    return out
