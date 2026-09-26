@@ -22,6 +22,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -297,16 +298,59 @@ def index_summary(df: pd.DataFrame) -> dict | None:
     }
 
 
-def fetch_histories(codes, workers: int = 8) -> dict[str, tuple]:
-    """국내·해외 섞인 코드 목록을 받아 각각 알맞은 곳에서 일봉을 가져옵니다."""
+def _yf_batch(tickers, period: str, interval: str) -> dict[str, pd.DataFrame]:
+    """야후 여러 종목을 한 번에 받아요(yfinance가 안에서 병렬로 받음). 못 받은 티커는 결과에서 빠져요."""
+    tickers = list(tickers)
+    if not tickers or MOCK:
+        return {}
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    out: dict[str, pd.DataFrame] = {}
+    for part in chunks(tickers, 60):
+        try:
+            raw = yf.download(part, period=period, interval=interval, group_by="ticker", auto_adjust=False,
+                              threads=True, progress=False)
+        except Exception:  # 야후 일시 오류·요청 제한 → 아래에서 하나씩 다시
+            continue
+        if raw is None or raw.empty:
+            continue
+        for t in part:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if t not in raw.columns.get_level_values(0):
+                    continue
+                sub = raw[t]
+            elif len(part) == 1:
+                sub = raw
+            else:
+                continue
+            df = normalize_yf(sub)
+            if not df.empty:
+                out[t] = df
+    return out
+
+
+def fetch_histories(codes, workers: int = 12) -> dict[str, tuple]:
+    """국내·해외 섞인 코드 목록을 받아 각각 알맞은 곳에서 일봉을 가져옵니다.
+
+    (속도) 국내는 12개씩 동시에, 해외는 야후에서 한 번에 받고 빠진 종목만 하나씩 다시 받아요.
+    """
     codes = list(codes)
-
-    def one(code):
-        return fetch_history(code) if is_kr(code) else fetch_history_overseas(code)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = pool.map(one, codes)
-    return dict(zip(codes, results))
+    kr = [c for c in codes if is_kr(c)]
+    os_ = [c for c in codes if not is_kr(c)]
+    out: dict[str, tuple] = {}
+    if kr:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            out.update(zip(kr, pool.map(fetch_history, kr)))
+    if os_:
+        got = _yf_batch(os_, "26mo", "1d")
+        out.update({t: (None, df, None) for t, df in got.items()})
+        rest = [t for t in os_ if t not in got]
+        if rest:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                out.update(zip(rest, pool.map(fetch_history_overseas, rest)))
+    return {c: out[c] for c in codes}
 
 
 def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
@@ -316,20 +360,38 @@ def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
         return {c: mock_quote(c) for c in codes}, None
     out: dict[str, dict] = {}
     errors = []
-    for part in chunks(codes, 40):
+
+    def one(part):
         try:
             r = session.get(POLLING_URL, params={"query": "SERVICE_ITEM:" + ",".join(part)}, timeout=8)
             r.raise_for_status()
-            out.update(parse_polling(decode(r.content)))
+            return parse_polling(decode(r.content)), None
         except (requests.RequestException, ValueError) as exc:
-            errors.append(exc.__class__.__name__)
+            return {}, exc.__class__.__name__
+
+    # (속도) 500여 종목 = 40개씩 13번 요청. 예전엔 차례로 보내서 몇 초씩 걸렸는데 이제 동시에 보내요.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for got, err in pool.map(one, list(chunks(codes, 40))):
+            out.update(got)
+            if err:
+                errors.append(err)
     return out, ("실시간 시세 조회 실패: " + ", ".join(sorted(set(errors)))) if errors else None
 
 
 # ─────────────────────────── 지표 계산 ───────────────────────────
+def _arrays(hist: pd.DataFrame):
+    """일봉 DataFrame → (날짜 datetime64[D], 고가, 저가, 종가) numpy 배열. 계산은 전부 이 배열로 해서 빨라요."""
+    d = hist["date"].values.astype("datetime64[D]")
+    return (d, hist["high"].to_numpy(dtype=float), hist["low"].to_numpy(dtype=float),
+            hist["close"].to_numpy(dtype=float))
+
+
 def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line",
                     monthly: pd.DataFrame | None = None) -> dict:
-    """현재가·등락률·52주 최고/최저·괴리율·신고가 경과일·정배열 여부."""
+    """현재가·등락률·52주 최고/최저·괴리율·신고가 경과일·정배열 여부.
+
+    (속도) 600종목을 30초마다 다시 계산하므로 pandas 대신 numpy 배열로 계산해요. 결과는 예전과 같아요.
+    """
     today = today or now_kst().date()
     res = {
         "price": None, "prev": None, "change": None, "high52": None, "low52": None,
@@ -342,27 +404,32 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     if hist is None or hist.empty:
         return res
 
-    last_is_today = hist["date"].iloc[-1].date() == today
-    closes = hist["close"].astype(float).reset_index(drop=True)
+    dts, highs, lows, closes0 = _arrays(hist)
+    today64 = np.datetime64(today, "D")
+    last_is_today = dts[-1] == today64
 
     if quote and quote.get("price"):
         price = float(quote["price"])
         prev = quote.get("prev")
         if not prev:
-            prev = closes.iloc[-2] if (last_is_today and len(closes) > 1) else closes.iloc[-1]
+            prev = closes0[-2] if (last_is_today and len(closes0) > 1) else closes0[-1]
         source = "실시간"
     else:
-        price = float(closes.iloc[-1])
-        prev = closes.iloc[-2] if len(closes) > 1 else None
+        price = float(closes0[-1])
+        prev = closes0[-2] if len(closes0) > 1 else None
         source = "일봉"
+    if prev is not None:
+        prev = float(prev)
 
-    window = hist[hist["date"].dt.date >= today - timedelta(days=364)]
-    if window.empty:
-        window = hist.tail(250)
-    hi_idx = window["high"].idxmax()
-    high52 = float(window.loc[hi_idx, "high"])
-    days_since = int((window["date"] > window.loc[hi_idx, "date"]).sum())
-    low52 = float(window["low"].min())
+    wmask = dts >= today64 - np.timedelta64(364, "D")
+    if not wmask.any():
+        wmask = np.zeros(len(dts), dtype=bool)
+        wmask[-250:] = True
+    w_d, w_hi, w_lo = dts[wmask], highs[wmask], lows[wmask]
+    hi_i = int(np.nanargmax(w_hi))
+    high52 = float(w_hi[hi_i])
+    days_since = int((w_d > w_d[hi_i]).sum())
+    low52 = float(np.nanmin(w_lo))
 
     q_high = quote.get("high") if quote else None
     q_low = quote.get("low") if quote else None
@@ -374,11 +441,17 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         low52 = float(q_low)
     low52 = min(low52, price)
 
+    # 현재가·장중 고가를 오늘 일봉에 반영한 사본으로 정배열·ATR·수익률·돌파 유지를 계산해요.
+    cc, hh, ll = closes0.copy(), highs.copy(), lows.copy()
     if last_is_today:
-        closes.iloc[-1] = price
+        cc[-1] = price
+        if q_high:
+            hh[-1] = max(hh[-1], float(q_high))
+        if q_low:
+            ll[-1] = min(ll[-1], float(q_low))
     aligned = None
-    if len(closes) >= 120:
-        ma20, ma60, ma120 = (closes.tail(n).mean() for n in (20, 60, 120))
+    if len(cc) >= 120:
+        ma20, ma60, ma120 = (float(cc[-n:].mean()) for n in (20, 60, 120))
         aligned = bool(price > ma20 > ma60 > ma120)
 
     res.update(
@@ -395,22 +468,14 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         source=source,
     )
 
-    # 현재가·장중 고가를 오늘 일봉에 반영한 사본으로 ATR·수익률·돌파 유지를 계산해요.
-    h = hist[["date", "high", "low", "close"]].astype({"high": float, "low": float, "close": float}).reset_index(drop=True)
-    if last_is_today:
-        h.loc[h.index[-1], "close"] = price
-        if q_high:
-            h.loc[h.index[-1], "high"] = max(float(h["high"].iloc[-1]), float(q_high))
-        if q_low:
-            h.loc[h.index[-1], "low"] = min(float(h["low"].iloc[-1]), float(q_low))
-    res["atr_pct"] = atr_pct(h, ATR_DAYS)
+    res["atr_pct"] = _atr_np(hh, ll, cc, ATR_DAYS)
     rets = {}
     for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
-        rets[key] = (price / float(h["close"].iloc[-1 - n]) - 1) * 100 if len(h) > n else None
+        rets[key] = (price / float(cc[-1 - n]) - 1) * 100 if len(cc) > n else None
     res.update(ret_1m=rets["ret_1m"], ret_3m=rets["ret_3m"], ret_6m=rets["ret_6m"])
     res["rs_raw"] = rs_raw_score(rets)
-    res.update(breakout_hold(h, bo_mode))
-    res.update(newhigh_flags(h, monthly))
+    res.update(_breakout_np(dts, hh, cc, bo_mode))
+    res.update(_newhigh_np(dts, hh, _monthly_arrays(monthly)))
     return res
 
 
@@ -423,15 +488,22 @@ BO_MODES = {
 }
 
 
+def _atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = ATR_DAYS) -> float | None:
+    if len(close) < n + 1:
+        return None
+    prev = np.empty_like(close)
+    prev[0] = np.nan
+    prev[1:] = close[:-1]
+    tr = np.fmax(high, prev) - np.fmin(low, prev)      # fmax/fmin은 빈 값(NaN)을 건너뛰어요
+    atr = np.nanmean(tr[-n:])
+    last = close[-1]
+    return float(atr / last * 100) if last else None
+
+
 def atr_pct(h: pd.DataFrame, n: int = ATR_DAYS) -> float | None:
     """최근 n거래일 평균 진폭(ATR)을 현재가 대비 %로. 진폭 = max(고가, 전일종가) − min(저가, 전일종가)."""
-    if len(h) < n + 1:
-        return None
-    prev = h["close"].shift(1)
-    tr = pd.concat([h["high"], prev], axis=1).max(axis=1) - pd.concat([h["low"], prev], axis=1).min(axis=1)
-    atr = tr.tail(n).mean()
-    last = h["close"].iloc[-1]
-    return float(atr / last * 100) if last else None
+    return _atr_np(h["high"].to_numpy(dtype=float), h["low"].to_numpy(dtype=float),
+                   h["close"].to_numpy(dtype=float), n)
 
 
 def rs_raw_score(rets: dict) -> float | None:
@@ -460,6 +532,72 @@ def add_rs_ranks(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _rolling_prior_max(high: np.ndarray, lookback: int, minp: int) -> np.ndarray:
+    """prior[t] = t 이전 lookback거래일 고가의 최고값(값이 minp개 미만이면 NaN). pandas rolling과 같은 결과."""
+    return pd.Series(high).shift(1).rolling(lookback, min_periods=minp).max().to_numpy()
+
+
+def _breakout_np(dts: np.ndarray, high: np.ndarray, close: np.ndarray, mode: str = "line",
+                 lookback: int = 250) -> dict:
+    out = {k: None for k in BO_KEYS}
+    n = len(close)
+    if n < 60:
+        return out
+    minp = lookback if n >= lookback + 20 else 60
+    prior = _rolling_prior_max(high, lookback, minp).tolist()
+    cl = close.tolist()
+
+    runs = []          # 유지 구간: 돌파일, 돌파선, 이탈일
+    cur = None
+    for t in range(n):
+        if cur is not None:
+            if cl[t] < cur["level"]:
+                cur["broken"] = t
+                runs.append(cur)
+                cur = None
+            continue
+        p = prior[t]
+        if p == p and cl[t] > p:                       # 종가로 직전 52주 최고가 돌파
+            cur = {"start": t, "level": float(p), "broken": None}
+    if cur is not None:
+        runs.append(cur)
+
+    def day(i):
+        return dts[i].astype(object)                   # datetime64[D] → datetime.date
+
+    last = n - 1
+    hist_rows = [{
+        "돌파일": day(r["start"]),
+        "돌파한 직전 52주 최고가": r["level"],
+        "유지": f"{(last - r['start'] + 1) if r['broken'] is None else (r['broken'] - r['start'])}일",
+        "이탈일": "-" if r["broken"] is None else day(r["broken"]),
+    } for r in runs[-6:]][::-1]
+
+    if cur is not None:                                   # 지금 유지 중
+        out.update(
+            bo_status="유지", bo_level=cur["level"], bo_date=day(cur["start"]),
+            bo_days=last - cur["start"] + 1, bo_held=last - cur["start"] + 1,
+            bo_vs=(cl[-1] / cur["level"] - 1) * 100,
+        )
+    else:                                                 # 지금의 52주 최고가 아래
+        w0 = max(0, n - lookback)
+        win = high[w0:]
+        ref = float(win[int(np.nanargmax(win))])
+        same = np.nonzero(win >= ref)[0]                  # 같은 최고가가 여러 번이면 가장 최근 날
+        peak_i = int(same[-1]) + w0 if len(same) else int(np.nanargmax(win)) + w0
+        above = np.nonzero(close[peak_i:] >= ref)[0]
+        first_below = (int(above[-1]) + peak_i + 1) if len(above) else peak_i
+        out.update(
+            bo_status="이탈", bo_level=ref, bo_date=day(peak_i),
+            bo_days=max(1, last - first_below + 1),
+            bo_vs=(cl[-1] / ref - 1) * 100,
+            bo_break_date=day(min(first_below, last)),
+            bo_held=(runs[-1]["broken"] - runs[-1]["start"]) if runs and runs[-1]["broken"] is not None else None,
+        )
+    out["bo_history"] = hist_rows
+    return out
+
+
 def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> dict:
     """직전 52주 최고가를 기준으로 '유지' 또는 '이탈'이 며칠째인지.
 
@@ -468,62 +606,10 @@ def breakout_hold(h: pd.DataFrame, mode: str = "line", lookback: int = 250) -> d
     - 이탈: 유지 중이 아니면 기준가 = 지금의 52주 최고가. 그 가격 위에서 마감한 마지막 날 다음 날
       (위에서 마감한 적이 없으면 최고가를 찍은 날)을 1일째로 센 거래일 수
     """
-    out = {k: None for k in BO_KEYS}
     if h is None or len(h) < 60:
-        return out
-    high = h["high"].values
-    close = h["close"].values
-    dates = h["date"]
-    n = len(h)
-    minp = lookback if n >= lookback + 20 else 60
-    prior = h["high"].shift(1).rolling(lookback, min_periods=minp).max().values
-
-    runs = []          # 유지 구간: 돌파일, 돌파선, 이탈일
-    cur = None
-    for t in range(n):
-        if cur is not None:
-            if close[t] < cur["level"]:
-                cur["broken"] = t
-                runs.append(cur)
-                cur = None
-            continue
-        if prior[t] == prior[t] and close[t] > prior[t]:    # 종가로 직전 52주 최고가 돌파
-            cur = {"start": t, "level": float(prior[t]), "broken": None}
-    if cur is not None:
-        runs.append(cur)
-
-    last = n - 1
-    hist_rows = [{
-        "돌파일": dates.iloc[r["start"]].date(),
-        "돌파한 직전 52주 최고가": r["level"],
-        "유지": f"{(last - r['start'] + 1) if r['broken'] is None else (r['broken'] - r['start'])}일",
-        "이탈일": "-" if r["broken"] is None else dates.iloc[r["broken"]].date(),
-    } for r in runs[-6:]][::-1]
-
-    if cur is not None:                                   # 지금 유지 중
-        out.update(
-            bo_status="유지", bo_level=cur["level"], bo_date=dates.iloc[cur["start"]].date(),
-            bo_days=last - cur["start"] + 1, bo_held=last - cur["start"] + 1,
-            bo_vs=(close[-1] / cur["level"] - 1) * 100,
-        )
-    else:                                                 # 지금의 52주 최고가 아래
-        win = h.tail(lookback)
-        peak_i = int(win["high"].values.argmax()) + (n - len(win))
-        # 같은 최고가가 여러 번이면 가장 최근 날
-        ref = float(high[peak_i])
-        same = [i for i in range(n - len(win), n) if high[i] >= ref]
-        peak_i = same[-1] if same else peak_i
-        above = [i for i in range(peak_i, n) if close[i] >= ref]
-        first_below = (above[-1] + 1) if above else peak_i
-        out.update(
-            bo_status="이탈", bo_level=ref, bo_date=dates.iloc[peak_i].date(),
-            bo_days=max(1, last - first_below + 1),
-            bo_vs=(close[-1] / ref - 1) * 100,
-            bo_break_date=dates.iloc[min(first_below, last)].date(),
-            bo_held=(runs[-1]["broken"] - runs[-1]["start"]) if runs and runs[-1]["broken"] is not None else None,
-        )
-    out["bo_history"] = hist_rows
-    return out
+        return {k: None for k in BO_KEYS}
+    return _breakout_np(h["date"].values.astype("datetime64[D]"), h["high"].to_numpy(dtype=float),
+                        h["close"].to_numpy(dtype=float), mode, lookback)
 
 
 def normalize_name(name: str | None) -> str:
@@ -841,17 +927,10 @@ def fetch_fx() -> dict[str, float]:
                  "CNY": 190.0, "CHF": 1560.0}
     else:
         rates = {}
-        try:
-            import yfinance as yf
-            for cur, t in FX_TICKERS.items():
-                try:
-                    h = yf.Ticker(t).history(period="5d")
-                    if not h.empty:
-                        rates[cur] = float(h["Close"].dropna().iloc[-1])
-                except Exception:
-                    continue
-        except ImportError:
-            pass
+        got = _yf_batch(list(FX_TICKERS.values()), "5d", "1d")
+        for cur, t in FX_TICKERS.items():
+            if t in got and not got[t].empty:
+                rates[cur] = float(got[t]["close"].iloc[-1])
         missing = [c for c in FX_TICKERS if c not in rates]
         if missing:
             try:  # 야후가 막히면 공개 환율 API로 보충
@@ -1169,12 +1248,35 @@ def mock_trend(code: str, days: int = 20) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=TREND_COLS)
 
 
+_bg_pool = ThreadPoolExecutor(max_workers=6)     # 화면을 멈추지 않고 뒤에서 새로 받는 일꾼
+_trend_refreshing: set[str] = set()
+
+
+def _refresh_trend(code: str, days: int):
+    old = _trend_cache.get(code)
+    try:
+        df = _fetch_stock_trend_now(code, days)
+        if df.empty and old is not None and not old[1].empty:   # 새로 받기 실패 → 예전 값 두고 1분 뒤 다시
+            _trend_cache[code] = (_time.time() - TREND_TTL + 60, old[1])
+    finally:
+        _trend_refreshing.discard(code)
+
+
 def fetch_stock_trend(code: str, days: int = 20) -> pd.DataFrame:
-    """종목 하나의 최근 일별 개인·외국인·기관 순매수. 10분 동안 기억해요."""
-    import time as _time
+    """종목 하나의 최근 일별 개인·외국인·기관 순매수. 10분 동안 기억해요.
+
+    (속도) 10분이 지난 종목은 기다리지 않고 예전 값을 먼저 보여준 뒤, 뒤에서 새로 받아요.
+    """
     hit = _trend_cache.get(code)
-    if hit and _time.time() - hit[0] < TREND_TTL:
+    if hit:
+        if _time.time() - hit[0] >= TREND_TTL and code not in _trend_refreshing:
+            _trend_refreshing.add(code)
+            _bg_pool.submit(_refresh_trend, code, days)
         return hit[1]
+    return _fetch_stock_trend_now(code, days)
+
+
+def _fetch_stock_trend_now(code: str, days: int = 20) -> pd.DataFrame:
     if MOCK:
         df = mock_trend(code, days)
     else:
@@ -1185,7 +1287,7 @@ def fetch_stock_trend(code: str, days: int = 20) -> pd.DataFrame:
     return df
 
 
-def fetch_stock_trends(codes, workers: int = 8) -> dict[str, pd.DataFrame]:
+def fetch_stock_trends(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
     codes = [c for c in codes if is_kr(c)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return dict(zip(codes, pool.map(fetch_stock_trend, codes)))
@@ -1256,14 +1358,29 @@ def resolve_codes(names) -> tuple[dict[str, str], dict[str, list[tuple[str, str]
     return ok, miss
 
 
+_metrics_memo: dict[str, tuple] = {}
+
+
+def _metrics_cached(code: str, hist, quote, monthly, bo_mode: str) -> dict:
+    """일봉·월봉이 같은 객체이고 시세(현재가·전일·고가·저가)도 그대로면 지난 계산 결과를 다시 써요.
+    장 마감 뒤나 거래가 뜸한 종목은 30초마다 다시 계산하지 않아도 돼요."""
+    qkey = (quote.get("price"), quote.get("prev"), quote.get("high"), quote.get("low")) if quote else None
+    today = now_kst().date()
+    m = _metrics_memo.get(code)
+    if m and m[0] is hist and m[1] is monthly and m[2] == qkey and m[3] == today and m[4] == bo_mode:
+        return m[5]
+    res = compute_metrics(hist, quote, today=today, bo_mode=bo_mode, monthly=monthly)
+    _metrics_memo[code] = (hist, monthly, qkey, today, bo_mode, res)
+    return res
+
+
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
                 shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line",
                 monthlies: dict | None = None) -> pd.DataFrame:
     rows = []
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
-        metrics = compute_metrics(hist, quotes.get(s["code"]), bo_mode=bo_mode,
-                                  monthly=(monthlies or {}).get(s["code"]))
+        metrics = _metrics_cached(s["code"], hist, quotes.get(s["code"]), (monthlies or {}).get(s["code"]), bo_mode)
         market, currency = market_of(s["code"])
         n_shares = (shares or {}).get(s["code"])
         cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
@@ -1327,8 +1444,13 @@ def mock_history(code: str, count: int = 520) -> pd.DataFrame:
     return rows_to_frame(rows)
 
 
+_mock_hist: dict[str, pd.DataFrame] = {}
+
+
 def mock_quote(code: str) -> dict:
-    hist = mock_history(code)
+    hist = _mock_hist.get(code)
+    if hist is None:
+        hist = _mock_hist[code] = mock_history(code)
     last = hist.iloc[-1]
     return {"price": float(last["close"]), "prev": float(hist.iloc[-2]["close"]),
             "high": float(last["high"]), "low": float(last["low"]), "status": "OPEN"}
@@ -1513,10 +1635,67 @@ def fetch_monthly(code: str, count: int = 600) -> pd.DataFrame:
         return empty_frame()
 
 
-def fetch_monthlies(codes, workers: int = 8) -> dict[str, pd.DataFrame]:
+def fetch_monthlies(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
     codes = list(codes)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return dict(zip(codes, pool.map(fetch_monthly, codes)))
+    kr = [c for c in codes if is_kr(c)]
+    os_ = [c for c in codes if not is_kr(c)]
+    out: dict[str, pd.DataFrame] = {}
+    if kr:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            out.update(zip(kr, pool.map(fetch_monthly, kr)))
+    if os_:
+        out.update(_yf_batch(os_, "max", "1mo"))
+        rest = [t for t in os_ if t not in out]
+        if rest:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                out.update(zip(rest, pool.map(fetch_monthly, rest)))
+    return {c: out[c] for c in codes}
+
+
+def _monthly_arrays(monthly: pd.DataFrame | None):
+    if monthly is None or monthly.empty:
+        return None
+    return monthly["date"].values.astype("datetime64[D]"), monthly["high"].to_numpy(dtype=float)
+
+
+def _newhigh_np(dts: np.ndarray, high: np.ndarray, mon) -> dict:
+    out = {k: None for k in NH_KEYS}
+    if len(dts) == 0:
+        return out
+    today = dts[-1]
+    t = today.astype(object)                               # datetime.date
+    starts = {
+        "d": today,
+        "w": today - np.timedelta64(t.weekday(), "D"),
+        "m": np.datetime64(t.replace(day=1), "D"),
+    }
+    mon_ok = mon is not None
+    old_max = None
+    if mon_ok:
+        old = mon[1][mon[0] < starts["m"]]
+        old_max = float(np.nanmax(old)) if len(old) else None
+    for k, st_ in starts.items():
+        bar = dts >= st_
+        if not bar.any():
+            continue
+        before = ~bar
+        n_before = int(before.sum())
+        bar_high = float(np.nanmax(high[bar]))
+        w52 = before & (dts >= st_ - np.timedelta64(364, "D"))
+        if n_before >= 200 and w52.any():
+            out[f"nh52_{k}"] = bool(bar_high > float(np.nanmax(high[w52])))
+        # 역대: 일봉에 있는 과거 + 월봉에 있는 그 이전 전체
+        cands = [float(np.nanmax(high[before]))] if n_before else []
+        if old_max is not None:
+            cands.append(old_max)
+        if cands and (mon_ok or n_before < 200):
+            out[f"ath_{k}"] = bool(bar_high > max(cands))
+    hist_max = float(np.nanmax(high))
+    if mon_ok:
+        hist_max = max(hist_max, float(np.nanmax(mon[1])))
+    out["ath_price"] = hist_max
+    out["ath_ok"] = mon_ok
+    return out
 
 
 def newhigh_flags(h: pd.DataFrame, monthly: pd.DataFrame | None = None) -> dict:
@@ -1525,44 +1704,10 @@ def newhigh_flags(h: pd.DataFrame, monthly: pd.DataFrame | None = None) -> dict:
     - 52주: 그 봉이 시작되기 전 52주(364일) 최고가를 그 봉 고가가 넘었는지
     - 역대: 그 봉이 시작되기 전 상장 이후 전체 최고가를 넘었는지(월봉으로 과거 전체를 봐요)
     """
-    out = {k: None for k in NH_KEYS}
     if h is None or h.empty:
-        return out
-    d = h.copy()
-    d["date"] = pd.to_datetime(d["date"])
-    today = d["date"].iloc[-1].normalize()
-    starts = {
-        "d": today,
-        "w": today - pd.Timedelta(days=today.weekday()),
-        "m": today.replace(day=1),
-    }
-    mon_ok = monthly is not None and not monthly.empty
-    if mon_ok:
-        mm = monthly.copy()
-        mm["date"] = pd.to_datetime(mm["date"])
-    for k, st_ in starts.items():
-        bar = d[d["date"] >= st_]
-        before = d[d["date"] < st_]
-        if bar.empty:
-            continue
-        bar_high = float(bar["high"].max())
-        w52 = before[before["date"] >= st_ - pd.Timedelta(days=364)]
-        if len(before) >= 200 and not w52.empty:
-            out[f"nh52_{k}"] = bool(bar_high > float(w52["high"].max()))
-        # 역대: 일봉에 있는 과거 + 월봉에 있는 그 이전 전체
-        cands = [float(before["high"].max())] if not before.empty else []
-        if mon_ok:
-            old = mm[mm["date"] < starts["m"]]
-            if not old.empty:
-                cands.append(float(old["high"].max()))
-        if cands and (mon_ok or len(before) < 200):
-            out[f"ath_{k}"] = bool(bar_high > max(cands))
-    hist_max = float(d["high"].max())
-    if mon_ok:
-        hist_max = max(hist_max, float(mm["high"].max()))
-    out["ath_price"] = hist_max
-    out["ath_ok"] = mon_ok
-    return out
+        return {k: None for k in NH_KEYS}
+    return _newhigh_np(pd.to_datetime(h["date"]).values.astype("datetime64[D]"),
+                       h["high"].to_numpy(dtype=float), _monthly_arrays(monthly))
 
 
 # ─────────────────────────── 시장신호(지수 신호등 · 지수 RS) ───────────────────────────

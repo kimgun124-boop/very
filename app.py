@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import importlib
+import threading
 import time
 
 import data
@@ -223,19 +224,78 @@ st.markdown(
 )
 
 
-@st.cache_data(ttl=1800, show_spinner="2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
+# ─────────────────────────── 데이터 기억(속도) ───────────────────────────
+# 예전에는 기억 시간(30분·5분·2분…)이 지나면 그 순간 화면이 멈추고 수백 종목을 다시 받았어요.
+# 이제는 처음 한 번만 기다리고, 그 뒤로는 지난 데이터를 바로 보여주면서 뒤에서 새로 받아 바꿔 끼워요.
+# (여러 사람이 봐도 한 번만 받고, 복사 없이 같은 데이터를 같이 써서 메모리도 덜 써요.)
+@st.cache_resource
+def _bg_store() -> dict:
+    return {"lock": threading.Lock(), "items": {}}
+
+
+def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = True, empty=None):
+    """key의 데이터를 돌려줘요. ttl초가 지났으면 지난 값을 먼저 주고 뒤에서 loader()로 새로 받아요.
+    first_wait=False면 처음에도 기다리지 않고 empty를 준 뒤 뒤에서 받아요(없어도 화면이 되는 데이터용)."""
+    store = _bg_store()
+    with store["lock"]:
+        item = store["items"].setdefault(key, {"value": None, "t": 0.0, "busy": False})
+        has_value = item["value"] is not None
+        need = (not has_value) or time.time() - item["t"] >= ttl
+        start_bg = need and not item["busy"] and (has_value or not first_wait)
+        if start_bg:
+            item["busy"] = True
+
+    def work():
+        try:
+            item.update(value=loader(), t=time.time())
+        except Exception:   # 네트워크 오류: 지난 값을 두고 1분 뒤 다시
+            item["t"] = time.time() - ttl + 60
+        finally:
+            item["busy"] = False
+
+    if start_bg:
+        threading.Thread(target=work, daemon=True).start()
+    if has_value:
+        return item["value"]
+    if not first_wait:
+        return empty
+    with st.spinner(spinner or "데이터를 불러오는 중이에요."):
+        with store["lock"]:
+            mine = not item["busy"]
+            if mine:
+                item["busy"] = True
+        if mine:
+            try:
+                item.update(value=loader(), t=time.time())
+            finally:
+                item["busy"] = False
+        else:                       # 다른 사람이 이미 받는 중이면 끝날 때까지 기다려요
+            while item["busy"] and item["value"] is None:
+                time.sleep(0.3)
+            if item["value"] is None:
+                item.update(value=loader(), t=time.time())
+    return item["value"]
+
+
+def swr_clear(*prefixes: str):
+    store = _bg_store()
+    with store["lock"]:
+        for k in [k for k in store["items"] if isinstance(k, tuple) and k[0] in prefixes]:
+            store["items"].pop(k, None)
+
+
 def load_histories(codes: tuple[str, ...]):
-    return data.fetch_histories(codes)
+    return swr(("hist_kr", codes), 1800, lambda: data.fetch_histories(codes),
+               "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
-@st.cache_data(ttl=300, show_spinner="해외 종목 일봉을 불러오는 중이에요.")
 def load_histories_overseas(codes: tuple[str, ...]):
-    return data.fetch_histories(codes, workers=4)
+    return swr(("hist_os", codes), 900, lambda: data.fetch_histories(codes), "해외 종목 일봉을 불러오는 중이에요.")
 
 
-@st.cache_data(ttl=21600, show_spinner="역대 최고가 계산용 월봉(상장 이후 전체)을 불러오는 중이에요. 처음 한 번만 걸려요.")
 def load_monthlies(codes: tuple[str, ...]):
-    return data.fetch_monthlies(codes)
+    """역대 최고가 계산용 월봉. 처음에도 기다리지 않아요(받는 동안은 '역대 신고가'만 잠깐 비어 있어요)."""
+    return swr(("monthly", codes), 21600, lambda: data.fetch_monthlies(codes), first_wait=False, empty={})
 
 
 @st.cache_resource
@@ -275,14 +335,12 @@ def load_shares() -> dict:
     return store
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def load_fx():
-    return data.fetch_fx()
+    return swr(("fx",), 3600, data.fetch_fx, "환율을 불러오는 중이에요.")
 
 
-@st.cache_data(ttl=120, show_spinner=False)
 def load_indexes():
-    return data.fetch_index_histories()
+    return swr(("indexes",), 120, data.fetch_index_histories, "지수·환율·유가를 불러오는 중이에요.")
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -290,9 +348,9 @@ def load_overview():
     return data.fetch_market_overview()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def load_flows():
-    return data.fetch_investor_flows(load_overview())
+    overview = load_overview()
+    return swr(("flows",), 300, lambda: data.fetch_investor_flows(overview), "투자자별 순매수를 불러오는 중이에요.")
 
 
 def load_trends(codes: tuple[str, ...]) -> dict:
@@ -373,8 +431,7 @@ with st.sidebar:
     if st.button("시세 지금 새로고침"):
         load_quotes.clear()
     if st.button("일봉까지 다시 받기", help="52주 최고가가 이상해 보일 때 눌러요."):
-        load_histories.clear()
-        load_histories_overseas.clear()
+        swr_clear("hist_kr", "hist_os", "monthly")
         _shares_store().update(t=0.0, ok=False)
         load_quotes.clear()
 
@@ -805,6 +862,13 @@ def _pct(v) -> str:
     return "-" if pd.isna(v) else f"{v:.1f}%"
 
 
+CARD_STEP = 60   # 휴대폰 카드는 한 번에 60장씩(수백 장을 30초마다 다시 그리면 휴대폰이 버벅여요)
+
+
+def _more_cards(limit: int):
+    st.session_state["card_limit"] = limit + CARD_STEP
+
+
 def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
     """휴대폰 화면용: 표 대신 카드 목록. CSS가 좁은 화면에서만 보여줘요."""
     kpis = (
@@ -814,7 +878,10 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
         f'<div><span>정배열</span><b>{n_aligned}</b></div></div>'
     )
     cards = []
-    for r in f[f["price"].notna()].itertuples():
+    shown = f[f["price"].notna()]
+    limit = st.session_state.get("card_limit", CARD_STEP)
+    total = len(shown)
+    for r in shown.head(limit).itertuples():
         hot = pd.notna(r.days_since_high) and r.days_since_high <= recent_days
         if pd.isna(r.change) or r.change == 0:
             chg = '<span class="c-chg">-</span>' if pd.isna(r.change) else '<span class="c-chg">0.00%</span>'
@@ -851,6 +918,8 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
             + f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
         )
     st.markdown(kpis + '<div class="cards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+    if total > limit:
+        st.button(f"카드 더 보기 ({limit}/{total})", key="card_more", on_click=_more_cards, args=(limit,))
     st.caption("카드를 누르면 종목 화면이 열려요. 국내는 네이버 증권, 해외는 야후 파이낸스예요.")
 
 
