@@ -24,7 +24,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
             "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
             "fetch_financials", "fetch_financials_many", "earnings_trend",
-            "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs")
+            "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs",
+            "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
@@ -1076,6 +1077,141 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
         st.link_button("야후 파이낸스에서 보기", row.url)
 
 
+# ─────────────────────────── 매수 후보 ───────────────────────────
+BUY_TIER_STYLE = {"매수 가능": ("#1B8A4B", "✅"), "종가 확인": ("#A87400", "⏳"),
+                  "시장 대기": ("#C0262E", "⛔"), "1개 미충족": ("#51616C", "⚠️")}
+
+
+def _buy_params() -> dict:
+    """원칙은 고정값, 숫자를 정해 주지 않은 기준만 바꿀 수 있게."""
+    d = data.BUY_DEFAULTS
+    with st.expander("판정 기준 보기·조정, 계좌 금액 입력"):
+        st.markdown(
+            "**내 원칙(고정)** — 코스피·코스닥 둘 다 60일선 위일 때만 · 주도섹터(분류 안 52주 신고가 "
+            f"{min_count}종목 이상, 최근 {recent_days}거래일) 소속 · 52주 신고가 돌파 유지(52주 안 첫 돌파를 맨 위로) · "
+            "RS 70 이상이면서 코스피·코스닥 지수 RS보다 위 · 정배열(단, 강한 종목 + 신고가 돌파면 면제) · ADX 20 이상 · 영업이익·EPS 정배열 · 손절 8%(ATR 8% 이상이면 ATR) · "
+            "1회 위험 계좌 1.5% · 최대 8종목 · 3R에서 절반 익절")
+        st.caption("아래는 원칙에 숫자가 없어서 정해 둔 기본값이에요. 내 기준에 맞게 바꿔도 돼요.")
+        c1, c2, c3 = st.columns(3)
+        fresh = c1.number_input("돌파 후 며칠 이내", 1, 20, d["fresh_days"], key="buy_fresh",
+                                help="돌파 유지 1일째 = 돌파한 날. 너무 오래된 돌파는 타점이 지났다고 봐요.")
+        ext = c2.number_input("20일선 이격 최대(%)", 5.0, 50.0, d["max_ext"], step=1.0, key="buy_ext",
+                              help="원칙: 이평선에서 너무 뜬(단기 과열) 종목은 피하기")
+        cap = c3.number_input("최소 시가총액(억원)", 0.0, 100000.0, d["min_cap"], step=500.0, key="buy_cap",
+                              help="원칙: 너무 작은 종목·테마성 소형주 피하기")
+        c4, c5, c6 = st.columns(3)
+        vol = c4.number_input("돌파일 거래량(50일 평균의 몇 배)", 1.0, 5.0, d["vol_mult"], step=0.1, key="buy_vol",
+                              help="원칙: 3stage 돌파는 큰 거래량")
+        dcr = c5.number_input("돌파일 DCR 최소(%)", 0.0, 100.0, d["dcr_min"], step=5.0, key="buy_dcr",
+                              help="원칙: 강한 종가(DCR 100%에 가까울수록 고가 근처 마감)")
+        first_only = st.toggle("52주 안 첫 돌파만 보기", value=d["first_only"], key="buy_first",
+                               help="끄면 첫 돌파를 맨 위에 두고 2번째 이상 돌파도 보여줘요. 켜면 첫 돌파만 통과.")
+        equity = c6.number_input("계좌 평가금액(원, 수량 계산용)", 0, 10_000_000_000, 0, step=1_000_000,
+                                 key="buy_equity", help="0이면 수량 계산을 안 해요. 이 값은 저장되지 않아요.")
+    return {**d, "first_only": bool(first_only), "fresh_days": int(fresh), "max_ext": float(ext), "min_cap": float(cap),
+            "vol_mult": float(vol), "dcr_min": float(dcr), "earn_years": earn_years, "equity": float(equity or 0)}
+
+
+def render_buy(df: pd.DataFrame, quotes: dict):
+    """내 매매 원칙을 모두 통과한 국내 종목. 산업·태그 필터와 관계없이 보드 전체에서 찾아요."""
+    st.subheader("🎯 매수 후보 — 내 매매 원칙 기준")
+    p = _buy_params()
+    hist = load_indexes()
+    parts, oks = [], []
+    for name, sym in data.MARKETS.items():
+        sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
+        ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
+        oks.append(ok)
+        parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
+    market_ok = None if None in oks else all(oks)
+    idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
+              for name, sym in data.MARKETS.items()}
+    market_text = " · ".join(parts)
+    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    intraday = data.market_status(quotes).startswith("장중")
+
+    if market_ok is True:
+        st.success(f"시장 조건 통과 — {market_text}")
+    elif market_ok is False:
+        st.error(f"⛔ 매수 쉬는 구간 — {market_text}. 원칙: 코스피·코스닥이 60일선 이하면 쉰다. "
+                 "아래는 시장이 돌아왔을 때 볼 종목(참고용)이에요.")
+    else:
+        st.warning("지수 데이터를 아직 못 받아서 시장 조건을 확인할 수 없어요. 확인될 때까지 매수 가능으로 표시하지 않아요.")
+    if not leaders:
+        st.error("⛔ 주도섹터가 없어요 — 원칙: 주도섹터가 없으면 돌파매매 안 함. 매수 가능 종목이 나올 수 없어요.")
+
+    pre = data.buy_screen(df, market_ok, market_text, leaders, p, fins=None, intraday=intraday, idx_rs=idx_rs)
+    if pre.empty:
+        st.info("원칙에 맞는 종목도, 하나만 빠지는 종목도 지금은 없어요.")
+        return
+    codes = tuple(pre["code"])
+    with st.spinner(f"후보 {len(codes)}종목의 영업이익·EPS를 확인하는 중이에요."):
+        fins = data.fetch_financials_many(codes)
+    res = data.buy_screen(df[df["code"].isin(codes)], market_ok, market_text, leaders, p, fins=fins, intraday=intraday,
+                          idx_rs=idx_rs)
+    if res.empty:
+        st.info("실적까지 확인하니 원칙에 맞는 종목이 없어요.")
+        return
+    trends = data.fetch_stock_trends(tuple(res["code"]))
+    counts = res["tier"].value_counts()
+    st.markdown(" · ".join(f"{BUY_TIER_STYLE[t][1]} **{t} {counts.get(t, 0)}**" for t in BUY_TIER_STYLE
+                           if counts.get(t, 0)))
+
+    labels = dict(data.BUY_RULES)
+    rows = []
+    for x in res.itertuples():
+        r, c = x.row, x.checks
+        plan = data.position_plan(float(r["price"]), r.get("atr_pct"), p["equity"], p)
+        sm = data.trend_summary(trends.get(x.code))
+        rows.append({
+            "상태": f"{BUY_TIER_STYLE[x.tier][1]} {x.tier}",
+            "종목": x.name, "분류": x.group,
+            "미충족": ", ".join(f"{labels[k]}({c[k][1]})" for k in x.fails) or "-",
+            "현재가": r["price"], "등락률": r["change"],
+            "돌파 유지": c["breakout"][1], "RS": r.get("rs"), "ADX": r.get("adx"),
+            "20일선 이격": r.get("dist_ma20"), "돌파일 거래량": r.get("bo_vol_ratio"), "DCR": r.get("bo_dcr"),
+            "시가총액(원)": r.get("cap_krw"),
+            "손절가": plan["stop_price"], "손절폭": plan["stop_pct"], "3R 목표가": plan["target_price"],
+            "수량": plan["shares"], "매수금액": plan["amount"], "비중": plan["weight"],
+            "외국인 5일(억)": sm["flow5_외국인"], "기관 5일(억)": sm["flow5_기관"],
+            "메모": " · ".join(t for t in ("⭐ 52주 안 첫 돌파" if r.get("bo_nth") == 1 else "",
+                                          "HTF — 리스크 더 타이트하게" if r.get("htf") else "") if t),
+        })
+    view = pd.DataFrame(rows)
+    if not p["equity"]:
+        view = view.drop(columns=["수량", "매수금액", "비중"])
+    fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "RS": "{:.0f}", "ADX": "{:.0f}", "20일선 이격": "{:+.1f}%",
+           "돌파일 거래량": "{:.1f}배", "DCR": "{:.0f}%", "시가총액(원)": data.format_krw, "손절가": "{:,.0f}",
+           "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}", "비중": "{:.1f}%",
+           "외국인 5일(억)": _eok_num, "기관 5일(억)": _eok_num}
+    fmt = {k: v for k, v in fmt.items() if k in view.columns}
+    st.dataframe(
+        view.style.format(fmt, na_rep="-")
+        .map(lambda v: f"color: {BUY_TIER_STYLE[v.split(' ', 1)[1]][0]}; font-weight: 700", subset=["상태"])
+        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}",
+             subset=["등락률", "외국인 5일(억)", "기관 5일(억)"]),
+        hide_index=True, height=min(560, 36 * (len(view) + 1) + 4),
+        column_config={"미충족": st.column_config.TextColumn(width="large")},
+    )
+
+    good = res[res["tier"].isin(["매수 가능", "종가 확인", "시장 대기"])]
+    for x in good.itertuples():
+        with st.expander(f"{BUY_TIER_STYLE[x.tier][1]} {x.name} — 조건 하나씩 보기"):
+            st.markdown("\n".join(
+                f"- {'✅' if x.checks[k][0] is True else ('❔' if x.checks[k][0] is None else '❌')} "
+                f"**{lab}** — {x.checks[k][1]}" for k, lab in data.BUY_RULES))
+            if x.tier == "종가 확인":
+                st.caption("오늘 장중에 돌파한 종목이에요. 종가가 직전 52주 최고가 위에서 마감하는지 확인하고 들어가요.")
+    st.caption(
+        "산업·태그 필터와 관계없이 보드의 국내 종목 전체에서 찾아요(해외 종목은 시장 조건을 코스피·코스닥으로 볼 수 없어 빠져요). "
+        "⏳ 종가 확인 = 오늘 장중 돌파라 종가 확인 전 · ⛔ 시장 대기 = 종목은 통과했지만 시장 조건 미충족 · "
+        "⚠️ 1개 미충족 = 조건 하나만 빠진 관심 종목(매수 대상 아님). "
+        "손절가는 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR), 수량은 계좌의 1.5%를 잃도록 계산해요. "
+        "종목별 수급은 네이버가 투신·연기금을 따로 주지 않아 외국인·기관 5일 합계를 참고로 보여줘요. "
+        "HTS 차트(베이스·호가·돌파봉)로 마지막 확인은 꼭 직접 하세요.")
+
+
+
 def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
@@ -1165,6 +1301,8 @@ def render_board():
 
     render_market(df)
     render_radar(df)
+    with st.container(key="buy_box", border=True):
+        render_buy(df, quotes)
     f = apply_filters(df)
     if only_earn:
         fins = load_financials(tuple(c for c in f["code"] if data.is_kr(c)))

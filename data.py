@@ -159,6 +159,7 @@ def parse_polling(text: str) -> dict[str, dict]:
                 "prev": to_num(item.get("pcv")) or to_num(item.get("sv")),
                 "high": to_num(item.get("hv")),
                 "low": to_num(item.get("lv")),
+                "volume": to_num(item.get("aq")),
                 "status": item.get("ms"),
             }
     return out
@@ -400,11 +401,13 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
         **{k: None for k in BO_KEYS},
         **{k: None for k in NH_KEYS},
+        **{k: None for k in EXTRA_KEYS},
     }
     if hist is None or hist.empty:
         return res
 
     dts, highs, lows, closes0 = _arrays(hist)
+    vols = hist["volume"].to_numpy(dtype=float) if "volume" in hist else np.full(len(dts), np.nan)
     today64 = np.datetime64(today, "D")
     last_is_today = dts[-1] == today64
 
@@ -476,12 +479,80 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     res["rs_raw"] = rs_raw_score(rets)
     res.update(_breakout_np(dts, hh, cc, bo_mode))
     res.update(_newhigh_np(dts, hh, _monthly_arrays(monthly)))
+    vv = vols.copy()
+    q_vol = quote.get("volume") if quote else None
+    if last_is_today and q_vol and not (vv[-1] >= q_vol):
+        vv[-1] = float(q_vol)                          # 일봉(30분마다)보다 실시간 누적 거래량이 더 최신
+    res.update(_extras(dts, hh, ll, cc, vv, price, res.get("bo_date") if res.get("bo_status") == "유지" else None))
     return res
+
+
+# ─────────────────────────── 매수 후보 판정용 추가 지표 ───────────────────────────
+EXTRA_KEYS = ("ma20", "dist_ma20", "adx", "bo_vol_ratio", "bo_dcr", "htf")
+
+
+def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> float | None:
+    """ADX(14), 와일더 방식. 20 미만 = 추세 약함/횡보, 20~40 = 추세, 40 이상 = 강한 추세."""
+    m = len(close)
+    if m < 2 * n + 1:
+        return None
+    h, l, c = high.tolist(), low.tolist(), close.tolist()
+    trs, pdm, mdm = [], [], []
+    for t in range(1, m):
+        up, dn = h[t] - h[t - 1], l[t - 1] - l[t]
+        pdm.append(up if (up > dn and up > 0) else 0.0)
+        mdm.append(dn if (dn > up and dn > 0) else 0.0)
+        trs.append(max(h[t], c[t - 1]) - min(l[t], c[t - 1]))
+    s_tr, s_p, s_m = sum(trs[:n]), sum(pdm[:n]), sum(mdm[:n])
+    dxs = []
+    for i in range(n, len(trs) + 1):
+        if i > n:
+            s_tr += trs[i - 1] - s_tr / n
+            s_p += pdm[i - 1] - s_p / n
+            s_m += mdm[i - 1] - s_m / n
+        if s_tr <= 0:
+            dxs.append(0.0)
+            continue
+        pdi, mdi = 100 * s_p / s_tr, 100 * s_m / s_tr
+        dxs.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0.0)
+    if len(dxs) < n:
+        return None
+    adx = sum(dxs[:n]) / n
+    for x in dxs[n:]:
+        adx = (adx * (n - 1) + x) / n
+    return float(adx)
+
+
+def _extras(dts, high, low, close, vol, price: float, bo_date) -> dict:
+    """20일선 이격, ADX, 돌파일 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR), HTF 여부."""
+    out = {k: None for k in EXTRA_KEYS}
+    n = len(close)
+    if n >= 20:
+        ma20 = float(close[-20:].mean())
+        out["ma20"] = ma20
+        out["dist_ma20"] = (price / ma20 - 1) * 100 if ma20 else None
+    out["adx"] = _adx(high, low, close)
+    if bo_date is not None:
+        idx = np.nonzero(dts == np.datetime64(bo_date, "D"))[0]
+        if len(idx):
+            t = int(idx[0])
+            base = vol[max(0, t - 50):t]
+            base = base[~np.isnan(base)]
+            if len(base) >= 20 and base.mean() > 0 and vol[t] == vol[t]:
+                out["bo_vol_ratio"] = float(vol[t] / base.mean())
+            rng = high[t] - low[t]
+            out["bo_dcr"] = float((close[t] - low[t]) / rng * 100) if rng > 0 else 100.0
+    # HTF: 최근 60거래일 안에, 그 전 40거래일 최저가 대비 종가가 100% 넘게 오른 적이 있으면
+    if n >= 60:
+        lows_min = pd.Series(low).rolling(40, min_periods=20).min().shift(1).to_numpy()
+        ratio = close[-60:] / lows_min[-60:]
+        out["htf"] = bool(np.nanmax(ratio) >= 2.0) if np.isfinite(ratio).any() else False
+    return out
 
 
 # ─────────────────────────── RS · ATR · 신고가 돌파 유지 ───────────────────────────
 ATR_DAYS = 20          # 20거래일 ATR
-BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_held", "bo_history")
+BO_KEYS = ("bo_date", "bo_level", "bo_days", "bo_status", "bo_vs", "bo_break_date", "bo_held", "bo_history", "bo_nth")
 BO_MODES = {
     "line": "돌파선(직전 52주 최고가)",
     "close": "첫 신고가일 종가",
@@ -574,6 +645,8 @@ def _breakout_np(dts: np.ndarray, high: np.ndarray, close: np.ndarray, mode: str
     } for r in runs[-6:]][::-1]
 
     if cur is not None:                                   # 지금 유지 중
+        # 몇 번째 돌파인지: 지금 돌파 전 250거래일(52주) 안에 다른 돌파(유지 구간)가 있었으면 2번째 이상
+        out["bo_nth"] = 1 + sum(1 for r in runs[:-1] if r["start"] >= cur["start"] - lookback)
         out.update(
             bo_status="유지", bo_level=cur["level"], bo_date=day(cur["start"]),
             bo_days=last - cur["start"] + 1, bo_held=last - cur["start"] + 1,
@@ -1752,3 +1825,140 @@ def index_rs(index_df: pd.DataFrame | None, board: pd.DataFrame) -> dict:
         pct = ((vals < v).sum() + 0.5 * (vals == v).sum()) / len(vals)
         out[col] = round(pct * 98 + 1)
     return out
+
+
+# ─────────────────────────── 매수 후보(효석 매매 원칙) ───────────────────────────
+# 원칙(내가 정한 규칙) — 바꾸지 않는 조건
+#   시장: 코스피·코스닥이 60일선 이하면 쉰다 / 주도섹터(분류 안 52주 신고가 2종목 이상)가 있을 때만 돌파매매
+#   종목: 1stage = 정배열 + 52주 신고가 돌파, RS 70 이상, 단기 과열(이평선 이격 과다) 피하기, ADX 20 이상(추세),
+#         3stage 돌파봉 = 큰 거래량 + 강한 종가(DCR), 너무 작은 종목 제외, 매출·영업이익·순이익 균형 성장
+#   리스크: 1R 손절 8%(ATR이 8% 이상이면 ATR까지), 1회 위험 계좌의 1.5%, 최대 8종목, 3R에서 절반 익절
+# 숫자로 정해 주지 않은 기준(돌파 후 며칠, 20일선 이격 %, 거래량 배수, DCR %, 최소 시총)은 기본값이고 앱에서 바꿀 수 있어요.
+BUY_DEFAULTS = {
+    "rs_min": 70,          # 원칙
+    "adx_min": 20,         # 원칙
+    "fresh_days": 5,       # 기본값: 돌파(유지 1일) 후 5거래일 이내만
+    "max_ext": 15.0,       # 기본값: 20일선 대비 +15% 넘게 뜬 종목은 과열로 제외
+    "vol_mult": 1.5,       # 기본값: 돌파일 거래량 ≥ 직전 50일 평균 × 1.5
+    "dcr_min": 70.0,       # 기본값: 돌파일 종가가 그날 고저 범위의 위쪽 30% 안
+    "min_cap": 3000.0,     # 기본값: 시총 3,000억원 이상(억원)
+    "first_only": False,   # 켜면 52주 안 첫 돌파만(원칙: 첫 돌파가 가장 좋음 → 기본은 첫 돌파를 맨 위로 정렬)
+    "stop_pct": 8.0,       # 원칙
+    "risk_pct": 1.5,       # 원칙
+    "max_pos": 8,          # 원칙
+}
+
+BUY_RULES = [   # (키, 표시 이름)
+    ("market", "지수 60일선 위(코스피·코스닥)"),
+    ("leader", "주도섹터 소속"),
+    ("breakout", "52주 신고가 돌파 유지(최근)"),
+    ("aligned", "정배열(강한 종목은 면제)"),
+    ("rs", "RS(70↑ · 코스피·코스닥 RS보다 위)"),
+    ("ext", "과열 아님(20일선 이격)"),
+    ("adx", "ADX 추세"),
+    ("volume", "돌파일 거래량"),
+    ("dcr", "돌파일 종가 강도(DCR)"),
+    ("cap", "시가총액"),
+    ("earn", "실적 정배열(영업이익·EPS)"),
+]
+
+
+def buy_checks(r, market_ok: bool | None, market_text: str, leaders: set, p: dict, earn=None,
+               idx_rs: dict | None = None) -> dict:
+    """한 종목의 조건별 (통과 True/False/모름 None, 설명)."""
+    def num(v):
+        return None if v is None or (isinstance(v, float) and v != v) else v
+
+    c = {}
+    c["market"] = (market_ok, market_text)
+    c["leader"] = (r["group"] in leaders, "주도섹터" if r["group"] in leaders else "주도섹터 아님")
+    days = num(r.get("bo_days"))
+    if r.get("bo_status") == "유지" and days is not None:
+        nth = num(r.get("bo_nth"))
+        nth_txt = (" · 52주 안 첫 돌파" if nth == 1 else f" · 52주 안 {int(nth)}번째 돌파") if nth else ""
+        ok = days <= p["fresh_days"] and (nth == 1 or not p.get("first_only"))
+        c["breakout"] = (ok, f"돌파 유지 {int(days)}일째{nth_txt}")
+    else:
+        c["breakout"] = (False, f"이탈 {int(days)}일" if r.get("bo_status") == "이탈" and days else "돌파 아님")
+    # RS: 70 이상 + 코스피·코스닥 지수 RS보다 모두 높아야(시장보다 강한 종목). 지수 RS를 모르면 통과 아님
+    rs = num(r.get("rs"))
+    idx_rs = idx_rs or {}
+    known = {k: v for k, v in idx_rs.items() if v is not None}
+    if rs is None:
+        c["rs"] = (None, "RS 없음")
+    elif len(known) < len(idx_rs) or not idx_rs:
+        c["rs"] = (None, f"RS {rs:.0f} · 지수 RS 모름")
+    else:
+        beat = all(rs > v for v in known.values())
+        idx_txt = " · ".join(f"{k} {v:.0f}" for k, v in known.items())
+        c["rs"] = (rs >= p["rs_min"] and beat, f"RS {rs:.0f} (지수 {idx_txt})")
+    # 정배열: 강한 종목(RS 조건 통과) + 52주 신고가 돌파면 정배열이 아니어도 괜찮아요
+    if r.get("aligned") is True:
+        c["aligned"] = (True, "정배열")
+    elif c["rs"][0] is True and r.get("bo_status") == "유지":
+        c["aligned"] = (True, "정배열 아님 — 강한 종목 + 신고가 돌파라 허용")
+    else:
+        c["aligned"] = (False, "정배열 아님(RS 조건·돌파 중 하나가 안 돼서 면제 안 됨)")
+    ext = num(r.get("dist_ma20"))
+    c["ext"] = (None if ext is None else ext <= p["max_ext"], f"20일선 {ext:+.1f}%" if ext is not None else "-")
+    adx = num(r.get("adx"))
+    c["adx"] = (None if adx is None else adx >= p["adx_min"], f"ADX {adx:.0f}" if adx is not None else "-")
+    vr = num(r.get("bo_vol_ratio"))
+    c["volume"] = (None if vr is None else vr >= p["vol_mult"], f"거래량 {vr:.1f}배" if vr is not None else "돌파일 없음")
+    dcr = num(r.get("bo_dcr"))
+    c["dcr"] = (None if dcr is None else dcr >= p["dcr_min"], f"DCR {dcr:.0f}%" if dcr is not None else "돌파일 없음")
+    cap = num(r.get("cap_krw"))
+    c["cap"] = (None if cap is None else cap / 1e8 >= p["min_cap"], format_krw(cap) + "원" if cap is not None else "시총 모름")
+    if earn is None:
+        c["earn"] = (None, "실적 미확인")
+    else:
+        ok = earn.get("earn_ok")
+        c["earn"] = (ok, {True: "정배열", False: "정배열 아님", None: "판정 불가(전망 없음)"}[ok])
+    return c
+
+
+def position_plan(price: float, atr: float | None, equity: float | None, p: dict) -> dict:
+    """1R 손절(8%, ATR이 8% 이상이면 ATR), 계좌 1.5% 위험 기준 수량, 3R 목표가."""
+    stop_pct = p["stop_pct"]
+    if atr is not None and atr == atr and atr >= p["stop_pct"]:
+        stop_pct = float(atr)
+    out = {"stop_pct": stop_pct, "stop_price": price * (1 - stop_pct / 100),
+           "target_price": price * (1 + 3 * stop_pct / 100), "shares": None, "amount": None, "weight": None}
+    if equity and price:
+        risk_won = equity * p["risk_pct"] / 100
+        shares = int(risk_won // (price * stop_pct / 100))
+        shares = min(shares, int(equity // price))           # 계좌보다 크게는 못 사요
+        out.update(shares=shares, amount=shares * price, weight=shares * price / equity * 100)
+    return out
+
+
+def buy_screen(df: pd.DataFrame, market_ok: bool | None, market_text: str, leaders: set, p: dict,
+               fins: dict | None = None, intraday: bool = False, idx_rs: dict | None = None) -> pd.DataFrame:
+    """국내 종목만. tier: 매수 가능 / 종가 확인 / 1개 미충족. 나머지는 빼요."""
+    rows = []
+    for _, r in df[df["code"].map(is_kr) & df["price"].notna()].iterrows():
+        earn = earnings_trend(fins.get(r["code"]), p.get("earn_years", 3)) if fins is not None else None
+        c = buy_checks(r, market_ok, market_text, leaders, p, earn, idx_rs)
+        # fins=None(1차 거르기)일 때는 실적을 아직 안 봤으니 빼고 세요. 실적은 남은 후보만 받아서 2차로 확인해요.
+        fails = [k for k, _ in BUY_RULES if (k != "earn" or fins is not None) and c[k][0] is not True]
+        stock_fails = [k for k in fails if k != "market"]
+        if len(stock_fails) > 1:
+            continue
+        if not stock_fails:
+            if market_ok is not True:
+                tier = "시장 대기"
+            elif intraday and r.get("bo_days") == 1:
+                tier = "종가 확인"
+            else:
+                tier = "매수 가능"
+        else:
+            tier = "1개 미충족"
+        rows.append({"code": r["code"], "name": r["name"], "group": r["group"], "tier": tier,
+                     "fails": stock_fails, "checks": c, "row": r})
+    order = {"매수 가능": 0, "종가 확인": 1, "시장 대기": 2, "1개 미충족": 3}
+    # 같은 등급 안에서는 52주 안 첫 돌파 → 돌파가 최근일수록 → RS 높은 순
+    def nth(x):
+        v = x["row"].get("bo_nth")
+        return 99 if v is None or v != v else int(v)
+    rows.sort(key=lambda x: (order[x["tier"]], nth(x), x["row"].get("bo_days") or 99, -(x["row"].get("rs") or 0)))
+    return pd.DataFrame(rows, columns=["code", "name", "group", "tier", "fails", "checks", "row"])
