@@ -883,37 +883,37 @@ def _rs_color(v):
 def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
         "종목": f["name"],
-        "현재가": f["price"],
-        "등락률": f["change"],
-        "신고가까지": f["to_high"],
-        "돌파": f.apply(_bo_full, axis=1),
-        "RS": f["rs"],
-        "섹터 순위": f.apply(lambda r: "-" if pd.isna(r["lead_rank"]) else
-                         (f"👑 1/{int(r['lead_n'])}" if r["lead_rank"] == 1 and r["lead_ok"] else f"{int(r['lead_rank'])}/{int(r['lead_n'])}"), axis=1),
+        "코드": f["code"],
+        "시장": f["market"],
         "분류": f["group"],
+        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
+        "현재가": f["price"],
         "시가총액(원)": f["cap_krw"],
+        "등락률": f["change"],
         **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
             "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
             "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
-        "52주 위치": f["pos"],
         "52주 최고": f["high52"],
         "괴리율": f["gap"],
+        "신고가까지": f["to_high"],
+        "52주 위치": f["pos"],
         "신고가 후": f["days_since_high"],
+        "돌파": f.apply(_bo_full, axis=1),
         "52주 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "nh52"), axis=1),
         "역대 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "ath"), axis=1),
+        "섹터 순위": f.apply(lambda r: "-" if pd.isna(r["lead_rank"]) else
+                         (f"👑 1/{int(r['lead_n'])}" if r["lead_rank"] == 1 and r["lead_ok"] else f"{int(r['lead_rank'])}/{int(r['lead_n'])}"), axis=1),
+        "RS": f["rs"],
         "RS(1M)": f["rs_1m"],
         "RS(3M)": f["rs_3m"],
         "RS(6M)": f["rs_6m"],
         "ATR%(20일)": f["atr_pct"],
         "정배열": f["aligned"],
-        "코드": f["code"],
-        "시장": f["market"],
-        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
         "설명": f["desc"],
     })
 
-    full = st.toggle("모든 열 보기", key="tbl_full", help="수급 하루치, 52주 최고, RS 1·3·6개월, ATR, 코드 등")
-    if not full:
+    simple = st.toggle("간단히 보기", key="tbl_simple", help="꼭 볼 열만: 신고가까지 · 돌파 · RS · 섹터 순위 · 5일 수급")
+    if simple:
         keep = ["종목", "현재가", "등락률", "신고가까지", "돌파", "RS", "섹터 순위", "분류", "시가총액(원)",
                 "외국인 5일(억원)", "기관 5일(억원)", "52주 위치"]
         view = view[[c for c in keep if c in view.columns]]
