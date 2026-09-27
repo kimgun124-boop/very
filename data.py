@@ -2551,7 +2551,7 @@ def rotation_confirm(df: pd.DataFrame, a_groups, b_groups, p: dict | None = None
         verdict = ("돈이 빠지는 중", "기존 리더도 약하고 받아가는 쪽도 없음 — 로테이션이 아니라 이탈(4번)",
                    "종목 이름만 바꾸지 말고 현금 확대 · 새 종목을 찾아 헤매지 않기")
     return {"b_checks": b_checks, "a_checks": a_checks, "b_ok": b_ok, "b_known": b_known, "a_ok": a_ok,
-            "a_rs_weak": a_rs_weak,
+            "a_rs_weak": a_rs_weak, "b_share": (bs_prev, bs_now),
             "verdict": verdict, "A": ma, "B": mb, "ALL": mall, "defense": defense}
 
 
