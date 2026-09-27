@@ -483,12 +483,14 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     q_vol = quote.get("volume") if quote else None
     if last_is_today and q_vol and not (vv[-1] >= q_vol):
         vv[-1] = float(q_vol)                          # 일봉(30분마다)보다 실시간 누적 거래량이 더 최신
-    res.update(_extras(dts, hh, ll, cc, vv, price, res.get("bo_date") if res.get("bo_status") == "유지" else None))
+    res.update(_extras(dts, hh, ll, cc, vv, price, res.get("bo_date") if res.get("bo_status") == "유지" else None,
+                       last_is_today))
     return res
 
 
 # ─────────────────────────── 매수 후보 판정용 추가 지표 ───────────────────────────
-EXTRA_KEYS = ("ma20", "dist_ma20", "adx", "bo_vol_ratio", "bo_dcr", "htf")
+EXTRA_KEYS = ("ma20", "dist_ma20", "adx", "bo_vol_ratio", "bo_dcr", "htf", "ma5", "ma50", "ma5_vs_50", "tv20",
+              "vol_today", "dcr_today")
 
 
 def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> float | None:
@@ -523,10 +525,27 @@ def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> f
     return float(adx)
 
 
-def _extras(dts, high, low, close, vol, price: float, bo_date) -> dict:
-    """20일선 이격, ADX, 돌파일 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR), HTF 여부."""
+def _extras(dts, high, low, close, vol, price: float, bo_date, last_is_today: bool = False) -> dict:
+    """20일선 이격, ADX, 돌파일 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR), HTF 여부,
+    끌고 가기 점검용 5일선·50일선, 주도주 판정용 20일 평균 거래대금(원)."""
     out = {k: None for k in EXTRA_KEYS}
     n = len(close)
+    if n >= 50:
+        ma5, ma50 = float(close[-5:].mean()), float(close[-50:].mean())
+        out.update(ma5=ma5, ma50=ma50, ma5_vs_50=(ma5 / ma50 - 1) * 100 if ma50 else None)
+    # 거래대금 = 종가 × 거래량. 오늘 장중 봉은 덜 쌓였으니 빼고 직전 20거래일 평균
+    end = n - 1 if last_is_today else n
+    tv = close[max(0, end - 20):end] * vol[max(0, end - 20):end]
+    tv = tv[np.isfinite(tv)]
+    out["tv20"] = float(tv.mean()) if len(tv) >= 10 else None
+    # 오늘(마지막) 봉: 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR)
+    if n >= 21:
+        base = vol[max(0, n - 51):n - 1]
+        base = base[np.isfinite(base)]
+        if len(base) >= 20 and base.mean() > 0 and np.isfinite(vol[-1]):
+            out["vol_today"] = float(vol[-1] / base.mean())
+        rng = high[-1] - low[-1]
+        out["dcr_today"] = float((close[-1] - low[-1]) / rng * 100) if rng > 0 else 100.0
     if n >= 20:
         ma20 = float(close[-20:].mean())
         out["ma20"] = ma20
@@ -1471,7 +1490,50 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict,
             "name_ok": name_matches(s["name"], naver_name),
             "error": error if metrics["price"] is None else None,
         })
-    return add_rs_ranks(pd.DataFrame(rows))
+    return add_leader_ranks(add_rs_ranks(pd.DataFrame(rows)))
+
+
+LEADER_RS_MIN = 70
+
+
+def add_leader_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """섹터(세부 분류) 안 주도주 순위. 원칙: 그 섹터에서 가장 강하고(RS) 시총이 크고 거래량이 많은(거래대금) 종목.
+
+    국내 종목끼리 분류마다 RS·시가총액·20일 평균 거래대금을 각각 백분위로 바꿔 똑같이 1/3씩 더해요.
+    값이 없는 항목은 그 분류에서 가장 낮은 것으로 쳐요(모르는 걸 좋게 보지 않기). 1위 = 대장주.
+    단, '가장 강한 종목'이 먼저라서 RS 70 미만은 시총·거래대금이 아무리 커도 RS 70 이상 종목들 뒤로 가요.
+    분류에 RS 70 이상이 하나도 없으면 대장주가 없어요(lead_ok=False).
+    """
+    df = df.copy()
+    for col in ("lead_rank", "lead_n", "lead_score", "lead_rs_rank", "lead_cap_rank", "lead_tv_rank"):
+        df[col] = np.nan
+    df["lead_ok"] = False
+    if df.empty:
+        return df
+    kr = df["code"].map(is_kr) & df["price"].notna()
+    for _, idx in df[kr].groupby("group").groups.items():
+        sub = df.loc[idx]
+        n = len(sub)
+        scores = pd.Series(0.0, index=idx)
+        for key, col in (("lead_rs_rank", "rs"), ("lead_cap_rank", "cap_krw"), ("lead_tv_rank", "tv20")):
+            vals = pd.to_numeric(sub[col], errors="coerce")
+            df.loc[idx, key] = vals.rank(ascending=False, method="min", na_option="bottom")
+            pct = vals.rank(pct=True, method="average").fillna(0.0)
+            scores += pct / 3
+        df.loc[idx, "lead_score"] = scores
+        rs = pd.to_numeric(sub["rs"], errors="coerce").fillna(-1)
+        strong = rs >= LEADER_RS_MIN
+        order = sorted(idx, key=lambda i: (not strong[i], -round(scores[i], 9), -rs[i]))
+        df.loc[order, "lead_rank"] = range(1, n + 1)
+        df.loc[idx, "lead_ok"] = strong
+        df.loc[idx, "lead_n"] = n
+    return df
+
+
+def sector_leaders(df: pd.DataFrame, groups) -> pd.DataFrame:
+    """분류마다 주도주 1위 행."""
+    d = df[df["group"].isin(list(groups)) & (df["lead_rank"] == 1) & (df["lead_ok"] == True)]  # noqa: E712
+    return d.sort_values("lead_score", ascending=False)
 
 
 def leading_groups(df: pd.DataFrame, recent_days: int, min_count: int = 2):
@@ -1842,6 +1904,7 @@ BUY_DEFAULTS = {
     "vol_mult": 1.5,       # 기본값: 돌파일 거래량 ≥ 직전 50일 평균 × 1.5
     "dcr_min": 70.0,       # 기본값: 돌파일 종가가 그날 고저 범위의 위쪽 30% 안
     "min_cap": 3000.0,     # 기본값: 시총 3,000억원 이상(억원)
+    "top_n": 1,            # 원칙: 섹터에서 가장 강한 주도주(1위)만. 2~3으로 넓힐 수 있어요
     "first_only": False,   # 켜면 52주 안 첫 돌파만(원칙: 첫 돌파가 가장 좋음 → 기본은 첫 돌파를 맨 위로 정렬)
     "stop_pct": 8.0,       # 원칙
     "risk_pct": 1.5,       # 원칙
@@ -1851,6 +1914,7 @@ BUY_DEFAULTS = {
 BUY_RULES = [   # (키, 표시 이름)
     ("market", "지수 60일선 위(코스피·코스닥)"),
     ("leader", "주도섹터 소속"),
+    ("top", "섹터 주도주(RS·시총·거래대금 종합 순위)"),
     ("breakout", "52주 신고가 돌파 유지(최근)"),
     ("aligned", "정배열(강한 종목은 면제)"),
     ("rs", "RS(70↑ · 코스피·코스닥 RS보다 위)"),
@@ -1872,6 +1936,15 @@ def buy_checks(r, market_ok: bool | None, market_text: str, leaders: set, p: dic
     c = {}
     c["market"] = (market_ok, market_text)
     c["leader"] = (r["group"] in leaders, "주도섹터" if r["group"] in leaders else "주도섹터 아님")
+    lr, ln = num(r.get("lead_rank")), num(r.get("lead_n"))
+    if lr is None:
+        c["top"] = (None, "순위 모름")
+    else:
+        parts = [f"{lab} {int(num(r.get(k)))}위" for lab, k in (("RS", "lead_rs_rank"), ("시총", "lead_cap_rank"),
+                                                              ("거래대금", "lead_tv_rank")) if num(r.get(k)) is not None]
+        ok = bool(r.get("lead_ok"))
+        head = ("👑 대장주" if lr == 1 else f"섹터 {int(lr)}위") if ok else f"섹터 {int(lr)}위(RS 70 미만)"
+        c["top"] = (ok and lr <= p.get("top_n", 1), f"{head}/{int(ln)}종목 ({', '.join(parts)})")
     days = num(r.get("bo_days"))
     if r.get("bo_status") == "유지" and days is not None:
         nth = num(r.get("bo_nth"))
@@ -1960,5 +2033,370 @@ def buy_screen(df: pd.DataFrame, market_ok: bool | None, market_text: str, leade
     def nth(x):
         v = x["row"].get("bo_nth")
         return 99 if v is None or v != v else int(v)
-    rows.sort(key=lambda x: (order[x["tier"]], nth(x), x["row"].get("bo_days") or 99, -(x["row"].get("rs") or 0)))
+    def lr(x):
+        v = x["row"].get("lead_rank")
+        return 99 if v is None or v != v else int(v)
+    # 같은 등급 안에서는 대장주(섹터 순위) → 52주 안 첫 돌파 → 최근 돌파 → RS 높은 순
+    rows.sort(key=lambda x: (order[x["tier"]], lr(x), nth(x), x["row"].get("bo_days") or 99,
+                             -(x["row"].get("rs") or 0)))
     return pd.DataFrame(rows, columns=["code", "name", "group", "tier", "fails", "checks", "row"])
+
+
+
+# ─────────────────────────── 섹터 안 급상승 엔진 · 차기 주도섹터 ───────────────────────────
+NON_SECTOR_GROUPS = {"스팩", "기타(동전주·정리매매 등)"}   # 업종이 아니라서 섹터 비교에서 빼요
+_flow_memo: dict = {}
+
+
+def _flow_table(trends: dict | None) -> pd.DataFrame:
+    """종목별 외국인·기관 순매수(억원) 5일·20일 합과 연속일수. 같은 수급 묶음이면 한 번만 계산."""
+    key = id(trends)
+    hit = _flow_memo.get("v")
+    if hit is not None and hit[0] == key and hit[1] is trends:
+        return hit[2]
+    out = _flow_table_now(trends)
+    _flow_memo["v"] = (key, trends, out)
+    return out
+
+
+def _flow_table_now(trends: dict | None) -> pd.DataFrame:
+    rows = []
+    for code, t in (trends or {}).items():
+        if t is None or t.empty:
+            continue
+        sm = trend_summary(t)
+        r = {"code": code, "streak_f": sm["streak_외국인"], "streak_i": sm["streak_기관"]}
+        for k, lab in (("외국인", "f"), ("기관", "i")):
+            col = t[f"{k}금액"]
+            r[f"{lab}5"] = float(col.tail(5).dropna().sum()) if col.tail(5).notna().any() else np.nan
+            r[f"{lab}20"] = float(col.tail(20).dropna().sum()) if col.tail(20).notna().any() else np.nan
+        rows.append(r)
+    return pd.DataFrame(rows, columns=["code", "streak_f", "streak_i", "f5", "f20", "i5", "i20"])
+
+
+MOM_WEIGHTS = {"flow": 0.30, "rs": 0.25, "candle": 0.20, "break": 0.25}
+
+
+def momentum_engine(df: pd.DataFrame, trends: dict | None, fresh_days: int = 5) -> pd.DataFrame:
+    """섹터 안에서 가장 빠르게 치고 올라오는 종목 점수(0~100).
+
+    국내 종목 전체를 기준으로 네 가지를 각각 백분위로 바꿔 가중 평균해요.
+    - 수급(30%): 외국인+기관 5일 순매수 ÷ 시가총액
+    - RS(25%): 1개월 RS 수준 + RS 가속(1개월 RS − 종합 RS, 최근이 더 강할수록 +)
+    - 캔들(20%): 오늘 거래량 배수(50일 평균 대비) + 오늘 종가 위치(DCR)
+    - 저항 돌파(25%): 52주 신고가 돌파 fresh_days일 이내면 만점, 아니면 52주 고가에 가까울수록 높게
+    수급 데이터가 없는 종목은 나머지 셋으로만 계산해요(mom_noflow=True).
+    섹터 순위(mom_rank)는 같은 분류 국내 종목끼리 점수 순서예요.
+    """
+    d = df[df["code"].map(is_kr) & df["price"].notna() & ~df["group"].isin(NON_SECTOR_GROUPS)].copy()
+    if d.empty:
+        return d
+    ft = _flow_table(trends)
+    d = d.merge(ft, on="code", how="left")
+    cap = pd.to_numeric(d["cap_krw"], errors="coerce")
+    d["fi5"] = d[["f5", "i5"]].sum(axis=1, min_count=1)
+    d["fi20"] = d[["f20", "i20"]].sum(axis=1, min_count=1)
+    d["fi5_pct"] = d["fi5"] * 1e8 / cap * 100
+
+    def pct(col):
+        v = pd.to_numeric(col, errors="coerce")
+        return v.rank(pct=True, method="average") * 100
+
+    d["rs_accel"] = pd.to_numeric(d["rs_1m"], errors="coerce") - pd.to_numeric(d["rs"], errors="coerce")
+    d["s_flow"] = pct(d["fi5_pct"])
+    d["s_rs"] = (pct(d["rs_1m"]) + pct(d["rs_accel"])) / 2
+    d["s_candle"] = (pct(d["vol_today"]) + pct(d["dcr_today"])) / 2
+    fresh = (d["bo_status"] == "유지") & (pd.to_numeric(d["bo_days"], errors="coerce") <= fresh_days)
+    d["s_break"] = (pct(d["gap"]) * 0.9).where(~fresh, 100.0)
+    parts = {"flow": "s_flow", "rs": "s_rs", "candle": "s_candle", "break": "s_break"}
+    num = sum(d[c].fillna(0) * MOM_WEIGHTS[k] for k, c in parts.items())
+    den = sum(d[c].notna() * MOM_WEIGHTS[k] for k, c in parts.items())
+    d["mom"] = (num / den.where(den > 0)).round(1)
+    d["mom_noflow"] = d["s_flow"].isna()
+    d["mom_rank"] = d.groupby("group")["mom"].rank(ascending=False, method="first")
+    d["mom_n"] = d.groupby("group")["code"].transform("count")
+    return d
+
+
+def _year_op(fin: pd.DataFrame | None) -> dict:
+    if fin is None or fin.empty or "op" not in fin:
+        return {}
+    out = {}
+    for k, v in zip(fin["key"].astype(str), fin["op"]):
+        if len(k) >= 4 and k[:4].isdigit() and v is not None and v == v:
+            out[int(k[:4])] = float(v)
+    return out
+
+
+_yo_memo: dict = {}
+
+
+def _year_ops(fins: dict | None) -> dict:
+    """{종목: {연도: 영업이익}}. 같은 실적 묶음이면 한 번만 계산."""
+    hit = _yo_memo.get("v")
+    if hit is not None and hit[0] is fins:
+        return hit[1]
+    out = {c: _year_op(f) for c, f in (fins or {}).items()}
+    _yo_memo["v"] = (fins, out)
+    return out
+
+
+NEXT_DEFAULTS = {"near_pct": 10.0, "near_rs": 70, "min_near": 3, "min_cover": 0.5}
+
+
+def next_leader_sectors(df: pd.DataFrame, fins: dict | None, trends: dict | None, leaders: set,
+                        p: dict | None = None, year: int | None = None, include_all: bool = False) -> pd.DataFrame:
+    """차기 주도섹터 후보. 세 조건(효석 원칙):
+    1) 업종 이익증가율 상승: 분류 국내 종목 영업이익 합으로 올해(E) 증가율 > 작년 증가율, 그리고 올해 증가율 > 0
+       (세 해 값이 모두 있는 종목만 더해요. 분류 종목의 절반 이상·3종목 이상이어야 판정)
+    2) 수급: 외국인+기관 순매수 합이 20일·5일 모두 플러스
+    3) 52주 신고가를 갈 수 있는 종목 다수: 52주 고가 대비 near_pct% 이내 + RS near_rs 이상 종목이 min_near개 이상
+    """
+    p = {**NEXT_DEFAULTS, **(p or {})}
+    year = year or now_kst().year
+    d = df[df["code"].map(is_kr) & df["price"].notna() & ~df["group"].isin(NON_SECTOR_GROUPS)]
+    d = d.merge(_flow_table(trends), on="code", how="left")
+    yo_all = _year_ops(fins)
+    rows = []
+    for g, sub in d.groupby("group"):
+        n = len(sub)
+        if n < 3:
+            continue
+        # 1) 이익증가율
+        ys = [year - 2, year - 1, year, year + 1]
+        sums = {y: 0.0 for y in ys}
+        cover = 0
+        cover_next = 0
+        nxt = 0.0
+        for c in sub["code"]:
+            yo = yo_all.get(c, {})
+            if all(y in yo for y in ys[:3]):
+                cover += 1
+                for y in ys[:3]:
+                    sums[y] += yo[y]
+                if ys[3] in yo:
+                    cover_next += 1
+        def growth(a, b):
+            return (b / a - 1) * 100 if a and a > 0 else None
+        g_prev = growth(sums[ys[0]], sums[ys[1]]) if cover else None
+        g_now = growth(sums[ys[1]], sums[ys[2]]) if cover else None
+        # 내년(E) 증가율: 내년 값까지 있는 종목만 따로
+        s2 = s3 = 0.0
+        for c in sub["code"]:
+            yo = yo_all.get(c, {})
+            if ys[2] in yo and ys[3] in yo and all(y in yo for y in ys[:3]):
+                s2 += yo[ys[2]]
+                s3 += yo[ys[3]]
+        g_next = growth(s2, s3) if cover_next else None
+        enough = cover >= 3 and cover / n >= p["min_cover"]
+        if not enough or g_prev is None or g_now is None:
+            earn_ok = None
+        else:
+            earn_ok = bool(g_now > g_prev and g_now > 0)
+        # 2) 수급
+        f5, i5 = sub["f5"].sum(min_count=1), sub["i5"].sum(min_count=1)
+        f20, i20 = sub["f20"].sum(min_count=1), sub["i20"].sum(min_count=1)
+        have_flow = sub["f20"].notna().sum()
+        if have_flow < max(2, n // 2):
+            flow_ok = None
+        else:
+            fi5 = (0 if pd.isna(f5) else f5) + (0 if pd.isna(i5) else i5)
+            fi20 = (0 if pd.isna(f20) else f20) + (0 if pd.isna(i20) else i20)
+            flow_ok = bool(fi20 > 0 and fi5 > 0)
+        # 3) 52주 신고가 갈 수 있는 종목
+        gap = pd.to_numeric(sub["gap"], errors="coerce")
+        rs = pd.to_numeric(sub["rs"], errors="coerce")
+        near = sub[(gap >= -p["near_pct"]) & (rs >= p["near_rs"])]
+        near_ok = len(near) >= p["min_near"]
+        oks = [earn_ok, flow_ok, near_ok]
+        n_ok = sum(1 for o in oks if o is True)
+        if n_ok == 3:
+            tier = "주도 유지" if g in leaders else "차기 주도 후보"
+        elif n_ok == 2:
+            tier = "관찰"
+        elif include_all:
+            tier = "해당 없음"
+        else:
+            continue
+        cap = pd.to_numeric(sub["cap_krw"], errors="coerce").sum(min_count=1)
+        fi20 = (0 if pd.isna(f20) else f20) + (0 if pd.isna(i20) else i20)
+        rows.append({
+            "group": g, "tier": tier, "leading": g in leaders, "n": n, "n_ok": n_ok,
+            "accel": (g_now - g_prev) if (earn_ok is not None) else None,
+            "flow_cap": (fi20 * 1e8 / cap * 100) if (flow_ok is not None and cap and cap > 0) else None,
+            "near_ratio": len(near) / n,
+            "earn_ok": earn_ok, "g_prev": g_prev, "g_now": g_now, "g_next": g_next, "cover": cover,
+            "flow_ok": flow_ok, "f5": f5, "i5": i5, "f20": f20, "i20": i20,
+            "both20": bool((f20 or 0) > 0 and (i20 or 0) > 0) if flow_ok is not None else None,
+            "near_ok": near_ok, "n_near": len(near),
+            "near_names": ", ".join(near.sort_values("gap", ascending=False)["name"].head(6)),
+            "years": ys,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # 가능성 점수(0~100): 섹터끼리 백분위 — 이익 가속 40% · 수급(시총 대비 외+기 20일) 30% · 신고가 근처 강한 종목 비율 30%
+    def pr(col):
+        return pd.to_numeric(out[col], errors="coerce").rank(pct=True) * 100
+    w = {"accel": 0.4, "flow_cap": 0.3, "near_ratio": 0.3}
+    num = sum(pr(c).fillna(0) * v for c, v in w.items())
+    den = sum(pr(c).notna() * v for c, v in w.items())
+    out["score"] = (num / den.where(den > 0)).round(0)
+    order = {"차기 주도 후보": 0, "주도 유지": 1, "관찰": 2, "해당 없음": 3}
+    out["_o"] = out["tier"].map(order)
+    out = out.sort_values(["_o", "score", "n_near"], ascending=[True, False, False]).drop(columns="_o")
+    return out.reset_index(drop=True)
+
+
+
+# ─────────────────────────── 로테이션 시나리오(두 바스켓) ───────────────────────────
+SCENARIO_PRESETS = {
+    "반도체 후공정 vs 전공정": {
+        "a_name": "후공정", "b_name": "전공정",
+        "a_groups": ["OSAT", "후공정 테스트 부품", "후공정 테스트 장비", "후공정 패키징·검사 장비", "패키징 소재"],
+        "b_groups": ["전공정 장비", "전공정 부품", "전공정 소재", "전공정 계측"],
+    },
+}
+SCN_WINDOWS = {"오늘": 1.0, "이번 주": 2.0, "5거래일": 2.0, "20거래일": 4.0}   # 창별 기본 기준(%)
+
+
+def _closes_frame(df: pd.DataFrame, histories: dict, codes) -> pd.DataFrame:
+    """종목별 종가를 날짜로 맞춘 표. 오늘 봉은 현재가로 바꿔요."""
+    today = pd.Timestamp(now_kst().date())
+    cols = {}
+    idx = df.set_index("code")
+    for c in codes:
+        h = histories.get(c, (None, None, None))[1]
+        if h is None or h.empty:
+            continue
+        sr = pd.Series(h["close"].to_numpy(dtype=float), index=pd.to_datetime(h["date"]).dt.normalize())
+        sr = sr[~sr.index.duplicated(keep="last")]
+        p = idx["price"].get(c)
+        live = idx["source"].get(c) == "실시간"
+        if p is not None and p == p and live:
+            if sr.index[-1] == today:
+                sr.iloc[-1] = float(p)            # 일봉에 오늘이 있으면 현재가로
+            elif today.weekday() < 5:
+                sr.loc[today] = float(p)          # 평일 장중인데 일봉에 오늘이 아직 없으면 붙여요(주말엔 안 붙임)
+        cols[c] = sr
+    if not cols:
+        return pd.DataFrame()
+    return pd.DataFrame(cols).sort_index().ffill()
+
+
+def basket_stats(df: pd.DataFrame, histories: dict, groups, window: str, trends: dict | None = None) -> dict:
+    """바스켓(분류 묶음) 수익률: 시총가중(판정 기준)·동일가중·상승 종목 비율, 외국인·기관 수급, 최근 5거래일 일별."""
+    sub = df[df["group"].isin(list(groups)) & df["code"].map(is_kr) & df["price"].notna()]
+    out = {"n": len(sub), "ret_cap": None, "ret_eq": None, "breadth": None, "f5": None, "i5": None,
+           "f20": None, "i20": None, "daily": pd.Series(dtype=float), "top": [], "codes": list(sub["code"])}
+    if sub.empty:
+        return out
+    cl = _closes_frame(df, histories, sub["code"])
+    if cl.empty or len(cl) < 3:
+        return out
+    last = cl.index[-1]
+    if window == "오늘":
+        base_i = len(cl) - 2
+    elif window == "이번 주":
+        monday = last - pd.Timedelta(days=last.weekday())
+        before = cl.index[cl.index < monday]
+        base_i = cl.index.get_loc(before[-1]) if len(before) else 0
+    else:
+        n = int(window.replace("거래일", ""))
+        base_i = max(0, len(cl) - 1 - n)
+    rets = (cl.iloc[-1] / cl.iloc[base_i] - 1) * 100
+    caps = pd.to_numeric(sub.set_index("code")["cap_krw"], errors="coerce").reindex(rets.index)
+    ok = rets.notna()
+    w = caps.where(caps > 0)
+    if w[ok].notna().sum() >= max(1, ok.sum() // 2):
+        w = w.fillna(w[ok].median())
+        out["ret_cap"] = float((rets[ok] * w[ok]).sum() / w[ok].sum())
+    else:
+        out["ret_cap"] = float(rets[ok].mean())                     # 시총을 모르면 동일가중
+    out["ret_eq"] = float(rets[ok].mean())
+    out["breadth"] = float((rets[ok] > 0).mean() * 100)
+    daily = cl.pct_change().iloc[-5:] * 100
+    wd = w.reindex(daily.columns).fillna(1.0) if w is not None else pd.Series(1.0, index=daily.columns)
+    out["daily"] = (daily.mul(wd, axis=1).sum(axis=1) / daily.notna().mul(wd, axis=1).sum(axis=1)).round(2)
+    names = sub.set_index("code")["name"]
+    top = rets[ok].sort_values(ascending=False)
+    out["top"] = [(names[c], float(top[c])) for c in top.index[:3]]
+    out["bottom"] = [(names[c], float(top[c])) for c in top.index[-3:][::-1]]
+    ft = _flow_table(trends)
+    ft = ft[ft["code"].isin(sub["code"])]
+    if not ft.empty:
+        for k in ("f5", "i5", "f20", "i20"):
+            out[k] = float(ft[k].sum(min_count=1)) if ft[k].notna().any() else None
+    return out
+
+
+def _state(r: float | None, t: float, crash: float) -> str | None:
+    if r is None or r != r:
+        return None
+    if r >= t:
+        return "강세"
+    if r > -t:
+        return "보합"
+    if r > -crash * t:
+        return "약세"
+    return "급락"
+
+
+# (A 상태, B 상태) → (시나리오 번호, 한 줄 판정). A = 지금 들고 있는/주도 쪽, B = 다음 후보 쪽
+_SCN_MATRIX = {
+    ("강세", "강세"): (3, "{A}도 가고 {B}도 간다"), ("보합", "강세"): (3, "{A} 쪽이 버티고 {B} 쪽이 간다 — 3번 쪽"),
+    ("약세", "강세"): (2.5, "{A} 쪽이 덜 빠지고 {B} 쪽이 간다 — 2번 신호지만 3번 가능성"),
+    ("급락", "강세"): (2, "{A} 쪽이 과하게 빠지고 {B} 쪽이 간다 — 완전한 로테이션"),
+    ("강세", "보합"): (1, "{A}만 간다"), ("강세", "약세"): (1, "{A}만 간다"), ("강세", "급락"): (1, "{A}만 간다"),
+    ("보합", "보합"): (0, "둘 다 방향 없음"), ("보합", "약세"): (0, "{B} 쪽이 밀리는 중 — {A} 쪽이 버티는지 확인"),
+    ("보합", "급락"): (0, "{B} 쪽 급락 — {A} 쪽이 버티는지 확인"),
+    ("약세", "보합"): (4, "{A} 쪽이 빠지는데 {B} 쪽도 못 간다 — 4번 초기"),
+    ("급락", "보합"): (4, "{A} 쪽이 급락하고 {B} 쪽도 못 간다"),
+    ("약세", "약세"): (4, "{A}·{B} 동반 약세"), ("약세", "급락"): (4, "{A}·{B} 동반 약세"),
+    ("급락", "약세"): (4, "{A}·{B} 동반 약세"), ("급락", "급락"): (4, "{A}·{B} 동반 급락"),
+}
+
+SCN_INFO = {   # 번호 → (이름, 시장 해석, 행동). 효석 메모(9/27) 기준. {A}·{B}는 바스켓 이름으로 바뀌어요
+    1: ("1번 · {A}만 계속", "{B} 쪽에 시간이 필요한 시장", "{A} 보유 유지(유리). {B} 쪽은 매수 후보 원칙이 뜰 때까지 관찰"),
+    2: ("2번 · {A} 빠지고 {B} 감", "수급이 부족한 시장(로테이션)",
+        "{A} 일부를 팔아서라도 {B} 담기. {A} 쪽이 과하게 빠지면 완벽한 섹터 로테이션장으로 보고 비중 이동"),
+    2.5: ("2번 신호 · 3번 가능성", "{A} 쪽이 덜 빠지면 수급 개선(3번)일 수 있음",
+          "{A} 쪽을 급하게 다 팔지 말고, {B} 쪽은 원칙 통과 종목부터 일부 선진입 검토. {A} 쪽이 과하게 빠지면 2번 확정"),
+    3: ("3번 · {A}도 {B}도 감", "수급이 개선되는 시장", "{A} 유지(유리) + {B} 쪽도 원칙 통과 종목 추가"),
+    4: ("4번 · 전체 Risk-off", "{A}도 빠지고 {B}도 못 가는 장",
+        "{A} 팔아 {B} 사는 게 아니라 현금 확대"),
+    0: ("관망 · 방향 미정", "아직 어느 시나리오도 아님", "포지션 유지, 다음 신호 대기(아래 경우의 수 기준선 확인)"),
+}
+
+
+def classify_scenario(ra: float | None, rb: float | None, t: float, crash: float = 2.5) -> dict:
+    sa, sb = _state(ra, t, crash), _state(rb, t, crash)
+    if sa is None or sb is None:
+        return {"id": None, "a_state": sa, "b_state": sb, "text": "데이터 부족"}
+    sid, text = _SCN_MATRIX[(sa, sb)]
+    return {"id": sid, "a_state": sa, "b_state": sb, "text": text}
+
+
+def scenario_paths(ra: float | None, rb: float | None, t: float, crash: float = 2.5) -> list[dict]:
+    """경우의 수: 각 시나리오가 되려면 A·B가 어디까지 가야 하는지(지금 값과의 거리)."""
+    if ra is None or rb is None:
+        return []
+    def need(cur, lo=None, hi=None):
+        """cur를 [lo, hi) 범위로 넣으려면 몇 %p 움직여야 하는지. 이미 안이면 0."""
+        if lo is not None and cur < lo:
+            return lo - cur
+        if hi is not None and cur >= hi:
+            return hi - cur
+        return 0.0
+    rows = [
+        (3, "{A} ≥ +{t} · {B} ≥ +{t}", need(ra, lo=t), need(rb, lo=t)),
+        (1, "{A} ≥ +{t} · {B} < +{t}", need(ra, lo=t), need(rb, hi=t)),
+        (2.5, "−{c} < {A} ≤ −{t} · {B} ≥ +{t}", need(ra, lo=-crash * t + 1e-9, hi=-t), need(rb, lo=t)),
+        (2, "{A} ≤ −{c} · {B} ≥ +{t}", need(ra, hi=-crash * t), need(rb, lo=t)),
+        (4, "{A} ≤ −{t} · {B} < +{t}", need(ra, hi=-t), need(rb, hi=t)),
+    ]
+    out = []
+    for sid, cond, da, db in rows:
+        out.append({"id": sid, "cond": cond.replace("{t}", f"{t:g}%").replace("{c}", f"{crash * t:g}%"),
+                    "move_a": da, "move_b": db, "dist": abs(da) + abs(db)})
+    return sorted(out, key=lambda r: r["dist"])
