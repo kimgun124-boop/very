@@ -490,7 +490,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
 
 # ─────────────────────────── 매수 후보 판정용 추가 지표 ───────────────────────────
 EXTRA_KEYS = ("ma20", "dist_ma20", "adx", "bo_vol_ratio", "bo_dcr", "htf", "ma5", "ma50", "ma5_vs_50", "tv20",
-              "vol_today", "dcr_today")
+              "vol_today", "dcr_today", "tv5", "tvp20")
 
 
 def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> float | None:
@@ -538,6 +538,13 @@ def _extras(dts, high, low, close, vol, price: float, bo_date, last_is_today: bo
     tv = close[max(0, end - 20):end] * vol[max(0, end - 20):end]
     tv = tv[np.isfinite(tv)]
     out["tv20"] = float(tv.mean()) if len(tv) >= 10 else None
+    # 돈의 방향: 최근 5거래일 평균 거래대금 vs 그 전 20거래일 평균(오늘 장중 봉은 빼요)
+    tv_all = close[:end] * vol[:end]
+    if len(tv_all) >= 25:
+        a5, p20 = tv_all[-5:], tv_all[-25:-5]
+        a5, p20 = a5[np.isfinite(a5)], p20[np.isfinite(p20)]
+        out["tv5"] = float(a5.mean()) if len(a5) >= 3 else None
+        out["tvp20"] = float(p20.mean()) if len(p20) >= 10 else None
     # 오늘(마지막) 봉: 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR)
     if n >= 21:
         base = vol[max(0, n - 51):n - 1]
@@ -2077,7 +2084,29 @@ def _flow_table_now(trends: dict | None) -> pd.DataFrame:
 MOM_WEIGHTS = {"flow": 0.30, "rs": 0.25, "candle": 0.20, "break": 0.25}
 
 
-def momentum_engine(df: pd.DataFrame, trends: dict | None, fresh_days: int = 5) -> pd.DataFrame:
+def op_growth(fin: pd.DataFrame | None, year: int | None = None) -> dict:
+    """올해(E 포함) 영업이익이 작년 실적보다 늘었는지. 원칙: 영업이익이 늘지 않는 종목은 강해도 배제.
+
+    - 증가: 올해 > 작년이고 올해가 흑자(적자에서 흑자로 바뀐 것도 증가로 봐요)
+    - 올해 값이 없거나 작년 값이 없으면 판정 불가(None) → 배제 쪽으로 처리
+    """
+    year = year or now_kst().year
+    yo = _year_op(fin)
+    a, b = yo.get(year - 1), yo.get(year)
+    if a is None or b is None:
+        return {"op_up": None, "op_g": None, "op_txt": "영업이익 확인 불가"}
+    up = bool(b > a and b > 0)
+    if a > 0:
+        g = (b / a - 1) * 100
+        txt = f"영업익 {g:+.0f}%"
+    else:
+        g = None
+        txt = "흑자전환" if b > 0 else "적자"
+    return {"op_up": up, "op_g": g, "op_txt": txt}
+
+
+def momentum_engine(df: pd.DataFrame, trends: dict | None, fresh_days: int = 5,
+                    fins: dict | None = None, require_op: bool = False) -> pd.DataFrame:
     """섹터 안에서 가장 빠르게 치고 올라오는 종목 점수(0~100).
 
     국내 종목 전체를 기준으로 네 가지를 각각 백분위로 바꿔 가중 평균해요.
@@ -2113,6 +2142,15 @@ def momentum_engine(df: pd.DataFrame, trends: dict | None, fresh_days: int = 5) 
     den = sum(d[c].notna() * MOM_WEIGHTS[k] for k, c in parts.items())
     d["mom"] = (num / den.where(den > 0)).round(1)
     d["mom_noflow"] = d["s_flow"].isna()
+    yr = now_kst().year
+    og = [op_growth((fins or {}).get(c), yr) for c in d["code"]]
+    d["op_up"] = [x["op_up"] for x in og]
+    d["op_g"] = [x["op_g"] for x in og]
+    d["op_txt"] = [x["op_txt"] for x in og]
+    if require_op:   # 점수는 전체 기준 그대로, 순위는 영업이익이 늘어나는 종목끼리
+        d = d[d["op_up"] == True].copy()  # noqa: E712
+        if d.empty:
+            return d
     d["mom_rank"] = d.groupby("group")["mom"].rank(ascending=False, method="first")
     d["mom_n"] = d.groupby("group")["code"].transform("count")
     return d
@@ -2400,3 +2438,156 @@ def scenario_paths(ra: float | None, rb: float | None, t: float, crash: float = 
         out.append({"id": sid, "cond": cond.replace("{t}", f"{t:g}%").replace("{c}", f"{crash * t:g}%"),
                     "move_a": da, "move_b": db, "dist": abs(da) + abs(db)})
     return sorted(out, key=lambda r: r["dist"])
+
+
+
+# ─────────────────────────── 돈의 방향(일당백 관점: 예측보다 확인) ───────────────────────────
+# 진짜 로테이션 = 기존 리더의 약세 + 새 리더의 강세가 같이 나와야 해요.
+#   새 리더 쪽: 거래대금이 늘고, 돌파가 나오고, 한두 종목이 아니라 여러 종목의 상대강도가 같이 올라와야
+#   기존 리더 쪽: 조정 때 20일선이나 기존 돌파가격을 지키는지
+#   아무도 돈을 못 받아가면 로테이션이 아니라 섹터에서 돈이 빠지는 것 → 현금도 선택지
+MONEY_DEFAULTS = {"tv_up": 1.2, "tv_down": 0.85, "min_break": 2, "rs_up": 0.5, "fresh_days": 5}
+
+
+def money_stats(sub: pd.DataFrame, fresh_days: int = 5) -> dict:
+    """종목 묶음의 돈 흐름: 거래대금 5일/이전 20일, 신규 돌파 수, 돌파 유지 수, RS 동반 상승 비율, 20일선 위 비율."""
+    sub = sub[sub["price"].notna()]
+    n = len(sub)
+    out = {"n": n, "tv5": None, "tvp20": None, "tv_ratio": None, "n_break": 0, "n_hold": 0,
+           "rs_up": None, "above20": None, "rs1m_med": None}
+    if not n:
+        return out
+    tv5 = pd.to_numeric(sub["tv5"], errors="coerce")
+    tvp = pd.to_numeric(sub["tvp20"], errors="coerce")
+    ok = tv5.notna() & tvp.notna()
+    if ok.any():
+        out["tv5"], out["tvp20"] = float(tv5[ok].sum()), float(tvp[ok].sum())
+        out["tv_ratio"] = out["tv5"] / out["tvp20"] if out["tvp20"] > 0 else None
+    hold = sub["bo_status"] == "유지"
+    days = pd.to_numeric(sub["bo_days"], errors="coerce")
+    out["n_hold"] = int(hold.sum())
+    out["n_break"] = int((hold & (days <= fresh_days)).sum())
+    r1, r = pd.to_numeric(sub["rs_1m"], errors="coerce"), pd.to_numeric(sub["rs"], errors="coerce")
+    both = r1.notna() & r.notna()
+    if both.any():
+        out["rs_up"] = float((r1[both] > r[both]).mean())
+        out["rs1m_med"] = float(r1[both].median())
+    ma20 = pd.to_numeric(sub["ma20"], errors="coerce")
+    has = ma20.notna()
+    if has.any():
+        out["above20"] = float((sub.loc[has, "price"] >= ma20[has]).mean())
+    return out
+
+
+def leaders_defense(sub: pd.DataFrame, top: int = 3) -> list[dict]:
+    """기존 리더들이 20일선이나 기존 돌파가격을 지키는지. 리더 = 분류별 섹터 순위 상위(RS 70↑)."""
+    d = sub[(sub["lead_ok"] == True) & (pd.to_numeric(sub["lead_rank"], errors="coerce") <= 1)]  # noqa: E712
+    if d.empty:
+        d = sub[sub["lead_ok"] == True]  # noqa: E712
+    d = d.sort_values("lead_score", ascending=False).head(top)
+    rows = []
+    for _, r in d.iterrows():
+        p, ma20 = r["price"], r.get("ma20")
+        on20 = ma20 is not None and not pd.isna(ma20) and p >= ma20
+        on_bo = r.get("bo_status") == "유지"          # 유지 = 돌파가격 위에서 계속 마감
+        lvl = r.get("bo_level")
+        rows.append({"name": r["name"], "group": r["group"], "ok": bool(on20 or on_bo),
+                     "on20": bool(on20), "on_bo": bool(on_bo),
+                     "vs20": (p / ma20 - 1) * 100 if (ma20 is not None and not pd.isna(ma20) and ma20) else None,
+                     "bo_level": lvl if on_bo else None})
+    return rows
+
+
+def rotation_confirm(df: pd.DataFrame, a_groups, b_groups, p: dict | None = None) -> dict:
+    """가격이 아니라 돈으로 확인. B(새 리더 후보) 네 가지, A(기존 리더) 두 가지를 봐요."""
+    p = {**MONEY_DEFAULTS, **(p or {})}
+    kr = df[df["code"].map(is_kr) & df["price"].notna() & ~df["group"].isin(NON_SECTOR_GROUPS)]
+    A = kr[kr["group"].isin(list(a_groups))]
+    B = kr[kr["group"].isin(list(b_groups))]
+    ma, mb, mall = money_stats(A, p["fresh_days"]), money_stats(B, p["fresh_days"]), money_stats(kr, p["fresh_days"])
+
+    def share(m):
+        return (m["tv5"] / mall["tv5"], m["tvp20"] / mall["tvp20"]) if (m["tv5"] and mall["tv5"] and m["tvp20"]
+                                                                         and mall["tvp20"]) else (None, None)
+    bs_now, bs_prev = share(mb)
+    b_checks = [
+        ("거래대금이 실제로 들어오는지", None if mb["tv_ratio"] is None else mb["tv_ratio"] >= p["tv_up"],
+         "-" if mb["tv_ratio"] is None else f"최근 5일 거래대금 = 이전 20일 평균의 {mb['tv_ratio']:.2f}배"),
+        ("보드 안 거래대금 비중이 느는지", None if bs_now is None else bs_now > bs_prev,
+         "-" if bs_now is None else f"비중 {bs_prev * 100:.1f}% → {bs_now * 100:.1f}%"),
+        ("돌파 성공 종목이 여러 개인지", mb["n_break"] >= p["min_break"],
+         f"최근 {p['fresh_days']}거래일 신규 돌파 {mb['n_break']}개 · 돌파 유지 {mb['n_hold']}개"),
+        ("여러 종목의 상대강도가 같이 오르는지", None if mb["rs_up"] is None else mb["rs_up"] >= p["rs_up"],
+         "-" if mb["rs_up"] is None else f"1개월 RS가 종합 RS보다 높은 종목 {mb['rs_up'] * 100:.0f}%"),
+    ]
+    defense = leaders_defense(A)
+    a_checks = [
+        ("상대강도가 유지되는지", None if ma["rs1m_med"] is None else ma["rs1m_med"] >= 60,
+         "-" if ma["rs1m_med"] is None else f"1개월 RS 중앙값 {ma['rs1m_med']:.0f}"),
+        ("리더들이 20일선·기존 돌파가격을 지키는지",
+         None if not defense else sum(x["ok"] for x in defense) * 2 > len(defense),   # 과반이 지키면 통과
+         " · ".join(f"{x['name']} {'✅' if x['ok'] else '❌'}" for x in defense) or "리더 없음"),
+    ]
+    b_ok = sum(1 for _, v, _ in b_checks if v is True)
+    b_known = sum(1 for _, v, _ in b_checks if v is not None)
+    # 기존 리더 판정의 중심은 '리더들이 20일선·돌파가격을 지키는지'. 상대강도는 함께 보여주되 약해지면 경고만
+    a_ok = a_checks[1][1] is True
+    a_rs_weak = a_checks[0][1] is False
+    b_conf = b_ok >= 3
+    if b_known < 3:
+        verdict = ("확인 불가", "데이터가 부족해서 돈의 방향을 확인할 수 없어요", "기다리기")
+    elif b_conf and a_ok:
+        verdict = ("섹터 확장", "새 돈이 섹터 전체로 들어오는 그림(3번 확인)",
+                   "기존 승자는 추세가 살아 있는 동안 보유 · 새로 강해지는 쪽은 작은 비중부터 · 돌파 성공이 늘면 조금씩 비중 확대")
+    elif b_conf:
+        verdict = ("로테이션 확인", "기존 리더 약세 + 새 리더 강세가 같이 나옴(2번 확인)",
+                   "기존 리더 일부를 줄이고 새 리더 쪽 원칙 통과 종목으로 이동 — 시장이 증명하는 만큼만")
+    elif a_ok:
+        verdict = ("기존 리더 유지", "새 쪽으로 돈이 넘어간 증거는 아직 없음 — 강한 종목도 쉬어감(1번)"
+                   + (" · 단, 바스켓 전체 상대강도는 약해지는 중" if a_rs_weak else ""),
+                   "미리 팔고 갈아타지 않기 · 기존 리더 보유, 새 쪽은 확인될 때까지 관찰"
+                   + (" · 리더가 20일선을 깨면 비중 줄이기" if a_rs_weak else ""))
+    else:
+        verdict = ("돈이 빠지는 중", "기존 리더도 약하고 받아가는 쪽도 없음 — 로테이션이 아니라 이탈(4번)",
+                   "종목 이름만 바꾸지 말고 현금 확대 · 새 종목을 찾아 헤매지 않기")
+    return {"b_checks": b_checks, "a_checks": a_checks, "b_ok": b_ok, "b_known": b_known, "a_ok": a_ok,
+            "a_rs_weak": a_rs_weak,
+            "verdict": verdict, "A": ma, "B": mb, "ALL": mall, "defense": defense}
+
+
+def sector_money_radar(df: pd.DataFrame, leaders: set, p: dict | None = None) -> tuple[pd.DataFrame, dict]:
+    """섹터 간 돈의 이동(와리가리) 레이더. 섹터마다 거래대금 비중 변화·돌파 수·RS 동반 상승으로 상태를 붙여요."""
+    p = {**MONEY_DEFAULTS, **(p or {})}
+    kr = df[df["code"].map(is_kr) & df["price"].notna() & ~df["group"].isin(NON_SECTOR_GROUPS)]
+    mall = money_stats(kr, p["fresh_days"])
+    rows = []
+    for g, sub in kr.groupby("group"):
+        if len(sub) < 2:
+            continue
+        m = money_stats(sub, p["fresh_days"])
+        if not (m["tv5"] and mall["tv5"] and m["tvp20"] and mall["tvp20"]):
+            continue
+        s_now, s_prev = m["tv5"] / mall["tv5"] * 100, m["tvp20"] / mall["tvp20"] * 100
+        share_ratio = s_now / s_prev if s_prev > 0 else None
+        lead = g in leaders
+        rs_up = m["rs_up"] or 0
+        strong_in = (share_ratio or 0) >= p["tv_up"] and (m["n_break"] >= p["min_break"] or rs_up >= p["rs_up"])
+        weak_out = (share_ratio or 9) <= p["tv_down"] and rs_up < 0.4
+        if strong_in:
+            state = "🔥 리더 강화" if lead else "💰 돈 들어오는 중"
+        elif weak_out:
+            state = "📉 리더 약화(돈 빠짐)" if lead else "🧊 돈 빠지는 중"
+        else:
+            state = "👑 리더 유지" if lead else "· 변화 없음"
+        rows.append({"group": g, "state": state, "leading": lead, "n": m["n"],
+                     "share_prev": s_prev, "share_now": s_now, "share_chg": s_now - s_prev, "share_ratio": share_ratio,
+                     "tv_ratio": m["tv_ratio"], "n_break": m["n_break"], "n_hold": m["n_hold"],
+                     "rs_up": m["rs_up"], "above20": m["above20"]})
+    out = pd.DataFrame(rows)
+    summary = {"all_tv_ratio": mall["tv_ratio"], "gainers": [], "losers": []}
+    if not out.empty:
+        out = out.sort_values("share_chg", ascending=False).reset_index(drop=True)
+        summary["gainers"] = out[out["state"].isin(["🔥 리더 강화", "💰 돈 들어오는 중"])]["group"].head(4).tolist()
+        summary["losers"] = out[out["state"].isin(["📉 리더 약화(돈 빠짐)", "🧊 돈 빠지는 중"])] \
+            .sort_values("share_chg")["group"].head(4).tolist()
+    return out, summary

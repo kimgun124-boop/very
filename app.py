@@ -27,7 +27,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs",
             "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS",
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
-            "SCENARIO_PRESETS", "SCN_WINDOWS", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths")
+            "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
@@ -98,6 +98,34 @@ st.markdown(
 .chip-names { color: #B9C7CF; font-size: 0.8rem; line-height: 1.45; margin-top: 0.2rem; }
 .radar-empty { color: #9FB0BA; font-size: 0.9rem; }
 .st-key-mobile_view { display: none; }
+.kcards { display: flex; flex-direction: column; gap: 0.45rem; }
+.stApp a.kcard { display: block; background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px;
+  padding: 0.65rem 0.8rem 0.6rem; text-decoration: none; color: #16212B; }
+.stApp a.kcard.hot { background: #FFF8E3; border-color: #EFD48A; }
+.k-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+.k-name { font-weight: 800; font-size: 1.02rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.k-crown { font-size: 0.68rem; font-weight: 800; background: #F2B134; color: #16212B; border-radius: 6px; padding: 0.05rem 0.35rem;
+  vertical-align: 2px; }
+.k-px { font-weight: 700; font-size: 0.95rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.k-chg { font-weight: 800; margin-left: 0.25rem; }
+.k-keys { display: grid; grid-template-columns: 1fr 1.45fr 0.6fr; gap: 0.35rem; margin: 0.5rem 0 0.4rem; }
+.k-keys div { background: #F2F5F7; border-radius: 8px; padding: 0.3rem 0.45rem; min-width: 0; }
+.k-keys small { display: block; font-size: 0.64rem; color: #6B7A84; line-height: 1.2; }
+.k-keys b { display: block; font-size: 0.92rem; font-weight: 800; color: #16212B; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.k-keys b.hot { color: #D6333B; } .k-keys b.near { color: #C27C0E; }
+.k-keys b.first { color: #D6333B; } .k-keys b.brk { color: #B8452C; } .k-keys b.off { color: #6B7A84; font-weight: 700; }
+.k-keys b.rs { color: #D6333B; }
+.k-sub { font-size: 0.74rem; color: #51616C; line-height: 1.45; }
+.k-flow { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.72rem; color: #51616C; margin-top: 0.15rem;
+  font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) {
+  [data-testid="stMainBlockContainer"] { padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
+  .st-key-mobile_view div[role="radiogroup"] { gap: 0.25rem 0.6rem; }
+  .st-key-mobile_view div[role="radiogroup"] label p { font-size: 0.8rem; }
+  [data-testid="stTabs"] button p { font-size: 0.85rem; }
+}
+
 .m-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; margin: 0 0 0.8rem; }
 .m-kpis div { background: #E7EDEF; border-radius: 10px; padding: 0.5rem 0.3rem; text-align: center; }
 .m-kpis span { display: block; font-size: 0.68rem; color: #51616C; line-height: 1.25; }
@@ -748,6 +776,49 @@ def _bo_text(r) -> str | None:
     return None
 
 
+def _bo_full(r) -> str:
+    """돌파 상태 한 줄: '⭐ 첫 돌파 3일째' / '2번째 돌파 5일째' / '미돌파 · 이탈 4일'."""
+    get = r.get if isinstance(r, dict) else (lambda k, d=None: getattr(r, k, d))
+    st_, days, nth = get("bo_status"), get("bo_days"), get("bo_nth")
+    if days is None or pd.isna(days):
+        return "-"
+    if st_ == "유지":
+        if nth is not None and not pd.isna(nth) and int(nth) > 1:
+            return f"{int(nth)}번째 돌파 {int(days)}일째"
+        return f"⭐ 첫 돌파 {int(days)}일째"
+    if st_ == "이탈":
+        return f"미돌파 · 이탈 {int(days)}일"
+    return "-"
+
+
+BO_FULL_HELP = ("⭐ 첫 돌파 N일째 = 최근 52주 안에서 처음으로 종가가 직전 52주 최고가를 넘은 뒤 N거래일째(돌파일 = 1일째), "
+                "그 뒤 한 번도 그 가격 아래에서 마감하지 않음. 2번째 돌파 = 52주 안에 한 번 돌파했다가 밀린 뒤 다시 돌파. "
+                "미돌파 · 이탈 N일 = 지금의 52주 최고가 아래에서 마감한 지 N거래일")
+
+
+def _bo_color(v):
+    if not isinstance(v, str):
+        return ""
+    if v.startswith("⭐"):
+        return f"color: {UP}; font-weight: 800"
+    if "번째 돌파" in v:
+        return f"color: {UP}; font-weight: 600"
+    if v.startswith("미돌파"):
+        return "color: #6B7A84"
+    return ""
+
+
+def _to_high_color(v):
+    """신고가까지 남은 %: 3% 이내 진하게, 10% 이내 주황."""
+    if v is None or pd.isna(v):
+        return ""
+    if v <= 3:
+        return f"color: {UP}; font-weight: 800"
+    if v <= 10:
+        return "color: #C27C0E; font-weight: 700"
+    return ""
+
+
 def _nh_text(r, kind: str) -> str | None:
     """지금 봉이 신고가인 봉만 모아서 '일·주·월'처럼. 아무것도 아니면 None."""
     hit = [lab for k, lab in (("d", "일"), ("w", "주"), ("m", "월")) if r.get(f"{kind}_{k}") == True]  # noqa: E712
@@ -767,32 +838,32 @@ def _rs_color(v):
 def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
         "종목": f["name"],
-        "코드": f["code"],
-        "시장": f["market"],
-        "분류": f["group"],
-        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
         "현재가": f["price"],
-        "시가총액(원)": f["cap_krw"],
         "등락률": f["change"],
+        "신고가까지": f["to_high"],
+        "돌파": f.apply(_bo_full, axis=1),
+        "RS": f["rs"],
+        "섹터 순위": f.apply(lambda r: "-" if pd.isna(r["lead_rank"]) else
+                         (f"👑 1/{int(r['lead_n'])}" if r["lead_rank"] == 1 and r["lead_ok"] else f"{int(r['lead_rank'])}/{int(r['lead_n'])}"), axis=1),
+        "분류": f["group"],
+        "시가총액(원)": f["cap_krw"],
         **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
             "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
             "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
+        "52주 위치": f["pos"],
         "52주 최고": f["high52"],
         "괴리율": f["gap"],
-        "신고가까지": f["to_high"],
-        "52주 위치": f["pos"],
         "신고가 후": f["days_since_high"],
-        "돌파 유지/이탈": f.apply(_bo_text, axis=1),
         "52주 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "nh52"), axis=1),
         "역대 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "ath"), axis=1),
-        "섹터 순위": f.apply(lambda r: "-" if pd.isna(r["lead_rank"]) else
-                         (f"👑 1/{int(r['lead_n'])}" if r["lead_rank"] == 1 and r["lead_ok"] else f"{int(r['lead_rank'])}/{int(r['lead_n'])}"), axis=1),
-        "RS": f["rs"],
         "RS(1M)": f["rs_1m"],
         "RS(3M)": f["rs_3m"],
         "RS(6M)": f["rs_6m"],
         "ATR%(20일)": f["atr_pct"],
         "정배열": f["aligned"],
+        "코드": f["code"],
+        "시장": f["market"],
+        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
         "설명": f["desc"],
     })
 
@@ -825,9 +896,8 @@ def render_table(f: pd.DataFrame):
         .map(color_sign, subset=["등락률"] + flow_cols)
         .map(lambda _: "font-weight: 600", subset=["종목", "RS"])
         .map(_rs_color, subset=["RS", "RS(1M)", "RS(3M)", "RS(6M)"])
-        .map(lambda v: f"color: {UP}; font-weight: 600" if isinstance(v, str) and v.startswith("유지")
-             else (f"color: {DOWN}; font-weight: 600" if isinstance(v, str) and v.startswith("이탈") else ""),
-             subset=["돌파 유지/이탈"])
+        .map(_bo_color, subset=["돌파"])
+        .map(_to_high_color, subset=["신고가까지"])
         .map(lambda v: f"color: {UP}; font-weight: 700" if isinstance(v, str) else "",
              subset=["52주 신고가(일·주·월)", "역대 신고가(일·주·월)"])
         .apply(mark_new_high, axis=1)
@@ -848,9 +918,8 @@ def render_table(f: pd.DataFrame):
             "통화": st.column_config.Column(help="현재가·52주 최고가의 단위. 국내는 원, 해외는 각 시장 통화"),
             "현재가": st.column_config.Column(help="통화 열의 단위예요"),
             "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
-            "돌파 유지/이탈": st.column_config.Column(
-                help="유지 N일: 종가로 직전 52주 최고가를 돌파한 날(1일)부터 한 번도 그 아래에서 마감하지 않은 거래일 수. "
-                     "이탈 N일: 지금의 52주 최고가 아래에서 마감한 거래일 수(최고가를 찍은 날 또는 그 위에서 마감한 다음 날 = 1일)"),
+            "종목": st.column_config.Column(pinned=True),
+            "돌파": st.column_config.Column(help=BO_FULL_HELP),
             "52주 신고가(일·주·월)": st.column_config.Column(
                 help="오늘 일봉·이번 주 주봉·이번 달 월봉 중 고가가 그 봉 직전 52주 최고가를 넘은 봉"),
             "역대 신고가(일·주·월)": st.column_config.Column(
@@ -881,60 +950,90 @@ def _more_cards(limit: int):
     st.session_state["card_limit"] = limit + CARD_STEP
 
 
-def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int):
-    """휴대폰 화면용: 표 대신 카드 목록. CSS가 좁은 화면에서만 보여줘요."""
+M_SORTS = ["신고가 가까운 순", "첫 돌파 우선", "RS 높은 순", "등락률 순"]
+
+
+def _m_sorted(f: pd.DataFrame, how: str) -> pd.DataFrame:
+    if how == "첫 돌파 우선":
+        k = f.assign(_a=(f["bo_status"] != "유지").astype(int),
+                     _b=pd.to_numeric(f.get("bo_nth"), errors="coerce").fillna(99),
+                     _c=pd.to_numeric(f["bo_days"], errors="coerce").fillna(999))
+        return k.sort_values(["_a", "_b", "_c", "to_high"]).drop(columns=["_a", "_b", "_c"])
+    if how == "RS 높은 순":
+        return f.sort_values("rs", ascending=False, na_position="last")
+    if how == "등락률 순":
+        return f.sort_values("change", ascending=False, na_position="last")
+    return f.sort_values("to_high", ascending=True, na_position="last")
+
+
+def _kflow(v) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    color = UP if v > 0 else (DOWN if v < 0 else "#51616C")
+    return f'<b style="color:{color}">{_eok_num(v)}</b>'
+
+
+def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int, fins=None):
+    """휴대폰 화면용 체크 리스트. 한 장에 꼭 볼 것만: 신고가까지 · 돌파 상태 · RS를 같은 자리에 크게."""
     kpis = (
         f'<div class="m-kpis"><div><span>종목</span><b>{len(f)}</b></div>'
         f'<div><span>최근 {recent_days}일 신고가</span><b>{n_hot}</b></div>'
         f'<div><span>10% 이내</span><b>{n_near}</b></div>'
-        f'<div><span>정배열</span><b>{n_aligned}</b></div></div>'
+        f'<div><span>돌파 유지</span><b>{int((f["bo_status"] == "유지").sum())}</b></div></div>'
     )
-    cards = []
-    shown = f[f["price"].notna()]
+    st.markdown(kpis, unsafe_allow_html=True)
+    how = st.radio("정렬", M_SORTS, horizontal=True, key="m_sort", label_visibility="collapsed")
+    shown = _m_sorted(f[f["price"].notna()], how)
     limit = st.session_state.get("card_limit", CARD_STEP)
     total = len(shown)
+    yr = data.now_kst().year
+    cards = []
     for r in shown.head(limit).itertuples():
         hot = pd.notna(r.days_since_high) and r.days_since_high <= recent_days
         if pd.isna(r.change) or r.change == 0:
-            chg = '<span class="c-chg">-</span>' if pd.isna(r.change) else '<span class="c-chg">0.00%</span>'
+            chg = f'<span class="k-chg">{"-" if pd.isna(r.change) else "0.00%"}</span>'
         else:
-            color = UP if r.change > 0 else DOWN
-            chg = f'<span class="c-chg" style="color:{color}">{r.change:+.2f}%</span>'
-        tags = ""
-        if hot:
-            tags += f'<span class="c-tag new">신고가 {int(r.days_since_high)}일</span>'
+            chg = f'<span class="k-chg" style="color:{UP if r.change > 0 else DOWN}">{r.change:+.2f}%</span>'
+        th = r.to_high
+        th_cls = "" if pd.isna(th) else ("hot" if th <= 3 else ("near" if th <= 10 else ""))
+        bo = _bo_full(r)
+        bo_cls = "first" if bo.startswith("⭐") else ("brk" if "번째 돌파" in bo else "off")
+        bo_show = bo.replace("미돌파 · ", "") if bo != "-" else "돌파 전"
+        crown = ' <span class="k-crown">👑 대장</span>' if (r.lead_rank == 1 and r.lead_ok) else ""
+        sub = [html.escape(r.group)]
+        if pd.notna(r.cap_krw):
+            sub.append(f"{data.format_krw(r.cap_krw)}원")
+        if pd.notna(r.lead_rank):
+            sub.append(f"섹터 {int(r.lead_rank)}/{int(r.lead_n)}")
+        if fins is not None and data.is_kr(r.code):
+            og = data.op_growth(fins.get(r.code), yr)
+            color = UP if og["op_up"] else ("#6B7A84" if og["op_up"] is None else DOWN)
+            sub.append(f'<b style="color:{color}">{og["op_txt"]}</b>')
         if r.aligned:
-            tags += '<span class="c-tag al">정배열</span>'
-        if r.lead_rank == 1 and r.lead_ok:
-            tags += '<span class="c-tag new">👑 대장</span>'
-        if r.bo_status == "유지":
-            tags += f'<span class="c-tag new">유지 {int(r.bo_days)}일</span>'
+            sub.append("정배열")
         ath = _nh_text(r._asdict(), "ath")
         if ath:
-            tags += f'<span class="c-tag new">역대 신고가 {ath}</span>'
+            sub.append(f'<b style="color:{UP}">역대 신고가 {ath}</b>')
+        flow = ""
+        if show_flow and pd.notna(getattr(r, "flow_date", None)):
+            flow = (f'<div class="k-flow">외 {_kflow(r.flow_외국인)} · 기 {_kflow(r.flow_기관)}'
+                    f'<span>5일 외 {_kflow(r.flow5_외국인)} · 기 {_kflow(r.flow5_기관)}</span></div>')
         cards.append(
-            f'<a class="card{" hot" if hot else ""}" target="_blank" '
-            f'href="{r.url}">'
-            f'<div class="c-top"><span class="c-name">{html.escape(r.name)}{tags}</span>'
-            f'<span class="c-price">{fmt_price(r.price, r.currency)}'
-            f'{"" if r.currency == "KRW" else " " + r.currency}</span></div>'
-            f'<div class="c-mid"><span>{html.escape(r.group)}</span>{chg}</div>'
-            f'<div class="c-bar"><i style="width:{max(2.0, min(100.0, r.pos)):.0f}%"></i></div>'
-            f'<div class="c-meta"><span>52주 최고 {fmt_price(r.high52, r.currency)} ({r.gap:.1f}%)</span>'
-            f'<span>신고가까지 <b>{r.to_high:+.1f}%</b></span></div>'
-            f'<div class="c-meta" style="margin-top:0.15rem"><span>시가총액 <b>{data.format_krw(r.cap_krw)}{"원" if pd.notna(r.cap_krw) else ""}</b></span></div>'
-            f'<div class="c-meta" style="margin-top:0.15rem"><span>RS <b>{_n(r.rs)}</b> · 1M {_n(r.rs_1m)}</span>'
-            f'<span>ATR(20일) <b>{_pct(r.atr_pct)}</b></span></div>'
-            + (f'<div class="c-flow">수급 {r.flow_date:%m/%d} (억원) · 외 {_flow_cell(r.flow_외국인)} · '
-               f'기 {_flow_cell(r.flow_기관)} · 개 {_flow_cell(r.flow_개인)}'
-               f'<br>5일 누적 · 외 {_flow_cell(r.flow5_외국인)} · 기 {_flow_cell(r.flow5_기관)} · 개 {_flow_cell(r.flow5_개인)}</div>'
-               if show_flow and pd.notna(getattr(r, "flow_date", None)) else "")
-            + f'<div class="c-desc">{html.escape(r.desc)}</div></a>'
+            f'<a class="kcard{" hot" if hot else ""}" target="_blank" href="{r.url}">'
+            f'<div class="k-top"><span class="k-name">{html.escape(r.name)}{crown}</span>'
+            f'<span class="k-px">{fmt_price(r.price, r.currency)}{"" if r.currency == "KRW" else " " + r.currency} {chg}</span></div>'
+            f'<div class="k-keys">'
+            f'<div><small>신고가까지</small><b class="{th_cls}">{"-" if pd.isna(th) else f"{th:+.1f}%"}</b></div>'
+            f'<div><small>돌파</small><b class="{bo_cls}">{html.escape(bo_show)}</b></div>'
+            f'<div><small>RS</small><b class="{"rs" if pd.notna(r.rs) and r.rs >= 80 else ""}">{_n(r.rs)}</b></div>'
+            f'</div>'
+            f'<div class="k-sub">{" · ".join(sub)}</div>{flow}</a>'
         )
-    st.markdown(kpis + '<div class="cards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+    st.markdown('<div class="kcards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
     if total > limit:
         st.button(f"카드 더 보기 ({limit}/{total})", key="card_more", on_click=_more_cards, args=(limit,))
-    st.caption("카드를 누르면 종목 화면이 열려요. 국내는 네이버 증권, 해외는 야후 파이낸스예요.")
+    st.caption("노란 카드 = 최근 신고가. 신고가까지: 빨강 3% 이내 · 주황 10% 이내. "
+               "⭐ 첫 돌파 = 52주 안 첫 돌파(며칠째인지 함께). 카드를 누르면 종목 화면이 열려요. 수급은 억원.")
 
 
 def render_stock_flow(code: str, trends: dict):
@@ -1246,22 +1345,28 @@ def render_next_drill(df: pd.DataFrame, res: pd.DataFrame, fins, trends):
         "급상승 점수": sub["mom"], "현재가": sub["price"], "등락률": sub["change"],
         "52주 고가 대비": sub["gap"], "RS": sub["rs"], "1개월 RS": sub["rs_1m"],
         "외국인 20일(억)": sub["f20"], "기관 20일(억)": sub["i20"],
-        f"영업이익 {y}E 증가율": sub["og"], "신고가": sub.apply(lambda r: _bo_text(r) or "-", axis=1),
+        f"영업이익 {y}E 증가율": sub["og"], "신고가까지": sub["to_high"], "돌파": sub.apply(_bo_full, axis=1),
     })
     st.dataframe(
         view.style.format({"급상승 점수": "{:.0f}", "현재가": "{:,.0f}", "등락률": "{:+.2f}%", "52주 고가 대비": "{:+.1f}%",
                            "RS": "{:.0f}", "1개월 RS": "{:.0f}", "외국인 20일(억)": _eok_num, "기관 20일(억)": _eok_num,
-                           f"영업이익 {y}E 증가율": "{:+.1f}%"}, na_rep="-")
+                           f"영업이익 {y}E 증가율": "{:+.1f}%", "신고가까지": "{:+.1f}%"}, na_rep="-")
+        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"])
         .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}",
              subset=["등락률", "외국인 20일(억)", "기관 20일(억)", f"영업이익 {y}E 증가율"]),
         hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
     )
 
 
-def render_engine(df: pd.DataFrame, trends, leaders: set):
+def render_engine(df: pd.DataFrame, trends, leaders: set, fins=None):
     st.subheader("🚀 섹터 안에서 치고 올라오는 종목")
-    m = data.momentum_engine(df, trends, fresh_days=recent_days)
+    st.caption("원칙: 강하게 치고 나가도 영업이익이 늘지 않으면 배제 — 올해(E) 영업이익이 작년보다 늘어난 종목만 순위에 올려요.")
+    if fins is None:
+        st.info("영업이익을 뒤에서 받는 중이에요(처음 한 번 1~2분). 확인이 끝나면 증가 종목만 보여줘요.")
+        return
+    m = data.momentum_engine(df, trends, fresh_days=recent_days, fins=fins, require_op=True)
     if m.empty:
+        st.info("영업이익이 늘어나는 종목 중에 순위를 매길 종목이 없어요.")
         return
     groups = (m.groupby("group")["mom"].max().sort_values(ascending=False).index.tolist())
     lead_first = [g for g in groups if g in leaders] + [g for g in groups if g not in leaders]
@@ -1289,16 +1394,17 @@ def render_engine(df: pd.DataFrame, trends, leaders: set):
         return " · ".join(out) or "-"
 
     view = pd.DataFrame({
-        "섹터": v["group"], "섹터 내": v.apply(lambda r: f"{int(r['mom_rank'])}/{int(r['mom_n'])}", axis=1),
         "종목": v["name"] + v["lead_rank"].map(lambda x: " 👑" if x == 1 else "").where(v["lead_ok"] == True, ""),  # noqa: E712
         "급상승 점수": v["mom"], "등락률": v["change"],
+        "신고가까지": v["to_high"], "돌파": v.apply(_bo_full, axis=1), "영업이익": v["op_txt"],
+        "섹터": v["group"], "섹터 내": v.apply(lambda r: f"{int(r['mom_rank'])}/{int(r['mom_n'])}", axis=1),
         "수급": v["s_flow"], "RS": v["s_rs"], "캔들": v["s_candle"], "저항 돌파": v["s_break"],
         "외국인 5일(억)": v["f5"], "기관 5일(억)": v["i5"],
         "1개월 RS": v["rs_1m"], "종합 RS": v["rs"], "오늘 거래량": v["vol_today"], "오늘 DCR": v["dcr_today"],
         "근거": v.apply(why, axis=1),
     })
     st.dataframe(
-        view.style.format({"급상승 점수": "{:.0f}", "등락률": "{:+.2f}%", "수급": "{:.0f}", "RS": "{:.0f}",
+        view.style.format({"급상승 점수": "{:.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "수급": "{:.0f}", "RS": "{:.0f}",
                            "캔들": "{:.0f}", "저항 돌파": "{:.0f}", "외국인 5일(억)": _eok_num, "기관 5일(억)": _eok_num,
                            "1개월 RS": "{:.0f}", "종합 RS": "{:.0f}", "오늘 거래량": "{:.1f}배", "오늘 DCR": "{:.0f}%"},
                           na_rep="-")
@@ -1306,9 +1412,13 @@ def render_engine(df: pd.DataFrame, trends, leaders: set):
              f"background-color: rgba(214,51,59,{max(0.0, min(1.0, (v - 40) / 60)) * 0.45:.2f}); font-weight: 700",
              subset=["급상승 점수"])
         .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}",
-             subset=["등락률", "외국인 5일(억)", "기관 5일(억)"]),
+             subset=["등락률", "외국인 5일(억)", "기관 5일(억)"])
+        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"]),
         hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
         column_config={"근거": st.column_config.TextColumn(width="large"),
+                       "종목": st.column_config.Column(pinned=True),
+                       "돌파": st.column_config.Column(help=BO_FULL_HELP),
+                       "신고가까지": st.column_config.Column(help="52주 최고가를 넘으려면 필요한 상승률. 돌파 중이면 0%"),
                        "급상승 점수": st.column_config.NumberColumn(help="0~100. 수급 30%·RS 25%·캔들 20%·저항 돌파 25%")},
     )
     noflow = int(v["mom_noflow"].sum())
@@ -1362,8 +1472,91 @@ def _scn_action(sid, hold: str, a: str, b: str) -> str:
             3: "둘 다 유지(유리)", 4: "현금 확대", 0: "다음 신호 대기"}[sid]
 
 
-def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set):
-    st.subheader("🧭 로테이션 시나리오 — 두 바스켓으로 방향 잡기")
+VERDICT_COLOR = {"섹터 확장": "#1B6FD6", "로테이션 확인": "#C27C0E", "기존 리더 유지": "#1B8A4B",
+                 "돈이 빠지는 중": "#C0262E", "확인 불가": "#51616C"}
+
+
+def render_money_confirm(df: pd.DataFrame, a_groups, b_groups, a_name: str, b_name: str, price_sid):
+    """일당백 관점: 가격 시나리오 다음에 '돈이 실제로 움직였는지'로 확인. 행동은 이 판정을 따라요."""
+    c = data.rotation_confirm(df, a_groups, b_groups)
+    title, mean, act = c["verdict"]
+    col = VERDICT_COLOR.get(title, "#51616C")
+    st.markdown(f"**💸 돈의 방향 확인 — 예측이 아니라 확인**")
+    st.markdown(
+        f'<div style="border:2px solid {col};padding:12px 16px;border-radius:10px">'
+        f'<div style="font-size:1.25rem;font-weight:800;color:{col}">{html.escape(title)}</div>'
+        f'<div style="margin:3px 0 6px">{html.escape(mean)}</div>'
+        f'<div>👉 <b>{html.escape(act)}</b></div></div>', unsafe_allow_html=True)
+    price_map = {1: "기존 리더 유지", 2: "로테이션 확인", 2.5: "로테이션 확인", 3: "섹터 확장", 4: "돈이 빠지는 중"}
+    if price_sid in price_map and price_map[price_sid] != title and title != "확인 불가":
+        st.warning(f"가격만 보면 위 시나리오지만, 돈의 흐름은 아직 '{title}'이에요. 행동은 돈의 흐름 확인을 따르는 걸 기본으로 해요 "
+                   "(예측보다 확인이 조금 늦지만 계좌가 쓸데없이 바빠지지 않아요).")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**{b_name} — 돈을 받아가고 있나** ({c['b_ok']}/4, 3개 이상이면 확인)")
+        st.markdown("\n".join(f"- {_ok_mark(v)} {lab} — {txt}" for lab, v, txt in c["b_checks"]))
+    with c2:
+        st.markdown(f"**{a_name} — 기존 리더가 버티나**")
+        st.markdown("\n".join(f"- {_ok_mark(v)} {lab} — {txt}" for lab, v, txt in c["a_checks"]))
+        for x in c["defense"]:
+            bits = []
+            if x["vs20"] is not None:
+                bits.append(f"20일선 {x['vs20']:+.1f}%")
+            if x["bo_level"]:
+                bits.append(f"돌파가 {x['bo_level']:,.0f} 위 유지")
+            st.caption(f"{'✅' if x['ok'] else '❌'} {x['name']} ({x['group']}) — {' · '.join(bits) or '-'}")
+    st.caption(f"{b_name}에 새로 들어간 종목들이 수익권에 들어오고 돌파 성공 종목(지금 {c['B']['n_hold']}개 유지 중)이 "
+               "계속 늘어날 때 비중을 조금씩 키워요 — 시장이 증명하는 만큼만.")
+
+
+def render_money_radar(df: pd.DataFrame, leaders: set):
+    """주도섹터도 와리가리 한다 — 섹터 사이에서 돈이 어디서 빠져 어디로 가는지."""
+    st.markdown("**📡 돈의 방향 레이더 — 주도섹터 와리가리**")
+    r, sm = data.sector_money_radar(df, leaders, {"fresh_days": recent_days})
+    if r.empty:
+        st.info("거래대금 데이터가 아직 부족해요.")
+        return
+    allr = sm["all_tv_ratio"]
+    if allr is not None:
+        if allr >= 1.1:
+            mood = f"보드 전체 거래대금이 이전 20일보다 {allr:.2f}배 — 새 돈이 들어오는 중"
+        elif allr <= 0.9:
+            mood = f"보드 전체 거래대금이 이전 20일의 {allr:.2f}배 — 전체적으로 돈이 빠지는 중(받는 쪽이 없으면 현금도 선택지)"
+        else:
+            mood = f"보드 전체 거래대금 {allr:.2f}배 — 총량은 비슷, 섹터끼리 돈을 주고받는 중"
+        st.markdown(f"- {mood}")
+    if sm["losers"] or sm["gainers"]:
+        st.markdown(f"- 돈이 빠지는 쪽: **{', '.join(sm['losers']) or '뚜렷하지 않음'}** → "
+                    f"받아가는 쪽: **{', '.join(sm['gainers']) or '없음'}**")
+        if sm["losers"] and not sm["gainers"]:
+            st.markdown("- 받아가는 섹터가 없어요 → 로테이션이 아니라 이탈일 수 있어요. 종목 이름만 바꾸지 말기.")
+    only = st.toggle("변화 있는 섹터만", value=True, key="mr_only")
+    v = r if not only else r[~r["state"].isin(["· 변화 없음", "👑 리더 유지"])]
+    if v.empty:
+        st.caption("지금은 뚜렷하게 돈이 들고나는 섹터가 없어요.")
+        return
+    view = pd.DataFrame({
+        "상태": v["state"], "섹터": v["group"], "종목 수": v["n"],
+        "거래대금 비중": v.apply(lambda x: f"{x['share_prev']:.1f}% → {x['share_now']:.1f}%", axis=1),
+        "비중 변화(%p)": v["share_chg"], "거래대금 5일/이전20일": v["tv_ratio"],
+        "신규 돌파": v["n_break"], "돌파 유지": v["n_hold"], "RS 동반 상승": v["rs_up"], "20일선 위": v["above20"],
+    })
+    st.dataframe(
+        view.style.format({"비중 변화(%p)": "{:+.2f}", "거래대금 5일/이전20일": "{:.2f}배", "RS 동반 상승": "{:.0%}",
+                           "20일선 위": "{:.0%}"}, na_rep="-")
+        .map(lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}; font-weight: 700",
+             subset=["비중 변화(%p)"]),
+        hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
+        column_config={"섹터": st.column_config.Column(pinned=True)},
+    )
+    st.caption("💰 돈 들어오는 중 = 보드 안 거래대금 비중이 1.2배 이상 늘고 + (신규 돌파 2개 이상 또는 RS 동반 상승 50% 이상). "
+               "🧊/📉 = 비중이 0.85배 이하로 줄고 RS 동반 상승 40% 미만. 👑/🔥/📉는 지금 주도섹터. "
+               "거래대금은 최근 5거래일 평균 vs 그 전 20거래일 평균(오늘 장중 봉 제외). 기준값은 제가 정한 값이에요.")
+
+
+
+def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set, fins=None):
+    st.subheader("🧭 로테이션 시나리오 — 무엇이 오르나보다 돈이 어디로 가나")
     groups_all = sorted(df["group"].dropna().unique().tolist())
     with st.expander("시나리오 설정(바스켓·기간·기준)", expanded=False):
         preset = st.selectbox("프리셋", list(data.SCENARIO_PRESETS), key="scn_preset")
@@ -1404,6 +1597,8 @@ def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set):
         f'<div style="font-size:1rem;margin-bottom:6px">{html.escape(cls["text"].replace("{A}", a_name).replace("{B}", b_name))}'
         f' → <b>{html.escape(mean)}</b></div>'
         f'<div style="font-size:1.05rem">👉 <b>{html.escape(act)}</b></div></div>', unsafe_allow_html=True)
+
+    render_money_confirm(df, a_groups, b_groups, a_name, b_name, sid)
 
     idx = _index_ret(load_indexes(), window)
     c1, c2, c3, c4 = st.columns(4)
@@ -1459,7 +1654,7 @@ def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set):
                "관망 = 둘 다 보합이거나 B만 밀리는 구간.")
 
     # 행동에 필요한 종목
-    m = data.momentum_engine(df, trends, fresh_days=recent_days)
+    m = data.momentum_engine(df, trends, fresh_days=recent_days, fins=fins, require_op=fins is not None)
     cA, cB = st.columns(2)
     with cA:
         st.markdown(f"**{a_name} — 보유 쪽 끌고 가기 점검**")
@@ -1472,13 +1667,19 @@ def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set):
                    " ㅣ 많이 빠진 종목: " + ", ".join(f"{n} {v:+.1f}%" for n, v in A.get("bottom", [])))
     with cB:
         st.markdown(f"**{b_name} — 담을 후보(치고 올라오는 순)**")
-        mb = m[m["group"].isin(b_groups)].sort_values("mom", ascending=False).head(6)
+        if fins is None:
+            st.caption("영업이익 확인 중 — 끝나면 영업이익이 늘어나는 종목만 보여줘요.")
+        mb = m[m["group"].isin(b_groups)].sort_values("mom", ascending=False).head(6) if fins is not None and not m.empty \
+            else m.iloc[0:0]
         for r in mb.itertuples():
             tag = " 👑" if (r.lead_rank == 1 and r.lead_ok) else ""
             bo = f"신고가 {r.bo_status} {int(r.bo_days)}일" if r.bo_status in ("유지", "이탈") and pd.notna(r.bo_days) else "-"
-            st.markdown(f"- **{r.name}{tag}** ({r.group}) — 급상승 {r.mom:.0f} · RS {r.rs:.0f} · {bo}")
+            st.markdown(f"- **{r.name}{tag}** ({r.group}) — 급상승 {r.mom:.0f} · RS {_n(r.rs)} · "
+                        f"신고가까지 {r.to_high:+.1f}% · {_bo_full(r)} · {r.op_txt}")
         st.caption("많이 오른 종목: " + ", ".join(f"{n} {v:+.1f}%" for n, v in B["top"]))
     st.caption("시나리오는 방향을 잡는 도구예요. 실제로 담는 종목은 📋 보드 탭의 🎯 매수 후보 원칙(시장·주도주·돌파·RS 등)을 통과해야 해요.")
+    st.divider()
+    render_money_radar(df, leaders)
 
 
 
@@ -1503,18 +1704,22 @@ def render_leaders(df: pd.DataFrame, leaders: set):
         return
     st.markdown("**👑 주도섹터 대장주 — 끌고 가기 점검**")
     view = pd.DataFrame({
-        "섹터": lead["group"], "대장주": lead["name"], "현재가": lead["price"], "등락률": lead["change"],
+        "대장주": lead["name"], "현재가": lead["price"], "등락률": lead["change"],
+        "신고가까지": lead["to_high"], "돌파": lead.apply(_bo_full, axis=1), "섹터": lead["group"],
         "RS": lead["rs"], "시가총액(원)": lead["cap_krw"], "20일 평균 거래대금(원)": lead["tv20"],
         "섹터 종목 수": lead["lead_n"],
-        "52주 신고가": lead.apply(lambda r: _bo_text(r) or "-", axis=1),
         "끌고 가기 점검": lead.apply(_hold_text, axis=1),
     })
     st.dataframe(
-        view.style.format({"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "RS": "{:.0f}", "시가총액(원)": data.format_krw,
+        view.style.format({"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}",
+                           "시가총액(원)": data.format_krw,
                            "20일 평균 거래대금(원)": data.format_krw, "섹터 종목 수": "{:.0f}"}, na_rep="-")
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}", subset=["등락률"]),
+        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}", subset=["등락률"])
+        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"]),
         hide_index=True, height=min(400, 36 * (len(view) + 1) + 4),
-        column_config={"끌고 가기 점검": st.column_config.TextColumn(width="medium")},
+        column_config={"끌고 가기 점검": st.column_config.TextColumn(width="medium"),
+                       "대장주": st.column_config.Column(pinned=True),
+                       "돌파": st.column_config.Column(help=BO_FULL_HELP)},
     )
     st.caption("대장주 = 그 섹터 국내 종목 중 RS 70 이상에서 RS·시가총액·20일 평균 거래대금 종합 1위(신고가가 아니어도 1위면 대장). "
                "끌고 가기 점검은 원칙(3R 절반 익절 후 나머지는 일봉 5일선이 50일선에 닿을 때 정리)을 그대로 보여줘요. "
@@ -1578,7 +1783,7 @@ def render_buy(df: pd.DataFrame, quotes: dict):
             "종목": x.name, "분류": x.group, "섹터 순위": c["top"][1].split(" (")[0],
             "미충족": ", ".join(f"{labels[k]}({c[k][1]})" for k in x.fails) or "-",
             "현재가": r["price"], "등락률": r["change"],
-            "돌파 유지": c["breakout"][1], "RS": r.get("rs"), "ADX": r.get("adx"),
+            "신고가까지": r.get("to_high"), "돌파": _bo_full(r.to_dict()), "RS": r.get("rs"), "ADX": r.get("adx"),
             "끌고 가기": _hold_text(r), "20일선 이격": r.get("dist_ma20"), "돌파일 거래량": r.get("bo_vol_ratio"), "DCR": r.get("bo_dcr"),
             "시가총액(원)": r.get("cap_krw"),
             "손절가": plan["stop_price"], "손절폭": plan["stop_pct"], "3R 목표가": plan["target_price"],
@@ -1590,7 +1795,8 @@ def render_buy(df: pd.DataFrame, quotes: dict):
     view = pd.DataFrame(rows)
     if not p["equity"]:
         view = view.drop(columns=["수량", "매수금액", "비중"])
-    fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "RS": "{:.0f}", "ADX": "{:.0f}", "20일선 이격": "{:+.1f}%",
+    fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}", "ADX": "{:.0f}",
+           "20일선 이격": "{:+.1f}%",
            "돌파일 거래량": "{:.1f}배", "DCR": "{:.0f}%", "시가총액(원)": data.format_krw, "손절가": "{:,.0f}",
            "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}", "비중": "{:.1f}%",
            "외국인 5일(억)": _eok_num, "기관 5일(억)": _eok_num}
@@ -1711,20 +1917,24 @@ def render_board():
 
     leaders_now = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
-    tab_board, tab_next, tab_scn = st.tabs(["📋 보드", "🔭 차기 주도섹터", "🧭 시나리오"])
+    tab_board, tab_next, tab_scn = st.tabs(["📋 보드", "🔭 차기 주도섹터", "🧭 시나리오·돈의 방향"])
     with tab_next:
         render_next(df, fins_all, trends_all, leaders_now)
     with tab_scn:
-        render_scenario(df, histories, trends_all, leaders_now)
+        render_scenario(df, histories, trends_all, leaders_now, fins_all)
     with tab_board:
-        render_board_main(df, histories, quotes, quote_error, shares_store, trends_all, leaders_now)
+        render_board_main(df, histories, quotes, quote_error, shares_store, trends_all, leaders_now, fins_all)
 
 
-def render_board_main(df, histories, quotes, quote_error, shares_store, trends_all, leaders_now):
+def render_board_main(df, histories, quotes, quote_error, shares_store, trends_all, leaders_now, fins_all=None):
     render_market(df)
     render_radar(df)
+    _r, _sm = data.sector_money_radar(df, leaders_now, {"fresh_days": recent_days})
+    if _sm["gainers"] or _sm["losers"]:
+        st.caption(f"💸 돈의 방향 — 빠지는 쪽: {', '.join(_sm['losers']) or '뚜렷하지 않음'} → "
+                   f"받아가는 쪽: {', '.join(_sm['gainers']) or '없음'} (자세히는 🧭 시나리오·돈의 방향 탭)")
     with st.container(key="engine_box", border=True):
-        render_engine(df, trends_all, leaders_now)
+        render_engine(df, trends_all, leaders_now, fins_all)
     with st.container(key="buy_box", border=True):
         render_buy(df, quotes)
     f = apply_filters(df)
@@ -1760,7 +1970,7 @@ def render_board_main(df, histories, quotes, quote_error, shares_store, trends_a
                        "단위: 현재가·52주 최고는 통화 열 기준, 시가총액은 원화(조·억), 등락률·괴리율은 %, "
                        "수급 열은 억원(1억 원 = 100,000,000원)으로 순매수 수량 × 종가로 환산한 추정치예요.")
         with st.container(key="mobile_view"):
-            render_cards(f, n_hot, n_near, n_aligned)
+            render_cards(f, n_hot, n_near, n_aligned, fins_all)
         render_detail(f, histories, trends)
     render_checks(df, quote_error, shares_store)
 
