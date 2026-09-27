@@ -1583,6 +1583,13 @@ def mock_history(code: str, count: int = 520) -> pd.DataFrame:
         lo = min(o, c) * (1 - abs(rng.gauss(0, 0.01)))
         rows.append((d.strftime("%Y%m%d"), round(o), round(hi), round(lo), round(c), rng.randint(10_000, 5_000_000)))
         price = c
+    if rng.random() < 0.12:        # 거래량 폭발 탭 확인용: 몇 달 조용하다가 최근 며칠 터진 모양
+        k = rng.randint(1, 4)
+        base = rng.randint(50_000, 300_000)
+        for i in range(len(rows) - 110, len(rows)):
+            r = list(rows[i])
+            r[5] = int(base * rng.uniform(0.6, 1.4)) if i < len(rows) - k else int(base * rng.uniform(3, 9))
+            rows[i] = tuple(r)
     return rows_to_frame(rows)
 
 
@@ -2591,3 +2598,230 @@ def sector_money_radar(df: pd.DataFrame, leaders: set, p: dict | None = None) ->
         summary["losers"] = out[out["state"].isin(["📉 리더 약화(돈 빠짐)", "🧊 돈 빠지는 중"])] \
             .sort_values("share_chg")["group"].head(4).tolist()
     return out, summary
+
+
+# ─────────────────────────── 🏁 신고가 후보 · 💥 거래량 폭발 ───────────────────────────
+NHC_DEFAULTS = {"imminent": 2.0, "near": 7.0, "watch": 15.0, "tv_min": 1.5, "rs_min": 80, "fresh_days": 60}
+NHC_STATES = ("돌파", "터치", "임박", "근접", "관찰")
+
+
+def _is_session_now(today: date) -> bool:
+    """오늘이 평일이고 9시가 지났으면 '오늘 봉이 생겼어야 하는' 시간이에요(주말·장 전엔 일봉 마지막 봉이 지금 세션)."""
+    now = now_kst()
+    return now.date() == today and now.weekday() < 5 and now.time() >= time(9, 0)
+
+
+def _session_bars(hist: pd.DataFrame, quote: dict | None, today: date | None = None):
+    """일봉 + 실시간 시세 → 마지막 칸이 '지금 세션'인 배열 (날짜, 시가, 고가, 저가, 종가, 거래량).
+
+    - 일봉 마지막이 오늘이면 그 봉에 현재가·장중 고가·누적 거래량을 덮어써요.
+    - 일봉에 오늘 봉이 아직 없고 장중(OPEN)이면 오늘 봉을 새로 붙여요.
+    - 그 밖(주말·장 전)이면 일봉 마지막 봉이 지금 세션이에요.
+    """
+    today = today or now_kst().date()
+    d = hist["date"].values.astype("datetime64[D]")
+    o = hist["open"].to_numpy(dtype=float) if "open" in hist else hist["close"].to_numpy(dtype=float)
+    h, l, c = (hist[k].to_numpy(dtype=float) for k in ("high", "low", "close"))
+    v = hist["volume"].to_numpy(dtype=float) if "volume" in hist else np.full(len(d), np.nan)
+    q = quote or {}
+    price, qh, ql, qv = q.get("price"), q.get("high"), q.get("low"), q.get("volume")
+    t64 = np.datetime64(today, "D")
+    if len(d) and d[-1] == t64:
+        o, h, l, c, v = (x.copy() for x in (o, h, l, c, v))
+        if price:
+            c[-1] = float(price)
+            h[-1] = max(h[-1], float(qh or price), float(price))
+            l[-1] = min(l[-1], float(ql or price), float(price))
+        if qv and not (v[-1] >= qv):
+            v[-1] = float(qv)
+    elif price and q.get("status") == "OPEN" and _is_session_now(today):
+        d = np.append(d, t64)
+        o = np.append(o, float(price))
+        h = np.append(h, max(float(qh or price), float(price)))
+        l = np.append(l, min(float(ql or price), float(price)))
+        c = np.append(c, float(price))
+        v = np.append(v, float(qv) if qv else np.nan)
+    return d, o, h, l, c, v
+
+
+def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = None, lookback: int = 250,
+                 spark_n: int = 120, p: dict | None = None) -> dict:
+    """신고가 후보 상태.
+
+    기준가 = 지금 세션을 뺀 직전 250거래일 최고가(장중 고가). 상태:
+      돌파 = 현재가가 기준가 위 · 터치 = 오늘 고가는 기준가를 넘었지만 현재가는 아래
+      임박/근접/관찰 = 기준가까지 남은 %가 imminent/near/watch 이내
+    거래대금 배수 = 오늘 거래대금 ÷ 직전 20거래일 평균 거래대금
+    최근 신고가 횟수 = 지금 세션 전 fresh_days거래일 안에 52주 신고가(고가 기준)를 쓴 날 수 (0이면 '신선')
+    """
+    p = {**NHC_DEFAULTS, **(p or {})}
+    out = {"ref_high": None, "nh_state": None, "nh_dist": None, "nh_brk": None, "tv_today": None, "tv_ratio": None,
+           "nh_recent": None, "spark": None}
+    if hist is None or hist.empty or len(hist) < 60:
+        return out
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    n = len(c)
+    if n < 61:
+        return out
+    prior = h[max(0, n - 1 - lookback):n - 1]
+    prior = prior[np.isfinite(prior)]
+    if not len(prior):
+        return out
+    ref = float(prior.max())
+    price, hi_now = float(c[-1]), float(h[-1])
+    dist = (ref / price - 1) * 100
+    if price > ref:
+        state = "돌파"
+    elif hi_now >= ref:
+        state = "터치"
+    elif dist <= p["imminent"]:
+        state = "임박"
+    elif dist <= p["near"]:
+        state = "근접"
+    elif dist <= p["watch"]:
+        state = "관찰"
+    else:
+        state = None
+    tv = c * v
+    base = tv[max(0, n - 21):n - 1]
+    base = base[np.isfinite(base)]
+    tv20 = float(base.mean()) if len(base) >= 10 else None
+    tv_today = float(tv[-1]) if np.isfinite(tv[-1]) else None
+    pm = _rolling_prior_max(h, lookback, 120)
+    fd = int(p["fresh_days"])
+    seg_h, seg_pm = h[n - 1 - fd:n - 1], pm[n - 1 - fd:n - 1]
+    ok = np.isfinite(seg_pm)
+    out.update(
+        ref_high=ref, nh_state=state, nh_dist=dist, nh_brk=(price / ref - 1) * 100,
+        tv_today=tv_today, tv_ratio=(tv_today / tv20) if (tv_today and tv20) else None,
+        nh_recent=int((seg_h[ok] > seg_pm[ok]).sum()),
+        spark=[round(float(x), 2) for x in c[-spark_n:] if np.isfinite(x)],
+    )
+    return out
+
+
+def nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None) -> pd.DataFrame:
+    """보드의 국내 종목 중 신고가 후보(돌파·터치·임박·근접·관찰)만 골라 섹션(신선·돌파권·돌파 중·터치 후 밀림)을 붙여요."""
+    p = {**NHC_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    rows = []
+    for _, r in df.iterrows():
+        code = r["code"]
+        if not is_kr(code):
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        res = nh_candidate(hist, quotes.get(code), today=today, p=p)
+        if res["nh_state"] is None:
+            continue
+        rows.append({"code": code, **res})
+    cols = ["code", *nh_candidate(None, None).keys()]
+    cand = pd.DataFrame(rows, columns=cols)
+    if cand.empty:
+        return cand.assign(section=[], fresh=[])
+    keep = [k for k in ("name", "group", "sector", "market", "price", "change", "atr_pct", "rs", "rs_1m", "url",
+                        "cap_krw", "tv20") if k in df.columns]
+    cand = cand.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+    rs = pd.to_numeric(cand["rs"], errors="coerce").fillna(0)
+    tvr = pd.to_numeric(cand["tv_ratio"], errors="coerce").fillna(0)
+    strong = (rs >= p["rs_min"]) & (tvr >= p["tv_min"])
+    st_ = cand["nh_state"]
+    cand["section"] = None
+    cand.loc[st_ == "돌파", "section"] = "돌파 중"
+    cand.loc[st_ == "터치", "section"] = "터치 후 밀림"
+    cand.loc[st_.isin(["임박", "근접"]) & strong, "section"] = "돌파권"
+    cand["fresh"] = st_.isin(["돌파", "터치", "임박", "근접"]) & strong & (cand["nh_recent"] == 0)
+    # 정렬: 돌파(돌파 폭 큰 순) → 나머지는 기준가까지 가까운 순
+    order = {s: i for i, s in enumerate(NHC_STATES)}
+    cand["_o"] = cand["nh_state"].map(order)
+    cand["_k"] = np.where(cand["nh_state"] == "돌파", -cand["nh_brk"], cand["nh_dist"])
+    return cand.sort_values(["_o", "_k"]).drop(columns=["_o", "_k"]).reset_index(drop=True)
+
+
+VS_DEFAULTS = {"quiet": 90, "recent": 5, "mult": 3.0, "quiet_cap": 2.0, "min_tv": 10e8}
+
+
+def volume_surge(hist: pd.DataFrame, quote: dict | None, today: date | None = None, p: dict | None = None,
+                 spark_n: int = 160) -> dict:
+    """몇 달 조용하다가 최근 거래량이 갑자기 터진 종목(일진전기형) 판정용 수치.
+
+    - 조용한 기간 = 최근 recent거래일을 뺀 그 앞 quiet거래일. 기준 거래량 = 그 기간 거래량의 중앙값
+    - 폭발 배수 = 최근 recent거래일 중 가장 큰 거래량 ÷ 기준 거래량
+    - 조용함 = 조용한 기간의 5일 평균 거래량이 기준의 quiet_cap배를 한 번도 안 넘었는지(한두 날 튄 건 괜찮아요)
+    - 거래 수준 = 조용한 기간 중앙값 ÷ 그 앞 1년 중앙값 (1보다 작을수록 평소보다 더 말라 있던 것)
+    """
+    p = {**VS_DEFAULTS, **(p or {})}
+    keys = ("vs_mult", "vs_days", "vs_peak_date", "vs_peak_up", "vs_peak_tv", "vs_avg_mult", "vs_quiet_ok",
+            "vs_quiet_max", "vs_dry", "vs_ret", "vs_range", "vs_since", "vs_vol", "vs_close", "vs_split")
+    out = {k: None for k in keys}
+    if hist is None or hist.empty:
+        return out
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    q, rcn = int(p["quiet"]), int(p["recent"])
+    n = len(v)
+    if n < q + rcn + 5:
+        return out
+    base = v[n - rcn - q:n - rcn]
+    base = base[np.isfinite(base) & (base > 0)]
+    if len(base) < q * 0.7:
+        return out
+    med = float(np.median(base))
+    if med <= 0:
+        return out
+    rec = v[n - rcn:]
+    rec = np.where(np.isfinite(rec), rec, 0)
+    ratios = rec / med
+    pk = int(np.argmax(ratios))
+    pk_i = n - rcn + pk
+    roll5 = pd.Series(v[n - rcn - q:n - rcn]).rolling(5, min_periods=3).mean().to_numpy() / med
+    quiet_max = float(np.nanmax(roll5)) if np.isfinite(roll5).any() else None
+    older = v[max(0, n - rcn - q - 250):n - rcn - q]
+    older = older[np.isfinite(older) & (older > 0)]
+    seg_c = c[n - rcn - q:n - rcn]
+    seg_c = seg_c[np.isfinite(seg_c)]
+    hit = np.nonzero(ratios >= p["mult"])[0]
+    out.update(
+        vs_mult=float(ratios[pk]),
+        vs_days=int(len(hit)),
+        vs_peak_date=pd.Timestamp(d[pk_i]).date(),
+        vs_peak_up=bool(c[pk_i] >= o[pk_i]) if np.isfinite(o[pk_i]) else None,
+        vs_peak_tv=float(c[pk_i] * v[pk_i]) if np.isfinite(v[pk_i]) else None,
+        vs_avg_mult=float(rec.mean() / med),
+        vs_quiet_ok=bool(quiet_max is not None and quiet_max <= p["quiet_cap"]),
+        vs_quiet_max=quiet_max,
+        vs_dry=float(med / np.median(older)) if len(older) >= 60 else None,
+        vs_ret=float((c[-1] / c[n - rcn - 1] - 1) * 100) if c[n - rcn - 1] > 0 else None,
+        vs_range=float((seg_c.max() / seg_c.min() - 1) * 100) if len(seg_c) and seg_c.min() > 0 else None,
+        vs_since=int(n - 1 - (n - rcn + int(hit[0]))) if len(hit) else None,
+        vs_vol=[0.0 if not np.isfinite(x) else round(float(x)) for x in v[-spark_n:]],
+        vs_close=[round(float(x), 2) for x in c[-spark_n:]],
+        vs_split=int(min(spark_n, n) - rcn - q) ,
+    )
+    return out
+
+
+def volume_surges(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None,
+                  only_quiet: bool = True) -> pd.DataFrame:
+    """보드의 국내 종목 중 거래량 폭발 종목. 조건: 폭발 배수 ≥ mult · 폭발일 거래대금 ≥ min_tv · (조용함)."""
+    p = {**VS_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    rows = []
+    for _, r in df.iterrows():
+        code = r["code"]
+        if not is_kr(code):
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        res = volume_surge(hist, quotes.get(code), today=today, p=p)
+        if res["vs_mult"] is None or res["vs_mult"] < p["mult"]:
+            continue
+        if (res["vs_peak_tv"] or 0) < p["min_tv"]:
+            continue
+        if only_quiet and not res["vs_quiet_ok"]:
+            continue
+        rows.append({"code": code, **res})
+    out = pd.DataFrame(rows, columns=["code", *volume_surge(None, None).keys()])
+    if out.empty:
+        return out
+    keep = [k for k in ("name", "group", "sector", "market", "price", "change", "to_high", "rs", "rs_1m", "url",
+                        "aligned", "cap_krw") if k in df.columns]
+    out = out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+    return out.sort_values("vs_mult", ascending=False).reset_index(drop=True)
