@@ -17,6 +17,7 @@ import threading
 import time
 
 import data
+import holdings
 import reports
 import stocks as stock_list
 
@@ -76,6 +77,11 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
+HOLDINGS_VERSION = "2026-09-28-holdings"
+if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
+    holdings = importlib.reload(holdings)
+if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
+    _missing.append("holdings.py 새 파일")
 if _missing:
     st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
              "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
@@ -206,16 +212,16 @@ st.markdown(
   position: relative; --gc: #51616C; --gt: #F1F4F6;
   background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
   border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
-.st-key-main_tabs [role="tab"]:nth-child(n+4):nth-child(-n+6) { --gc: #E0672B; --gt: #FDF3EC; }
-.st-key-main_tabs [role="tab"]:nth-child(n+7) { --gc: #1F66C9; --gt: #EEF4FC; }
-.st-key-main_tabs [role="tab"]:nth-child(4),
-.st-key-main_tabs [role="tab"]:nth-child(7) { margin-left: 0.9rem; }
+.st-key-main_tabs [role="tab"]:nth-child(n+5):nth-child(-n+7) { --gc: #E0672B; --gt: #FDF3EC; }
+.st-key-main_tabs [role="tab"]:nth-child(n+8) { --gc: #1F66C9; --gt: #EEF4FC; }
+.st-key-main_tabs [role="tab"]:nth-child(5),
+.st-key-main_tabs [role="tab"]:nth-child(8) { margin-left: 0.9rem; }
 .st-key-main_tabs [role="tab"]::before {
   position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
   letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
 .st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
-.st-key-main_tabs [role="tab"]:nth-child(4)::before { content: "종목 시그널"; }
-.st-key-main_tabs [role="tab"]:nth-child(7)::before { content: "섹터 흐름"; }
+.st-key-main_tabs [role="tab"]:nth-child(5)::before { content: "종목 시그널"; }
+.st-key-main_tabs [role="tab"]:nth-child(8)::before { content: "섹터 흐름"; }
 .st-key-main_tabs [role="tab"] p { color: #3A4852; font-size: 0.98rem !important; }
 .st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
 .st-key-main_tabs [role="tab"][aria-selected="true"] p,
@@ -279,6 +285,39 @@ st.markdown(
 .rp-badge.on { border-color: #2E9D5B; color: #1E7A45; background: #EEF8F2; }
 .rp-badge.off { border-color: #E3C7A0; color: #9A6417; background: #FDF6EC; }
 [class*="st-key-rp_box_"] { background: #FFFFFF; border-radius: 12px !important; }
+/* 메인 탭 색칠이 탭 안쪽의 작은 탭(차트·실적·뉴스 등)에는 번지지 않게 */
+.st-key-main_tabs [role="tabpanel"] [role="tab"], .st-key-main_tabs [role="tabpanel"] [role="tab"]:nth-child(n) {
+  --gc: #16212B; --gt: transparent; background: transparent !important; border: none !important;
+  border-bottom: 2px solid transparent !important; border-radius: 0 !important; margin-left: 0 !important;
+  padding: 0.4rem 0.8rem !important; }
+.st-key-main_tabs [role="tabpanel"] [role="tab"]::before { content: none !important; }
+.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] { background: transparent !important;
+  border-bottom: 2px solid #16212B !important; }
+.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] p { color: #16212B !important; font-weight: 800; }
+.st-key-main_tabs [role="tabpanel"] [role="tab"] p { font-size: 0.9rem !important; }
+/* ── 💼 내 보유 ── */
+[class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
+.hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.hd-name { font-size: 1.35rem; font-weight: 800; color: #16212B; }
+.hd-code { font-size: 0.85rem; color: #7A8A94; margin: 0 0.5rem 0 0.35rem; }
+.hd-px { font-size: 1.2rem; font-weight: 800; margin-right: 0.5rem; font-variant-numeric: tabular-nums; }
+.hd-pnl { font-size: 1.05rem; font-weight: 800; }
+.hd-verdict { font-size: 0.95rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 999px; border: 1.5px solid; }
+.hd-sub { font-size: 0.85rem; color: #51616C; margin: 0.3rem 0 0.6rem; }
+.hd-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.4rem; }
+.hd-chk { border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.45rem 0.65rem; background: #F9FAFB; }
+.hd-chk span { display: block; font-size: 0.84rem; font-weight: 800; color: #16212B; }
+.hd-chk em { font-style: normal; font-size: 0.8rem; color: #51616C; }
+.hd-chk.bad { border-color: #F2B8BB; background: #FDF3F3; }
+.hd-chk.warn { border-color: #EED9A8; background: #FFFAEE; }
+.hd-chk.good { border-color: #CBE7D5; background: #F4FBF6; }
+.hd-act { margin: 0.6rem 0 0.4rem; padding: 0.55rem 0.8rem; border-left: 4px solid #16212B; background: #F6F8F9; border-radius: 6px; }
+.hd-act b { font-size: 0.86rem; } .hd-act ul { margin: 0.2rem 0 0 1rem; padding: 0; font-size: 0.86rem; }
+.hd-news { display: flex; flex-direction: column; gap: 0.3rem; }
+.hd-news a { display: block; text-decoration: none; padding: 0.4rem 0.55rem; border: 1px solid #EEF1F3; border-radius: 8px; background: #FFFFFF; }
+.hd-news a:hover { border-color: #16212B; }
+.hd-news span { display: block; font-size: 0.88rem; color: #16212B; font-weight: 600; }
+.hd-news em { font-style: normal; font-size: 0.74rem; color: #7A8A94; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -1825,6 +1864,218 @@ def render_reports_tab():
     _render_saved_reports(stt, editable=True)
 
 
+# ─────────────────────────── 💼 내 보유 ───────────────────────────
+@st.cache_data(ttl=600, show_spinner=False, max_entries=200)
+def load_evidence(code: str, name: str) -> dict:
+    if data.MOCK:
+        return holdings.mock_gather(code, name)
+    return holdings.gather(code, name, data.is_kr(code))
+
+
+def _persist_holdings(store: dict, stt: dict) -> tuple[bool, str]:
+    holdings.save_local(store)
+    if stt["gh"]:
+        return reports.save_github(store, stt["token"], stt["repo"], stt["branch"], path="user_holdings.json")
+    return True, "이 서버에만 임시로 저장했어요(앱을 다시 켜면 사라질 수 있어요)."
+
+
+def _hold_context(df: pd.DataFrame) -> dict:
+    hist = load_indexes()
+    parts, oks = [], []
+    for name, sym in data.MARKETS.items():
+        sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
+        ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
+        oks.append(ok)
+        parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
+    sm_money = data.sector_money(df, "group") if "tv_live" in df else pd.DataFrame()
+    return {"market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
+            "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
+                       for n, sym in data.MARKETS.items()},
+            "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
+            "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
+
+
+def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict) -> tuple[dict, pd.DataFrame, dict | None]:
+    """보드에 있으면 보드 지표를, 없으면 일봉으로 바로 계산해요."""
+    quote = quotes.get(code)
+    if quote is None and data.is_kr(code):
+        quote = load_quotes((code,))[0].get(code)
+    bars = load_chart(code, "일봉")
+    bars_live = data.chart_with_live(bars, quote if data.is_kr(code) else None, "일봉")
+    hit = df[df["code"] == code]
+    if len(hit):
+        return hit.iloc[0].to_dict(), bars_live, quote
+    m = data.compute_metrics(bars, quote) if bars is not None and not bars.empty else {}
+    return m, bars_live, quote
+
+
+LEVEL_COLOR = {"red": ("#FDECEC", UP), "orange": ("#FDF1E7", "#D2691E"), "yellow": ("#FFF8E1", "#B7861D"),
+               "green": ("#EEF8F2", "#1E7A45"), "blue": ("#EEF4FC", DOWN), "gray": ("#F1F4F6", "#51616C")}
+
+
+@st.fragment
+def render_holdings_tab(df: pd.DataFrame, quotes: dict):
+    """💼 내 보유: 평단가를 넣으면 내 원칙으로 점검하고, 뉴스·리포트 근거를 모아 보여줘요."""
+    stt = _rep_status()
+    _sec_h("💼 내 보유 종목", "평단가를 넣으면 내 매매 원칙으로 점검해요 · 매수·매도 추천이 아니라 원칙 점검표예요")
+    if stt["pw"] and not st.session_state.get("rep_ok"):
+        pw = st.text_input("비밀번호(보유 종목은 비밀번호를 넣어야 보여요)", type="password", key="hold_pw")
+        if pw and pw == stt["pw"]:
+            st.session_state["rep_ok"] = True
+            st.rerun(scope="fragment")
+        elif pw:
+            st.error("비밀번호가 달라요.")
+        return
+    if not stt["pw"]:
+        st.warning("비밀번호(APP_PASSWORD)가 없어서 앱 주소를 아는 누구나 보유 종목을 볼 수 있어요. "
+                   "📥 리포트 탭의 '처음 한 번 설정하기'대로 Secrets에 비밀번호를 넣어 주세요.")
+    store = holdings.load()
+    board_labels = {s["code"]: s["name"] for s in STOCKS}
+
+    with st.expander("➕ 보유 종목 추가", expanded=not store["holdings"]):
+        c1, c2 = st.columns([1.4, 1])
+        q = c1.text_input("종목 이름이나 코드", key="hold_q", placeholder="예: 인텍플러스, 064290")
+        cands = []
+        if q.strip():
+            ql = q.strip().lower()
+            cands = [(c, n) for c, n in board_labels.items() if ql in n.lower() or c.lower().startswith(ql)][:10]
+            if data.is_kr(q.strip()) and len(q.strip()) == 6 and q.strip() not in board_labels:
+                cands.insert(0, (q.strip(), q.strip()))
+            if len(cands) < 5:
+                cands += [x for x in naver_search(q.strip()) if x[0] not in {c for c, _ in cands}][:8]
+        pick = c2.selectbox("찾은 종목", cands, format_func=lambda t: f"{t[1]} ({t[0]})", key="hold_pick",
+                            placeholder="먼저 왼쪽에 검색", index=0 if cands else None)
+        c1, c2, c3, c4 = st.columns(4)
+        avg = c1.number_input("평단가", min_value=0.0, step=100.0, format="%.2f", key="hold_avg")
+        qty = c2.number_input("수량(선택)", min_value=0.0, step=1.0, format="%.0f", key="hold_qty")
+        bdate = c3.date_input("매수일", value=data.now_kst().date(), key="hold_date")
+        stop = c4.number_input("손절 %(비우면 8% 또는 ATR)", min_value=0.0, max_value=50.0, step=0.5, value=0.0, key="hold_stop")
+        c1, c2 = st.columns([3, 1])
+        memo = c1.text_input("메모(선택)", key="hold_memo", placeholder="예: 후공정 섹터 2번째 돌파 진입")
+        half = c1.checkbox("이미 절반 익절함(손절선을 본전으로)", key="hold_half")
+        if c2.button("저장", type="primary", width="stretch", disabled=not (pick and avg > 0)):
+            store["holdings"].append(holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo))
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(msg)
+            st.rerun(scope="fragment")
+
+    if not store["holdings"]:
+        st.info("아직 넣은 보유 종목이 없어요. 위에서 종목과 평단가를 넣어 주세요.")
+        return
+
+    ctx = _hold_context(df)
+    rows = []
+    for h in store["holdings"]:
+        m, bars, quote = _hold_metrics(h["code"], df, quotes)
+        rows.append((h, m, bars, holdings.judge(h, m, bars, ctx)))
+
+    # 요약
+    tot_cost = sum(h["avg"] * h["qty"] for h, *_ in rows if h.get("qty"))
+    tot_val = sum((_m.get("price") or 0) * h["qty"] for h, _m, *_ in rows if h.get("qty"))
+    cnt = {}
+    for *_, j in rows:
+        cnt[j["verdict"]] = cnt.get(j["verdict"], 0) + 1
+    c = st.columns(4)
+    c[0].metric("보유 종목", f"{len(rows)}개")
+    if tot_cost:
+        c[1].metric("평가손익", f"{tot_val - tot_cost:+,.0f}원", f"{(tot_val / tot_cost - 1) * 100:+.2f}%")
+    c[2].metric("손절·정리 신호", f"{sum(v for k, v in cnt.items() if k.startswith(('🛑', '📉', '⚠️')))}개")
+    c[3].metric("시장", "60일선 위" if ctx["market_ok"] else ("60일선 아래" if ctx["market_ok"] is False else "-"),
+                ctx["market_text"], delta_color="off")
+
+    order = {"red": 0, "orange": 1, "blue": 2, "yellow": 3, "green": 4, "gray": 5}
+    for h, m, bars, j in sorted(rows, key=lambda x: order.get(x[3]["level"], 9)):
+        bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
+        cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
+        price = m.get("price")
+        pnl_col = UP if (j["pnl"] or 0) > 0 else DOWN
+        with st.container(border=True, key=f"hold_card_{h['id']}"):
+            st.markdown(
+                f'<div class="hd-top"><div><b class="hd-name">{html.escape(h["name"])}</b>'
+                f'<span class="hd-code">{h["code"]}</span>'
+                f'<span class="hd-px">{fmt_price(price, cur)}</span>'
+                f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {(j["r"] or 0):+.2f}R</span></div>'
+                f'<span class="hd-verdict" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></div>'
+                f'<div class="hd-sub">평단 {fmt_price(h["avg"], cur)}'
+                + (f' · {h["qty"]:,.0f}주 · 평가손익 {(price - h["avg"]) * h["qty"]:+,.0f}' if h.get("qty") and price else "")
+                + f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
+                + f' · 3R 목표 {fmt_price(j["target3r"], cur)} · 매수일 {h.get("buy_date", "-")}'
+                + (f' · {html.escape(h["memo"])}' if h.get("memo") else "") + "</div>",
+                unsafe_allow_html=True)
+            icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
+            st.markdown('<div class="hd-checks">' + "".join(
+                f'<div class="hd-chk {st_}"><span>{icon[st_]} {html.escape(item)}</span><em>{html.escape(txt)}</em></div>'
+                for st_, item, txt in j["checks"]) + "</div>", unsafe_allow_html=True)
+            st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
+                f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
+
+            t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
+            with t_news:
+                ev = load_evidence(h["code"], h["name"])
+                if stt["ai"]:
+                    k = f"hold_ai_{h['id']}"
+                    if st.button("🤖 뉴스를 원칙과 연결해 요약", key=f"{k}_btn"):
+                        with st.spinner("뉴스·리포트를 읽는 중이에요."):
+                            txt, err = holdings.ai_news_summary(stt["key"], stt["model"], h["name"], j,
+                                                                ev["news"] + ev["research"])
+                        st.session_state[k] = txt or err
+                    if st.session_state.get(k):
+                        st.info(st.session_state[k])
+                c1, c2 = st.columns([1.6, 1])
+                with c1:
+                    st.markdown("**최근 뉴스** (네이버 증권 · 구글 뉴스 모음)")
+                    if ev["news"]:
+                        st.markdown('<div class="hd-news">' + "".join(
+                            f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
+                            f'<em>{html.escape(x["source"])} · {html.escape(x["time"])} · {x["portal"]}</em></a>'
+                            for x in ev["news"][:12]) + "</div>", unsafe_allow_html=True)
+                    else:
+                        st.caption("뉴스를 받지 못했어요.")
+                with c2:
+                    st.markdown("**증권사 리포트**")
+                    if ev["research"]:
+                        st.markdown('<div class="hd-news">' + "".join(
+                            f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
+                            f'<em>{html.escape(x["source"])} · {html.escape(x["time"])}</em></a>'
+                            for x in ev["research"]) + "</div>", unsafe_allow_html=True)
+                    else:
+                        st.caption("최근 리포트가 없거나 받지 못했어요.")
+                st.caption("뉴스는 10분마다 새로 모아요. 제목만으로는 판단이 틀릴 수 있으니 원문을 확인하세요.")
+            with t_chart:
+                candle_chart(h["code"], cur, quotes.get(h["code"]) if data.is_kr(h["code"]) else None,
+                             m.get("high52"), key=f"hold_ch_{h['id']}")
+
+    with st.expander("✏️ 보유 종목 고치기 · 지우기"):
+        ed = st.data_editor(pd.DataFrame([{
+            "종목명": h["name"], "코드": h["code"], "평단가": h["avg"], "수량": h.get("qty") or 0.0,
+            "매수일": h.get("buy_date", ""), "손절%": h.get("stop_pct"), "절반 익절함": bool(h.get("half_taken")),
+            "메모": h.get("memo", ""), "_id": h["id"]} for h in store["holdings"]]),
+            key="hold_editor", hide_index=True, num_rows="dynamic", width="stretch",
+            column_config={"_id": None, "코드": st.column_config.TextColumn(disabled=True),
+                           "종목명": st.column_config.TextColumn(disabled=True),
+                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR")})
+        st.caption("줄을 지우려면 왼쪽 칸을 고르고 휴지통을 누른 뒤 저장하세요. 새 종목은 위 '보유 종목 추가'로 넣어요.")
+        if st.button("변경 저장", key="hold_save"):
+            by_id = {h["id"]: h for h in store["holdings"]}
+            new = []
+            for _, r in ed.iterrows():
+                h = by_id.get(r.get("_id"))
+                if not h:
+                    continue
+                sp = r.get("손절%")
+                h.update(avg=float(r["평단가"]), qty=float(r["수량"] or 0), buy_date=str(r["매수일"] or ""),
+                         stop_pct=float(sp) if sp == sp and sp not in (None, "", 0) else None,
+                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""))
+                new.append(h)
+            store["holdings"] = new
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(msg)
+            st.rerun(scope="fragment")
+    if stt["gh"]:
+        st.caption("보유 종목은 GitHub 저장소의 user_holdings.json에 저장돼요. 저장소가 공개(Public)면 누구나 볼 수 있으니 "
+                   "GitHub에서 저장소를 비공개(Private)로 바꿔 두세요.")
+
+
 def now_date() -> str:
     return data.now_kst().strftime("%y.%m.%d")
 
@@ -3290,9 +3541,11 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     with st.container(key="main_tabs"):
-        t_list, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
-            ["📋 리스트", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금",
-             "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"])
+        t_list, t_hold, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
+            ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"])
+    with t_hold:
+        render_holdings_tab(df, quotes)
     with t_rep:
         render_reports_tab()
     with t_chart:
