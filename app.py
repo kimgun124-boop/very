@@ -183,17 +183,33 @@ st.markdown(
 .st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
 .st-key-main_tabs [role="tab"]:nth-child(3)::before { content: "종목 시그널"; }
 .st-key-main_tabs [role="tab"]:nth-child(6)::before { content: "섹터 흐름"; }
-.st-key-main_tabs [role="tab"] p { color: #3A4852; }
+.st-key-main_tabs [role="tab"] p { color: #3A4852; font-size: 0.98rem !important; }
 .st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
 .st-key-main_tabs [role="tab"][aria-selected="true"] p,
 .st-key-main_tabs [role="tab"][aria-selected="true"]::before { color: #FFFFFF !important; }
 .st-key-main_tabs .react-aria-SelectionIndicator, .st-key-main_tabs [data-baseweb="tab-highlight"], .st-key-main_tabs [data-baseweb="tab-border"] { display: none; }
 .ch-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem 0.7rem; margin: 0.3rem 0 0.4rem; }
-.ch-head b { font-size: 1.35rem; font-weight: 800; color: #16212B; }
-.ch-code { font-size: 0.82rem; color: #7A8A94; }
-.ch-px { font-size: 1.25rem; font-weight: 800; font-variant-numeric: tabular-nums; }
-.ch-px small { font-size: 0.9rem; font-weight: 700; margin-left: 0.2rem; }
-.ch-sub { font-size: 0.8rem; color: #51616C; flex-basis: 100%; }
+.ch-head { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.8rem 1rem; margin: 0.6rem 0 0.7rem !important; }
+.ch-head b { font-size: 1.7rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em; }
+.ch-code { font-size: 0.95rem; color: #7A8A94; }
+.ch-px { font-size: 1.6rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.ch-px small { font-size: 1.05rem; font-weight: 700; margin-left: 0.25rem; }
+.ch-sub { font-size: 0.95rem; color: #51616C; flex-basis: 100%; }
+[class*="st-key-"][class*="chart_bar"], .st-key-chart_search {
+  background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.75rem 0.9rem 0.85rem; }
+[class*="st-key-"][class*="chart_bar"] label p, .st-key-chart_search label p {
+  font-size: 0.9rem !important; font-weight: 800 !important; color: #16212B !important; }
+[class*="st-key-"][class*="chart_bar"] button[data-variant="segmented_control"] {
+  min-height: 2.5rem; padding: 0.35rem 0.4rem !important; }
+[class*="st-key-"][class*="chart_bar"] button p { font-size: 0.98rem !important; font-weight: 700; }
+[class*="st-key-"][class*="chart_bar"] button[data-selected="true"] { background: #16212B !important; border-color: #16212B !important; }
+[class*="st-key-"][class*="chart_bar"] button[data-selected="true"] p { color: #FFFFFF !important; }
+.st-key-chart_search input { font-size: 1rem !important; min-height: 2.6rem; }
+.st-key-chart_search [data-baseweb="select"] div { font-size: 1rem; }
+.st-key-chart_search [data-testid="stButtonGroup"] button { min-height: 2.2rem; }
+.st-key-chart_search [data-testid="stButtonGroup"] button p { font-size: 0.95rem !important; }
+.st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] { background: #16212B !important; }
+.st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] p { color: #FFFFFF !important; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -1388,13 +1404,13 @@ MA_SET = {"일봉": ((5, "5일"), (20, "20일"), (60, "60일"), (120, "120일"))
           "주봉": ((5, "5주"), (10, "10주"), (30, "30주"), (52, "52주")),
           "월봉": ((3, "3개월"), (6, "6개월"), (12, "12개월"), (24, "24개월"))}
 MA_COLORS = ("#E0672B", "#2E9D5B", "#7A4FD1", "#8A96A0")
-PERIODS = {"일봉": {"3개월": 63, "6개월": 126, "1년": 250, "2년": 500, "전체": None},
+PERIODS = {"일봉": {"1개월": 21, "3개월": 63, "6개월": 126, "1년": 250, "2년": 500, "전체": None},
            "주봉": {"1년": 52, "2년": 104, "5년": 260, "전체": None},
            "월봉": {"5년": 60, "10년": 120, "전체": None}}
 
 
 def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol: bool, line: float | None = None,
-               currency: str = "KRW"):
+               currency: str = "KRW", show_tv: bool = False):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     b = b.copy().reset_index(drop=True)
@@ -1403,8 +1419,10 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
     if n:
         b = b.tail(n)
     x = pd.to_datetime(b["date"]).dt.strftime("%Y-%m" if tf == "월봉" else "%Y-%m-%d")
-    fig = make_subplots(rows=2 if show_vol else 1, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                        row_heights=[0.76, 0.24] if show_vol else [1.0])
+    panels = ["price"] + (["vol"] if show_vol else []) + (["tv"] if show_tv else [])
+    heights = {1: [1.0], 2: [0.74, 0.26], 3: [0.62, 0.19, 0.19]}[len(panels)]
+    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=heights)
+    up_mask = [c >= o for o, c in zip(b["open"], b["close"])]
     fmt = ",.0f" if currency in ("KRW", "JPY") else ",.2f"
     fig.add_trace(go.Candlestick(
         x=x, open=b["open"], high=b["high"], low=b["low"], close=b["close"], name="봉", showlegend=False,
@@ -1419,43 +1437,67 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
         fig.add_hline(y=line, line=dict(color="#F2B134", width=1.4, dash="dash"), row=1, col=1,
                       annotation_text=f"52주 최고 {line:{fmt}}", annotation_position="top left",
                       annotation_font=dict(size=11, color="#B7861D"))
+    colors = [UP if u else DOWN for u in up_mask]
+    fig.update_yaxes(side="right", gridcolor="#EEF1F3", zeroline=False, tickfont=dict(size=12))
+    fig.update_yaxes(tickformat=fmt, row=1, col=1)
     if show_vol:
-        colors = [UP if c >= o else DOWN for o, c in zip(b["open"], b["close"])]
+        r = panels.index("vol") + 1
         fig.add_trace(go.Bar(x=x, y=b["volume"], marker_color=colors, opacity=0.55, name="거래량", showlegend=False,
-                             hovertemplate="거래량 %{y:,.0f}<extra></extra>"), row=2, col=1)
+                             hovertemplate="거래량 %{y:,.0f}<extra></extra>"), row=r, col=1)
+        fig.update_yaxes(title_text="거래량", title_font=dict(size=12, color="#7A8A94"), tickformat="~s", row=r, col=1)
+    if show_tv:
+        r = panels.index("tv") + 1
+        # 거래대금 ≈ 평균가((고+저+종)/3) × 거래량. 국내는 억원, 해외는 백만(현지 통화)
+        typ = (b["high"] + b["low"] + b["close"]) / 3
+        krw = currency == "KRW"
+        tv = typ * b["volume"] / (1e8 if krw else 1e6)
+        unit = "억" if krw else f"M {UNIT.get(currency, currency)}"
+        fig.add_trace(go.Bar(x=x, y=tv, marker_color=colors, opacity=0.75, name="거래대금", showlegend=False,
+                             hovertemplate=f"거래대금 %{{y:,.0f}}{unit}<extra></extra>"), row=r, col=1)
+        fig.update_yaxes(title_text=f"거래대금({unit})", title_font=dict(size=12, color="#7A8A94"), tickformat=",.0f",
+                         row=r, col=1)
     fig.update_xaxes(type="category", nticks=8, showgrid=False, rangeslider_visible=False, tickangle=0,
-                     showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
-    fig.update_yaxes(side="right", gridcolor="#EEF1F3", tickformat=fmt, zeroline=False)
-    fig.update_layout(height=560 if show_vol else 460, margin=dict(l=8, r=8, t=30, b=8), hovermode="x unified",
-                      dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                      legend=dict(orientation="h", y=1.06, x=0, font=dict(size=11)),
-                      font=dict(family="Pretendard, Malgun Gothic, sans-serif"))
+                     tickfont=dict(size=12), showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
+    fig.update_layout(height={1: 480, 2: 600, 3: 700}[len(panels)], margin=dict(l=8, r=8, t=36, b=8),
+                      hovermode="x unified", dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                      hoverlabel=dict(font_size=13),
+                      legend=dict(orientation="h", y=1.05, x=0, font=dict(size=13)),
+                      font=dict(family="Pretendard, Malgun Gothic, sans-serif", size=13))
     return fig
 
 
 def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, high52: float | None = None,
                  key: str = "cc"):
     """일봉·주봉·월봉 캔들 + 이동평균 + 거래량. 국내 종목은 실시간 시세로 마지막 봉을 갱신해요."""
-    c1, c2, c3 = st.columns([1.1, 1.6, 1.3])
-    tf = c1.segmented_control("봉", list(data.CHART_TF), default="일봉", required=True, key=f"{key}_tf",
-                              label_visibility="collapsed") or "일봉"
-    periods = PERIODS[tf]
-    default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
-    per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
-                               label_visibility="collapsed") or default_p
-    opts = c3.pills("표시", ["이동평균", "거래량"], selection_mode="multi", default=["이동평균", "거래량"],
-                    key=f"{key}_opts", label_visibility="collapsed") or []
+    with st.container(key=f"{key}_bar"):
+        c1, c2, c3 = st.columns([1.0, 2.0, 1.6], gap="medium")
+        tf = c1.segmented_control("봉 종류", list(data.CHART_TF), default="일봉", required=True, key=f"{key}_tf",
+                                  width="stretch") or "일봉"
+        periods = PERIODS[tf]
+        default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
+        per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
+                                   width="stretch") or default_p
+        opts = c3.segmented_control("아래 칸에 표시", ["이동평균", "거래량", "거래대금"], selection_mode="multi",
+                                    default=["이동평균", "거래량", "거래대금"], key=f"{key}_opts2", width="stretch") or []
     with st.spinner("차트를 불러오는 중이에요."):
         bars = load_chart(code, tf)
     if bars is None or bars.empty:
         st.info("이 종목의 봉 데이터를 받지 못했어요. 잠시 뒤 다시 시도해 보세요.")
         return
     bars = data.chart_with_live(bars, quote, tf)
-    fig = candle_fig(bars, tf, periods[per], "이동평균" in opts, "거래량" in opts, high52, currency)
+    fig = candle_fig(bars, tf, periods[per], "이동평균" in opts, "거래량" in opts, high52, currency, "거래대금" in opts)
     st.plotly_chart(fig, key=f"{key}_fig", config={"displaylogo": False, "scrollZoom": True,
                                                    "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
-    st.caption("드래그로 옮기고, 휠·두 손가락으로 확대해요. 더블클릭하면 원래대로. "
+    st.caption("드래그로 옮기고, 휠·두 손가락으로 확대해요. 더블클릭하면 원래대로. 거래대금은 평균가×거래량으로 계산한 추정치예요. "
                + ("마지막 봉은 실시간 시세로 갱신돼요." if quote else "해외 종목은 야후 일봉 기준이에요."))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def naver_search(q: str) -> list[tuple[str, str]]:
+    try:
+        return data.search_stock(q)[:12]
+    except Exception:
+        return []
 
 
 def render_chart_tab(df: pd.DataFrame, quotes: dict):
@@ -1465,26 +1507,44 @@ def render_chart_tab(df: pd.DataFrame, quotes: dict):
     codes = list(labels)
     mine = [c for c in codes if _mkt(c) == market]
     ordered = mine + [c for c in codes if c not in mine]
+    names = st.session_state.setdefault("chart_names", {})
     want = st.session_state.get("chart_code")
     if want in ordered and st.session_state.get("chart_pick") != want:
         st.session_state["chart_pick"] = want          # 표·카드에서 고른 종목으로 맞춰요
     if st.session_state.get("chart_pick") not in ordered:
         st.session_state.pop("chart_pick", None)
-    c1, c2 = st.columns([2, 1])
-    code = c1.selectbox("종목 검색", ordered, format_func=labels.get, key="chart_pick",
-                        placeholder="종목 이름이나 코드를 입력하세요",
-                        on_change=lambda: st.session_state.update(chart_code=st.session_state["chart_pick"]))
-    extra = c2.text_input("보드에 없는 국내 종목", placeholder="예: 카카오, 035720", key="chart_extra")
-    name, currency, row = labels.get(code, code).split(" · ")[0], "KRW", None
-    if extra.strip():
-        q = extra.strip()
-        cands = [(q, q)] if data.is_kr(q) and len(q) == 6 else data.search_stock(q)[:8]
-        if cands:
-            pick = st.radio("검색 결과", cands, format_func=lambda t: f"{t[1]} ({t[0]})", horizontal=True,
-                            key="chart_extra_pick")
-            code, name = pick
-        else:
-            st.caption("검색 결과가 없어요. 이름을 정확히 쓰거나 6자리 코드를 넣어 보세요.")
+
+    with st.container(key="chart_search"):
+        c1, c2 = st.columns([1.35, 1], gap="medium")
+        q = c1.text_input("🔍 종목 검색", placeholder="종목 이름이나 코드를 치고 엔터 — 예: 삼성, 토마토, 035720",
+                          key="chart_q").strip()
+        c2.selectbox("📋 보드 종목에서 고르기", ordered, format_func=labels.get, key="chart_pick",
+                     on_change=lambda: st.session_state.update(chart_code=st.session_state["chart_pick"]))
+        if q:
+            ql = q.lower()
+            res = [(r.code, r.name) for r in board.itertuples()
+                   if ql in str(r.name).lower() or str(r.code).lower().startswith(ql)]
+            on_board = {c for c, _ in res}
+            if data.is_kr(q) and len(q) == 6 and q not in on_board:
+                res.insert(0, (q, q))
+            for c, nm in naver_search(q):
+                if c not in on_board and c not in {x for x, _ in res}:
+                    res.append((c, nm))
+            res = res[:18]
+            if res:
+                names.update({c: nm for c, nm in res})
+                opts = [c for c, _ in res]
+                st.pills(f"관련 종목 {len(res)}개", opts, key=f"chart_res_{q}",
+                         format_func=lambda c: f"{'★ ' if c in on_board else ''}{names.get(c, c)}",
+                         on_change=lambda k=f"chart_res_{q}": st.session_state.update(
+                             chart_code=st.session_state[k]) if st.session_state.get(k) else None,
+                         help="★ = 보드에 넣어 둔 종목. 누르면 아래에 차트가 떠요.")
+            else:
+                st.caption("검색 결과가 없어요. 이름을 조금 짧게 쓰거나 6자리 코드를 넣어 보세요.")
+    code = st.session_state.get("chart_code") or st.session_state.get("chart_pick") or (ordered[0] if ordered else None)
+    if code is None:
+        return
+    name, currency, row = (labels.get(code) or "").split(" · ")[0] or names.get(code, code), "KRW", None
     st.session_state["chart_code"] = code
     hit = board[board["code"] == code]
     if len(hit):
