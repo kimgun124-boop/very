@@ -58,7 +58,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe")
-DATA_VERSION = "2026-09-28-universe"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-09-28-universe2"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -628,8 +628,16 @@ def load_histories(codes: tuple[str, ...]):
                "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
+_UNI_RETRY = {"t": 0.0}
+
+
 def load_universe() -> list[dict]:
-    return swr(("krx_universe",), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
+    """전체 종목 목록(하루 기억). 못 받았으면(빈 목록) 하루 동안 비워 두지 않고 2분마다 다시 시도해요."""
+    val = swr(("krx_universe",), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
+    if not val and time.time() - _UNI_RETRY["t"] > 120:
+        _UNI_RETRY["t"] = time.time()
+        swr_clear("krx_universe")
+    return val or []
 
 
 def load_histories_extra(codes: tuple[str, ...]):
@@ -815,8 +823,16 @@ with st.sidebar:
         if _x["group"] not in GROUP_ORDER:
             GROUP_ORDER = GROUP_ORDER + [_x["group"]]
     with st.sidebar:
-        if scope_all:
+        if scope_all and EXTRA_STOCKS:
             st.caption(f"보드 {len(STOCKS):,} + 상장 종목 {len(EXTRA_STOCKS):,}개 = {len(STOCKS_VIEW):,}개")
+        elif scope_all:
+            diag = " · ".join(f"{k} {v}" for k, v in getattr(data, "UNIVERSE_DIAG", {}).items()) or "응답 없음"
+            st.warning(f"코스피·코스닥 전체 목록을 아직 못 받았어요({diag}). 지금은 내 보드 종목만 보여요. "
+                       "2분마다 자동으로 다시 시도해요.")
+            if st.button("전체 목록 다시 받기", key="uni_retry", width="stretch"):
+                _UNI_RETRY["t"] = 0.0
+                swr_clear("krx_universe")
+                st.rerun()
     mkt_stocks = [x for x in STOCKS_VIEW if _mkt(x["code"]) == market]
 
     # ② 산업 — 묶음별 2칸 격자. 아무것도 안 고르면 그 시장 전체

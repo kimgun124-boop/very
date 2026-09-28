@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-universe"
+DATA_VERSION = "2026-09-28-universe2"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -1408,20 +1408,108 @@ def _naver_market(sosok: int, max_pages: int = 60) -> list[dict]:
     return rows
 
 
+UNIVERSE_DIAG: dict = {}       # 어디서 몇 개 받았는지(못 받았을 때 화면에 이유를 보여줘요)
+
+
+def _naver_mobile_market(market: str, page_size: int = 100, max_pages: int = 40) -> list[dict]:
+    """네이버 모바일 시가총액 순위 API(가장 잘 되는 곳). market = KOSPI / KOSDAQ."""
+    rows, seen = [], set()
+    for page in range(1, max_pages + 1):
+        try:
+            r = session.get(f"https://m.stock.naver.com/api/stocks/marketValue/{market}",
+                            params={"page": page, "pageSize": page_size}, headers=JSON_HEADERS, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+        except (requests.RequestException, ValueError):
+            break
+        got = []
+
+        def pick(d):
+            code = d.get("itemCode") or d.get("reutersCode") or d.get("code")
+            name = d.get("stockName") or d.get("itemName") or d.get("name")
+            if code and name and re.fullmatch(r"\w{6}", str(code)):
+                kind = str(d.get("stockEndType") or "stock").lower()
+                got.append({"code": str(code), "name": str(name).strip(), "kind": kind,
+                            "industry": str(d.get("industryCodeName") or d.get("sosokName") or ""), "product": ""})
+
+        def walk(n):
+            if isinstance(n, dict):
+                pick(n)
+                for v in n.values():
+                    walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+        walk(j)
+        new = [x for x in got if x["code"] not in seen]
+        if not new:
+            break
+        for x in new:
+            seen.add(x["code"])
+            rows.append(x)
+        if len(got) < page_size:
+            break
+    return [x for x in rows if x["kind"] in ("stock", "")]
+
+
+def fetch_upjong_map() -> dict[str, str]:
+    """네이버 업종 분류 {코드: 업종명}. 전체 종목에 세부 분류를 붙일 때 써요(업종 80여 개 페이지)."""
+    try:
+        r = session.get("https://finance.naver.com/sise/sise_group.naver", params={"type": "upjong"}, timeout=10)
+        text = decode(r.content)
+    except requests.RequestException:
+        return {}
+    groups = re.findall(r'href="/sise/sise_group_detail\.naver\?type=upjong&(?:amp;)?no=(\d+)"[^>]*>([^<]+)</a>', text)
+
+    def one(g):
+        no, name = g
+        try:
+            r = session.get("https://finance.naver.com/sise/sise_group_detail.naver",
+                            params={"type": "upjong", "no": no}, timeout=10)
+            codes = set(re.findall(r'/item/main\.naver\?code=(\w{6})', decode(r.content)))
+            return name.strip(), codes
+        except requests.RequestException:
+            return name.strip(), set()
+
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for name, codes in pool.map(one, groups):
+            for c in codes:
+                out.setdefault(c, name)
+    return out
+
+
 def fetch_krx_universe() -> list[dict]:
-    """코스피·코스닥 상장 종목 전체 [{code, name, market, industry, product}]. 스팩·ETF·ETN은 빼요."""
+    """코스피·코스닥 상장 종목 전체 [{code, name, market, industry, product}]. 스팩·ETF·ETN·우선주는 빼요.
+    네이버 모바일 → 한국거래소 KIND → 네이버 PC 순서로 시도해요(해외 서버에서 막히는 곳이 있어서)."""
     if MOCK:
         rng = _rng("universe")
         return [{"code": f"9{i:05d}", "name": f"테스트{'피' if i % 3 else '닥'}{i}", "market": "코스피" if i % 3 else "코스닥",
                  "industry": rng.choice(["반도체 제조업", "의약품 제조업", "소프트웨어 개발 및 공급업", "금융 지원 서비스업"]),
                  "product": "테스트 제품"} for i in range(1, int(os.environ.get("MOCK_UNIVERSE", "300")) + 1)]
     out = []
-    for label, mt, sosok in (("코스피", "stockMkt", 0), ("코스닥", "kosdaqMkt", 1)):
-        rows = _kind_market(mt) or _naver_market(sosok)
+    UNIVERSE_DIAG.clear()
+    for label, mob, mt, sosok in (("코스피", "KOSPI", "stockMkt", 0), ("코스닥", "KOSDAQ", "kosdaqMkt", 1)):
+        rows, src = [], ""
+        for src, fn in (("네이버 모바일", lambda: _naver_mobile_market(mob)), ("한국거래소 KIND", lambda: _kind_market(mt)),
+                        ("네이버 PC", lambda: _naver_market(sosok))):
+            try:
+                rows = fn()
+            except Exception:
+                rows = []
+            if len(rows) >= 50:
+                break
+        UNIVERSE_DIAG[label] = f"{src} {len(rows)}개" if rows else "못 받음"
         for x in rows:
-            if "스팩" in x["name"] or re.search(r"(ETF|ETN|리츠)$", x["name"]):
-                continue
-            out.append({**x, "market": label})
+            if "스팩" in x["name"] or re.search(r"(ETF|ETN|리츠)$", x["name"]) or not x["code"].endswith("0"):
+                continue                      # 우선주(코드 끝이 0이 아님)·스팩·ETF 빼기
+            out.append({k: v for k, v in x.items() if k != "kind"} | {"market": label})
+    if out and sum(1 for x in out if x.get("industry")) < len(out) * 0.5:     # 업종이 비었으면 네이버 업종으로 채워요
+        up = fetch_upjong_map()
+        UNIVERSE_DIAG["업종"] = f"네이버 업종 {len(set(up.values()))}개" if up else "업종 못 받음"
+        for x in out:
+            if not x.get("industry"):
+                x["industry"] = up.get(x["code"], "")
     uniq = {}
     for x in out:
         uniq.setdefault(x["code"], x)
