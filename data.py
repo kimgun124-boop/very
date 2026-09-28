@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-money"
+DATA_VERSION = "2026-09-28-chart"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -1975,6 +1975,70 @@ def fetch_monthly(code: str, count: int = 600) -> pd.DataFrame:
         return normalize_yf(yf.Ticker(code).history(period="max", interval="1mo", auto_adjust=False))
     except Exception:
         return empty_frame()
+
+
+# ─────────────────────────── 앱 안 캔들 차트(일·주·월봉) ───────────────────────────
+CHART_TF = {"일봉": ("day", 800, "5y", "1d"), "주봉": ("week", 520, "10y", "1wk"), "월봉": ("month", 400, "max", "1mo")}
+
+
+def _resample(d: pd.DataFrame, rule: str) -> pd.DataFrame:
+    g = d.set_index("date").resample(rule)
+    out = pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+                        "close": g["close"].last(), "volume": g["volume"].sum()}).dropna(subset=["close"])
+    first_day = d.set_index("date")["close"].resample(rule).apply(lambda x: x.index.min() if len(x) else pd.NaT)
+    out.index = first_day.loc[out.index].values
+    return out.rename_axis("date").reset_index()
+
+
+def fetch_chart(code: str, tf: str = "일봉") -> pd.DataFrame:
+    """캔들 차트용 봉(날짜·시가·고가·저가·종가·거래량). 국내는 네이버, 해외는 야후. 못 받으면 빈 표."""
+    kind, count, period, interval = CHART_TF.get(tf, CHART_TF["일봉"])
+    if MOCK:
+        d = mock_history(code, 520)
+        return d if tf == "일봉" else _resample(d, "W-FRI" if tf == "주봉" else "MS")
+    try:
+        if is_kr(code):
+            r = session.get(FCHART_URL, params={"symbol": code, "timeframe": kind, "count": count, "requestType": 0},
+                            timeout=8)
+            r.raise_for_status()
+            return parse_fchart(decode(r.content))[1]
+        got = _yf_batch([code], period, interval)
+        if code in got and not got[code].empty:
+            return got[code]
+        import yfinance as yf
+        return normalize_yf(yf.Ticker(code).history(period=period, interval=interval, auto_adjust=False))
+    except Exception:
+        return empty_frame()
+
+
+def chart_with_live(bars: pd.DataFrame, quote: dict | None, tf: str, today: date | None = None) -> pd.DataFrame:
+    """실시간 시세로 마지막 봉을 고치거나(오늘·이번 주·이번 달), 장중인데 봉이 없으면 새로 붙여요."""
+    if bars is None or bars.empty or not quote or not quote.get("price"):
+        return bars
+    today = today or now_kst().date()
+    price = float(quote["price"])
+    hi = max(float(quote.get("high") or price), price)
+    lo = min(float(quote.get("low") or price), price)
+    vol = quote.get("volume")
+    b = bars.copy()
+    for c in ("open", "high", "low", "close", "volume"):
+        b[c] = pd.to_numeric(b[c], errors="coerce").astype(float)
+    last = pd.Timestamp(b["date"].iloc[-1]).date()
+    same = {"일봉": last == today,
+            "주봉": last.isocalendar()[:2] == today.isocalendar()[:2],
+            "월봉": (last.year, last.month) == (today.year, today.month)}.get(tf, False)
+    if same:
+        i = b.index[-1]
+        b.loc[i, "close"] = price
+        b.loc[i, "high"] = max(b.loc[i, "high"], hi)
+        b.loc[i, "low"] = min(b.loc[i, "low"], lo)
+        if tf == "일봉" and vol and not (b.loc[i, "volume"] >= vol):
+            b.loc[i, "volume"] = float(vol)
+    elif quote.get("status") == "OPEN" and _is_session_now(today):
+        b = pd.concat([b, pd.DataFrame([{"date": pd.Timestamp(today), "open": price, "high": hi, "low": lo,
+                                         "close": price, "volume": float(vol) if vol else np.nan}])],
+                      ignore_index=True)
+    return b
 
 
 def fetch_monthlies(codes, workers: int = 12) -> dict[str, pd.DataFrame]:

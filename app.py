@@ -19,6 +19,24 @@ import stocks as stock_list
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
+# 크롬 자동 번역이 화면 글자를 바꿔 끼우면 'removeChild' 오류로 앱이 멈춰요. 한국어 페이지로 알리고 번역을 막아요.
+import streamlit.components.v1 as _components
+_components.html("""<script>
+try { const d = window.parent.document;
+  d.documentElement.setAttribute('lang', 'ko'); d.documentElement.setAttribute('translate', 'no');
+  d.documentElement.classList.add('notranslate'); d.body.classList.add('notranslate');
+  if (!d.querySelector('meta[name=google][content=notranslate]')) {
+    const m = d.createElement('meta'); m.name = 'google'; m.content = 'notranslate'; d.head.appendChild(m); }
+} catch (e) {}
+</script>""", height=0)
+
+# 카드·표의 종목 링크(?chart=코드)로 들어오면 그 종목 차트를 바로 보여줘요
+_qp_chart = st.query_params.get("chart")
+if _qp_chart:
+    st.session_state["chart_code"] = _qp_chart
+    st.session_state["detail_code"] = _qp_chart
+    del st.query_params["chart"]
+
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
             "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
@@ -29,8 +47,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
-            "live_volume", "sector_money", "session_frac")
-DATA_VERSION = "2026-09-28-money"   # data.py의 DATA_VERSION과 같아야 해요
+            "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF")
+DATA_VERSION = "2026-09-28-chart"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -124,6 +142,30 @@ st.markdown(
 [data-testid="stSidebar"] [data-testid="stButtonGroup"] button[data-selected="true"] p {
   color: #FFFFFF !important; font-weight: 700; }
 [data-testid="stSidebar"] [data-testid="stExpander"] details { background: #FFFFFF; }
+[data-testid="stSidebar"] [class*="st-key-sb_box_"] { background: #FFFFFF; border-radius: 12px !important;
+  border: 1px solid #E3E8EB !important; padding: 0.75rem 0.75rem 0.8rem !important; gap: 0.45rem !important; }
+.sb-head { display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: 0.35rem; border-bottom: 1px solid #EEF1F3; margin-bottom: 0.1rem; }
+.sb-head span { font-size: 0.86rem; font-weight: 800; color: #16212B; }
+.sb-head em { font-style: normal; font-size: 0.72rem; font-weight: 700; color: #7A8A94; }
+.sb-cat { font-size: 0.7rem; font-weight: 800; color: #7A8A94; letter-spacing: 0.02em; margin: 0.45rem 0 0;
+  display: flex; align-items: center; gap: 0.4rem; }
+.sb-cat::after { content: ""; flex: 1; height: 1px; background: #EEF1F3; }
+.sb-cat { line-height: 1.1rem; height: 1.1rem; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(.sb-cat),
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(.sb-head) { margin-bottom: 0 !important; overflow: visible !important; }
+[data-testid="stSidebar"] [data-testid="stElementContainer"]:has(.sb-cat) { height: auto !important; min-height: 1.4rem; overflow: visible !important; }
+[data-testid="stSidebarHeader"] { height: 2.2rem !important; min-height: 2.2rem !important; padding-top: 0.4rem !important; }
+[data-testid="stSidebar"] .st-key-sb_box_sector [data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
+[data-testid="stSidebar"] .st-key-sb_box_sector [data-testid="stColumn"] { min-width: 0 !important; }
+[data-testid="stSidebar"] .st-key-sb_box_sector button {
+  min-height: 2.05rem; height: 2.05rem; padding: 0 0.45rem !important; border-radius: 8px;
+  justify-content: flex-start; border: 1px solid #DCE3E7; background: #F6F8F9; }
+[data-testid="stSidebar"] .st-key-sb_box_sector button p {
+  font-size: 0.78rem !important; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+[data-testid="stSidebar"] .st-key-sb_box_sector button[kind="primary"] { background: #16212B; border-color: #16212B; }
+[data-testid="stSidebar"] .st-key-sb_box_sector button[kind="primary"] p { color: #FFFFFF !important; }
+[data-testid="stSidebar"] .st-key-sb_box_sector button:hover { border-color: #16212B; }
 [data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-weight: 700; color: #16212B; }
 /* ── 메인 탭: 기본 · 종목 시그널 · 섹터 흐름 3묶음으로 나눠 보이게 ── */
 .st-key-main_tabs [role="tablist"] { gap: 0.3rem; border-bottom: 2px solid #DCE3E7; padding-bottom: 0; }
@@ -131,21 +173,27 @@ st.markdown(
   position: relative; --gc: #51616C; --gt: #F1F4F6;
   background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
   border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
-.st-key-main_tabs [role="tab"]:nth-child(n+2):nth-child(-n+4) { --gc: #E0672B; --gt: #FDF3EC; }
-.st-key-main_tabs [role="tab"]:nth-child(n+5) { --gc: #1F66C9; --gt: #EEF4FC; }
-.st-key-main_tabs [role="tab"]:nth-child(2),
-.st-key-main_tabs [role="tab"]:nth-child(5) { margin-left: 0.9rem; }
+.st-key-main_tabs [role="tab"]:nth-child(n+3):nth-child(-n+5) { --gc: #E0672B; --gt: #FDF3EC; }
+.st-key-main_tabs [role="tab"]:nth-child(n+6) { --gc: #1F66C9; --gt: #EEF4FC; }
+.st-key-main_tabs [role="tab"]:nth-child(3),
+.st-key-main_tabs [role="tab"]:nth-child(6) { margin-left: 0.9rem; }
 .st-key-main_tabs [role="tab"]::before {
   position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
   letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
 .st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
-.st-key-main_tabs [role="tab"]:nth-child(2)::before { content: "종목 시그널"; }
-.st-key-main_tabs [role="tab"]:nth-child(5)::before { content: "섹터 흐름"; }
+.st-key-main_tabs [role="tab"]:nth-child(3)::before { content: "종목 시그널"; }
+.st-key-main_tabs [role="tab"]:nth-child(6)::before { content: "섹터 흐름"; }
 .st-key-main_tabs [role="tab"] p { color: #3A4852; }
 .st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
 .st-key-main_tabs [role="tab"][aria-selected="true"] p,
 .st-key-main_tabs [role="tab"][aria-selected="true"]::before { color: #FFFFFF !important; }
 .st-key-main_tabs .react-aria-SelectionIndicator, .st-key-main_tabs [data-baseweb="tab-highlight"], .st-key-main_tabs [data-baseweb="tab-border"] { display: none; }
+.ch-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem 0.7rem; margin: 0.3rem 0 0.4rem; }
+.ch-head b { font-size: 1.35rem; font-weight: 800; color: #16212B; }
+.ch-code { font-size: 0.82rem; color: #7A8A94; }
+.ch-px { font-size: 1.25rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.ch-px small { font-size: 0.9rem; font-weight: 700; margin-left: 0.2rem; }
+.ch-sub { font-size: 0.8rem; color: #51616C; flex-basis: 100%; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -535,7 +583,18 @@ NH_FILTERS = {
 }
 
 # ─────────────────────────── 사이드바 ───────────────────────────
-MARKETS = {"🇰🇷 한국": "KR", "🇺🇸 미국": "US", "🌏 기타": "OTHER"}
+MARKETS = {"한국": "KR", "미국": "US", "기타": "OTHER"}
+# 산업을 큰 묶음으로 나눠 칸으로 보여줘요. 여기 없는 산업은 '기타'로 가요.
+SECTOR_CATS = [
+    ("반도체 · IT", ["반도체", "글로벌 반도체", "AI·IT", "AI 인프라(해외)", "AI 소프트웨어(해외)", "OLED",
+                    "데이터센터 전력", "우주 데이터센터"]),
+    ("에너지 · 산업재", ["2차전지", "전력·에너지", "풍력", "조선", "건설", "산업재", "전략광물"]),
+    ("소비 · 바이오 · 금융", ["화장품", "바이오·헬스케어", "금융·지주"]),
+    ("기타", ["기타", "기타(리포트 스크린)", "해외 기타"]),
+]
+SECTOR_SHORT = {"기타(리포트 스크린)": "리포트", "AI 인프라(해외)": "AI 인프라", "AI 소프트웨어(해외)": "AI SW",
+                "글로벌 반도체": "반도체", "해외 기타": "기타",
+                "바이오·헬스케어": "바이오·헬스", "데이터센터 전력": "DC 전력", "우주 데이터센터": "우주 DC"}
 
 
 def _mkt(code: str) -> str:
@@ -543,35 +602,72 @@ def _mkt(code: str) -> str:
     return m if m in ("KR", "US") else "OTHER"
 
 
+def _sb_head(text: str, right: str = ""):
+    st.markdown(f'<div class="sb-head"><span>{text}</span><em>{right}</em></div>', unsafe_allow_html=True)
+
+
+def _toggle_sector(key: str, sec: str | None):
+    cur = list(st.session_state.get(key, []))
+    if sec is None:
+        cur = []
+    elif sec in cur:
+        cur.remove(sec)
+    else:
+        cur.append(sec)
+    st.session_state[key] = cur
+
+
 with st.sidebar:
     st.markdown('<div class="sb-title">보기 설정</div>', unsafe_allow_html=True)
 
-    # ① 시장 — 한국·미국을 아예 나눠서 봐요
-    market_label = st.segmented_control("시장", list(MARKETS), default="🇰🇷 한국", required=True,
-                                        key="sb_market", width="stretch")
-    market = MARKETS[market_label or "🇰🇷 한국"]
-    mkt_stocks = [x for x in STOCKS if _mkt(x["code"]) == market]
+    # ① 시장
+    with st.container(border=True, key="sb_box_market"):
+        _sb_head("시장")
+        market_label = st.segmented_control("시장", list(MARKETS), default="한국", required=True,
+                                            key="sb_market2", width="stretch", label_visibility="collapsed") or "한국"
+        market = MARKETS[market_label]
+        mkt_stocks = [x for x in STOCKS if _mkt(x["code"]) == market]
 
-    # ② 산업 — 아무것도 안 고르면 그 시장 전체
+    # ② 산업 — 묶음별 2칸 격자. 아무것도 안 고르면 그 시장 전체
     sector_choices = [sec for sec in SECTOR_ORDER if any(x["sector"] == sec for x in mkt_stocks)]
     sector_choices += sorted({x["sector"] for x in mkt_stocks} - set(sector_choices))
     sec_count = {sec: sum(x["sector"] == sec for x in mkt_stocks) for sec in sector_choices}
-    sectors = st.pills("산업", sector_choices, selection_mode="multi", key=f"sb_sectors_{market}",
-                       format_func=lambda sec: f"{sec.replace('(해외)', '')} {sec_count[sec]}",
-                       help="안 고르면 이 시장 전체를 보여줘요. 여러 개 고를 수 있어요.")
+    sel_key = f"sb_sel_{market}"
+    st.session_state.setdefault(sel_key, [])
+    sectors = [x for x in st.session_state[sel_key] if x in sector_choices]
+    with st.container(border=True, key="sb_box_sector"):
+        _sb_head("산업", f"{len(sectors)}개 선택" if sectors else "전체")
+        st.button(f"전체  {len(mkt_stocks)}", key=f"sb_all_{market}", width="stretch",
+                  type="primary" if not sectors else "secondary",
+                  on_click=_toggle_sector, args=(sel_key, None))
+        placed = set()
+        cats = [(nm, [x for x in secs if x in sec_count]) for nm, secs in SECTOR_CATS]
+        rest = [x for x in sector_choices if not any(x in secs for _, secs in cats)]
+        if rest:
+            cats[-1] = (cats[-1][0], cats[-1][1] + rest)
+        for cat, secs in cats:
+            if not secs:
+                continue
+            st.markdown(f'<div class="sb-cat">{cat}</div>', unsafe_allow_html=True)
+            for i in range(0, len(secs), 2):
+                cols = st.columns(2, gap="small")
+                for col, sec in zip(cols, secs[i:i + 2]):
+                    col.button(f"{SECTOR_SHORT.get(sec, sec)}  {sec_count[sec]}", key=f"sb_sec_{market}_{sec}",
+                               width="stretch", type="primary" if sec in sectors else "secondary",
+                               on_click=_toggle_sector, args=(sel_key, sec))
     active_sectors = sectors or sector_choices
 
-    # ③ 세부 분류 · 리포트 태그 · 검색
-    group_choices = [g for g in GROUP_ORDER
-                     if any(x["group"] == g and x["sector"] in active_sectors for x in mkt_stocks)]
-    group_pick = st.selectbox("세부 분류", ["전체", *group_choices], key=f"sb_group_{market}")
-    groups = [] if group_pick == "전체" else [group_pick]
-    tag_choices = [t for t in TAGS if any(t in x["tags"] for x in mkt_stocks)]
-    tags = st.multiselect("리포트 태그", tag_choices, placeholder="선택 안 함", key=f"sb_tags_{market}",
-                          help="태그를 고르면 위의 산업·분류와 관계없이 이 시장 전체에서 그 리포트에 나온 종목만 보여줘요.")
-    query = st.text_input("종목 검색", placeholder="🔍 이름이나 코드", key="sb_query")
-    st.caption(f"{market_label} 종목 {len(mkt_stocks)}개 중 "
-               f"{'전체 산업' if not sectors else ', '.join(s_.replace('(해외)', '') for s_ in sectors)}")
+    # ③ 종목 찾기 — 세부 분류 · 리포트 태그 · 검색
+    with st.container(border=True, key="sb_box_find"):
+        _sb_head("종목 찾기")
+        group_choices = [g for g in GROUP_ORDER
+                         if any(x["group"] == g and x["sector"] in active_sectors for x in mkt_stocks)]
+        group_pick = st.selectbox("세부 분류", ["전체", *group_choices], key=f"sb_group_{market}")
+        groups = [] if group_pick == "전체" else [group_pick]
+        tag_choices = [t for t in TAGS if any(t in x["tags"] for x in mkt_stocks)]
+        tags = st.multiselect("리포트 태그", tag_choices, placeholder="선택 안 함", key=f"sb_tags_{market}",
+                              help="태그를 고르면 위의 산업·분류와 관계없이 이 시장 전체에서 그 리포트에 나온 종목만 보여줘요.")
+        query = st.text_input("종목 검색", placeholder="이름이나 코드", key="sb_query")
 
     # ④ 조건 필터 — 평소엔 접어 둬요
     with st.expander("📐 조건 필터", expanded=False):
@@ -1074,9 +1170,20 @@ def render_table(f: pd.DataFrame):
              subset=[c for c in ("52주 신고가(일·주·월)", "역대 신고가(일·주·월)") if c in view.columns])
         .apply(mark_new_high, axis=1)
     )
+    codes_in_view = list(f["code"])
+
+    def _pick_row():
+        sel = st.session_state.get("list_table")
+        rows = getattr(getattr(sel, "selection", None), "rows", None) or (sel or {}).get("selection", {}).get("rows", [])
+        if rows and rows[0] < len(codes_in_view):
+            st.session_state["detail_code"] = codes_in_view[rows[0]]
+            st.session_state["chart_code"] = codes_in_view[rows[0]]
+
+    st.caption("👆 종목 줄을 누르면 아래 '종목 자세히 보기'에 캔들 차트가 떠요.")
     st.dataframe(
         styled,
         hide_index=True,
+        key="list_table", on_select=_pick_row, selection_mode="single-row",
         height=min(720, 36 * (len(view) + 1) + 4),
         column_config={
             "52주 위치": st.column_config.ProgressColumn(
@@ -1191,7 +1298,7 @@ def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int, fins=
             flow = (f'<div class="k-flow">외 {_kflow(r.flow_외국인)} · 기 {_kflow(r.flow_기관)}'
                     f'<span>5일 외 {_kflow(r.flow5_외국인)} · 기 {_kflow(r.flow5_기관)}</span></div>')
         cards.append(
-            f'<a class="kcard{" hot" if hot else ""}" target="_blank" href="{r.url}">'
+            f'<a class="kcard{" hot" if hot else ""}" target="_self" href="?chart={r.code}">'
             f'<div class="k-top"><span class="k-name">{html.escape(r.name)}{crown}</span>'
             f'<span class="k-px">{fmt_price(r.price, r.currency)}{"" if r.currency == "KRW" else " " + r.currency} {chg}</span></div>'
             f'<div class="k-keys">'
@@ -1272,12 +1379,150 @@ def render_stock_flow(code: str, trends: dict):
                "시장 전체 기준으로 위쪽 '투자자별 순매수 자세히'에 보여줘요.")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_chart(code: str, tf: str) -> pd.DataFrame:
+    return data.fetch_chart(code, tf)
+
+
+MA_SET = {"일봉": ((5, "5일"), (20, "20일"), (60, "60일"), (120, "120일")),
+          "주봉": ((5, "5주"), (10, "10주"), (30, "30주"), (52, "52주")),
+          "월봉": ((3, "3개월"), (6, "6개월"), (12, "12개월"), (24, "24개월"))}
+MA_COLORS = ("#E0672B", "#2E9D5B", "#7A4FD1", "#8A96A0")
+PERIODS = {"일봉": {"3개월": 63, "6개월": 126, "1년": 250, "2년": 500, "전체": None},
+           "주봉": {"1년": 52, "2년": 104, "5년": 260, "전체": None},
+           "월봉": {"5년": 60, "10년": 120, "전체": None}}
+
+
+def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol: bool, line: float | None = None,
+               currency: str = "KRW"):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    b = b.copy().reset_index(drop=True)
+    for k, _ in MA_SET[tf]:
+        b[f"ma{k}"] = b["close"].rolling(k).mean()
+    if n:
+        b = b.tail(n)
+    x = pd.to_datetime(b["date"]).dt.strftime("%Y-%m" if tf == "월봉" else "%Y-%m-%d")
+    fig = make_subplots(rows=2 if show_vol else 1, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        row_heights=[0.76, 0.24] if show_vol else [1.0])
+    fmt = ",.0f" if currency in ("KRW", "JPY") else ",.2f"
+    fig.add_trace(go.Candlestick(
+        x=x, open=b["open"], high=b["high"], low=b["low"], close=b["close"], name="봉", showlegend=False,
+        increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
+        decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
+        hoverlabel=dict(namelength=0)), row=1, col=1)
+    if show_ma:
+        for (k, lab), c in zip(MA_SET[tf], MA_COLORS):
+            fig.add_trace(go.Scatter(x=x, y=b[f"ma{k}"], name=lab, mode="lines", line=dict(color=c, width=1.3),
+                                     hovertemplate=f"{lab} %{{y:{fmt}}}<extra></extra>"), row=1, col=1)
+    if line and tf != "월봉":
+        fig.add_hline(y=line, line=dict(color="#F2B134", width=1.4, dash="dash"), row=1, col=1,
+                      annotation_text=f"52주 최고 {line:{fmt}}", annotation_position="top left",
+                      annotation_font=dict(size=11, color="#B7861D"))
+    if show_vol:
+        colors = [UP if c >= o else DOWN for o, c in zip(b["open"], b["close"])]
+        fig.add_trace(go.Bar(x=x, y=b["volume"], marker_color=colors, opacity=0.55, name="거래량", showlegend=False,
+                             hovertemplate="거래량 %{y:,.0f}<extra></extra>"), row=2, col=1)
+    fig.update_xaxes(type="category", nticks=8, showgrid=False, rangeslider_visible=False, tickangle=0,
+                     showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
+    fig.update_yaxes(side="right", gridcolor="#EEF1F3", tickformat=fmt, zeroline=False)
+    fig.update_layout(height=560 if show_vol else 460, margin=dict(l=8, r=8, t=30, b=8), hovermode="x unified",
+                      dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                      legend=dict(orientation="h", y=1.06, x=0, font=dict(size=11)),
+                      font=dict(family="Pretendard, Malgun Gothic, sans-serif"))
+    return fig
+
+
+def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, high52: float | None = None,
+                 key: str = "cc"):
+    """일봉·주봉·월봉 캔들 + 이동평균 + 거래량. 국내 종목은 실시간 시세로 마지막 봉을 갱신해요."""
+    c1, c2, c3 = st.columns([1.1, 1.6, 1.3])
+    tf = c1.segmented_control("봉", list(data.CHART_TF), default="일봉", required=True, key=f"{key}_tf",
+                              label_visibility="collapsed") or "일봉"
+    periods = PERIODS[tf]
+    default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
+    per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
+                               label_visibility="collapsed") or default_p
+    opts = c3.pills("표시", ["이동평균", "거래량"], selection_mode="multi", default=["이동평균", "거래량"],
+                    key=f"{key}_opts", label_visibility="collapsed") or []
+    with st.spinner("차트를 불러오는 중이에요."):
+        bars = load_chart(code, tf)
+    if bars is None or bars.empty:
+        st.info("이 종목의 봉 데이터를 받지 못했어요. 잠시 뒤 다시 시도해 보세요.")
+        return
+    bars = data.chart_with_live(bars, quote, tf)
+    fig = candle_fig(bars, tf, periods[per], "이동평균" in opts, "거래량" in opts, high52, currency)
+    st.plotly_chart(fig, key=f"{key}_fig", config={"displaylogo": False, "scrollZoom": True,
+                                                   "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
+    st.caption("드래그로 옮기고, 휠·두 손가락으로 확대해요. 더블클릭하면 원래대로. "
+               + ("마지막 봉은 실시간 시세로 갱신돼요." if quote else "해외 종목은 야후 일봉 기준이에요."))
+
+
+def render_chart_tab(df: pd.DataFrame, quotes: dict):
+    """🕯️ 차트: 종목을 검색해서 일봉·주봉·월봉 캔들로 봐요."""
+    board = df.drop_duplicates("code")
+    labels = {r.code: f"{r.name} · {r.code} · {'한국' if data.is_kr(r.code) else r.market}" for r in board.itertuples()}
+    codes = list(labels)
+    mine = [c for c in codes if _mkt(c) == market]
+    ordered = mine + [c for c in codes if c not in mine]
+    want = st.session_state.get("chart_code")
+    if want in ordered and st.session_state.get("chart_pick") != want:
+        st.session_state["chart_pick"] = want          # 표·카드에서 고른 종목으로 맞춰요
+    if st.session_state.get("chart_pick") not in ordered:
+        st.session_state.pop("chart_pick", None)
+    c1, c2 = st.columns([2, 1])
+    code = c1.selectbox("종목 검색", ordered, format_func=labels.get, key="chart_pick",
+                        placeholder="종목 이름이나 코드를 입력하세요",
+                        on_change=lambda: st.session_state.update(chart_code=st.session_state["chart_pick"]))
+    extra = c2.text_input("보드에 없는 국내 종목", placeholder="예: 카카오, 035720", key="chart_extra")
+    name, currency, row = labels.get(code, code).split(" · ")[0], "KRW", None
+    if extra.strip():
+        q = extra.strip()
+        cands = [(q, q)] if data.is_kr(q) and len(q) == 6 else data.search_stock(q)[:8]
+        if cands:
+            pick = st.radio("검색 결과", cands, format_func=lambda t: f"{t[1]} ({t[0]})", horizontal=True,
+                            key="chart_extra_pick")
+            code, name = pick
+        else:
+            st.caption("검색 결과가 없어요. 이름을 정확히 쓰거나 6자리 코드를 넣어 보세요.")
+    st.session_state["chart_code"] = code
+    hit = board[board["code"] == code]
+    if len(hit):
+        row = hit.iloc[0]
+        currency = row["currency"]
+    quote = quotes.get(code)
+    if quote is None and data.is_kr(code) and row is None:
+        got, _ = load_quotes((code,))
+        quote = got.get(code)
+    unit = UNIT.get(currency, currency)
+    price = (quote or {}).get("price") or (row["price"] if row is not None else None)
+    prev = (quote or {}).get("prev")
+    chg = (price / prev - 1) * 100 if price and prev else (row["change"] if row is not None else None)
+    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#51616C")
+    sub = []
+    if row is not None:
+        if pd.notna(row.get("to_high")):
+            sub.append(f"52주 최고까지 {row['to_high']:+.1f}%")
+        if pd.notna(row.get("rs")):
+            sub.append(f"RS {row['rs']:.0f}")
+        sub.append(str(row["group"]))
+    st.markdown(
+        f'<div class="ch-head"><b>{html.escape(str(name))}</b><span class="ch-code">{html.escape(code)}</span>'
+        f'<span class="ch-px" style="color:{col}">{fmt_price(price, currency)}{unit}'
+        f'{f" <small>{chg:+.2f}%</small>" if chg is not None and pd.notna(chg) else ""}</span>'
+        f'<span class="ch-sub">{" · ".join(html.escape(x) for x in sub)}</span></div>', unsafe_allow_html=True)
+    candle_chart(code, currency, quote if data.is_kr(code) else None,
+                 row["high52"] if row is not None and pd.notna(row.get("high52")) else None, key="tabchart")
+
+
 def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
     options = f[f["price"].notna()]
     if options.empty:
         return
     st.subheader("종목 자세히 보기")
     labels = {r.code: f"{r.name} ({r.code})" for r in options.itertuples()}
+    if st.session_state.get("detail_code") not in labels:
+        st.session_state.pop("detail_code", None)
     code = st.selectbox("종목", list(labels), format_func=labels.get, label_visibility="collapsed",
                         key="detail_code")
     row = options[options["code"] == code].iloc[0]
@@ -1330,19 +1575,9 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
                                                         f"자료 메모 {len(notes)}"])
     with tab_chart:
         hist = histories.get(code, (None, data.empty_frame(), None))[1]
+        candle_chart(code, row.currency, _QUOTES.get(code) if data.is_kr(code) else None,
+                     row.high52 if pd.notna(row.high52) else None, key="detailchart")
         if not hist.empty:
-            h = hist.tail(250).set_index("date")
-            chart = pd.DataFrame({
-                "종가": h["close"],
-                "20일선": h["close"].rolling(20).mean(),
-                "60일선": h["close"].rolling(60).mean(),
-                "52주 최고": row.high52,
-            })
-            colors = ["#16212B", "#2E6B6F", "#9AA9B3", "#F2B134"]
-            if row.bo_status == "유지" and pd.notna(row.bo_level):
-                chart["유지 기준(직전 52주 최고)"] = row.bo_level
-                colors.append(UP)
-            price_chart(chart, colors, height=280)
             hist_rows = row.get("bo_history")
             hist_rows = hist_rows if isinstance(hist_rows, list) else []
             if hist_rows:
@@ -1360,10 +1595,6 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
             st.caption("엣지방 대화 요약(9/22~24)과 캡처 자료에서 모은 포인트예요. 매수·매도 추천이 아니에요.")
         else:
             st.caption("이 종목은 따로 모아 둔 메모가 없어요. 위 설명이 요약이에요.")
-    if data.is_kr(code):
-        st.link_button("네이버 증권에서 보기", f"https://m.stock.naver.com/domestic/stock/{code}/total")
-    else:
-        st.link_button("야후 파이낸스에서 보기", row.url)
 
 
 # ─────────────────────────── 매수 후보 ───────────────────────────
@@ -2348,7 +2579,7 @@ def _nh_card(r) -> str:
     rs = "-" if pd.isna(r["rs"]) else f"{r['rs']:.0f}"
     rs1 = "-" if pd.isna(r["rs_1m"]) else f"{r['rs_1m']:.0f}"
     return (
-        f'<a class="nh-card" href="{html.escape(str(r["url"]))}" target="_blank">'
+        f'<a class="nh-card" href="?chart={html.escape(str(r["code"]))}" target="_self">'
         f'<div class="nh-c-top"><span class="nh-c-name">{html.escape(str(r["name"]))} '
         f'<span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></span>'
         f'<span class="nh-c-chg">{_chg_html(r["change"])}</span></div>'
@@ -2431,7 +2662,7 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
         brk = r["nh_state"] == "돌파"
         rows.append(
             f'<tr><td class="c rk hide-m">{i}</td>'
-            f'<td class="l nm"><a href="{html.escape(str(r["url"]))}" target="_blank">{html.escape(str(r["name"]))}</a>'
+            f'<td class="l nm"><a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>'
             f'<small>{r["code"]}</small></td>'
             f'<td class="l hide-m">{html.escape(str(r["group"]))}</td>'
             f'<td class="c"><span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></td>'
@@ -2572,7 +2803,7 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
         dry = "-" if pd.isna(r["vs_dry"]) else f"{r['vs_dry']:.2f}"
         rows.append(
             f'<tr><td class="c rk hide-m">{i + 1}</td>'
-            f'<td class="l nm"><a href="{html.escape(str(r["url"]))}" target="_blank">{html.escape(str(r["name"]))}</a>{tag}'
+            f'<td class="l nm"><a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>{tag}'
             f'<small>{r["code"]} · {html.escape(str(r["group"]))}</small></td>'
             f'<td class="sp">{_vol_svg(r["vs_vol"], r["vs_close"], r["vs_split"], recent)}</td>'
             f'<td><b class="rs" style="color:{UP}">{r["vs_mult"]:.1f}배</b><small>{pk_txt} · 평균 {r["vs_avg_mult"]:.1f}배</small></td>'
@@ -2607,9 +2838,14 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
             "- 보드에 넣은 종목(stocks.py) 안에서만 찾아요. 오늘 봉은 실시간 누적 거래량이라 장중엔 계속 커져요.")
 
 
+_QUOTES: dict = {}
+
+
 def render_board():
     histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
     quotes, quote_error = load_quotes(KR_CODES)
+    _QUOTES.clear()
+    _QUOTES.update(quotes)
     shares_store = load_shares()
     df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
                           monthlies=load_monthlies(ALL_CODES), official52=load_official_52w(KR_CODES))
@@ -2630,9 +2866,11 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     with st.container(key="main_tabs"):
-        t_list, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
-            ["📋 리스트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금", "🚀 급상승", "🔭 차기 주도",
-             "🧭 시나리오"])
+        t_list, t_chart, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
+            ["📋 리스트", "🕯️ 차트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금", "🚀 급상승",
+             "🔭 차기 주도", "🧭 시나리오"])
+    with t_chart:
+        render_chart_tab(df, quotes)
     with t_money:
         render_money(df)
     with t_nh:
