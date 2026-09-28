@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-turnover"
+DATA_VERSION = "2026-09-28-universe"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -74,8 +74,15 @@ def to_num(value) -> float | None:
         return None
 
 
+_EMPTY_FRAME = None
+
+
 def empty_frame() -> pd.DataFrame:
-    return pd.DataFrame(columns=COLUMNS)
+    """(속도) 빈 표는 하나만 만들어 같이 써요(만들 때마다 느려서). 고치지 말고 읽기만 해요."""
+    global _EMPTY_FRAME
+    if _EMPTY_FRAME is None:
+        _EMPTY_FRAME = pd.DataFrame(columns=COLUMNS)
+    return _EMPTY_FRAME
 
 
 def rows_to_frame(rows) -> pd.DataFrame:
@@ -520,9 +527,22 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     q_vol = quote.get("volume") if quote else None
     if last_is_today and q_vol and not (vv[-1] >= q_vol):
         vv[-1] = float(q_vol)                          # 일봉(30분마다)보다 실시간 누적 거래량이 더 최신
+    # (속도) ADX는 일봉이 바뀔 때만 다시 계산해요(장중 몇 분 사이엔 거의 안 변해요)
+    key = id(hist)
+    hit = _ADX_CACHE.get(key)
+    if hit is not None and hit[0] is hist and hit[1] == len(hh):
+        adx = hit[2]
+    else:
+        adx = _adx(hh, ll, cc)
+        _ADX_CACHE[key] = (hist, len(hh), adx)
+        if len(_ADX_CACHE) > 6000:
+            _ADX_CACHE.clear()
     res.update(_extras(dts, hh, ll, cc, vv, price, res.get("bo_date") if res.get("bo_status") == "유지" else None,
-                       last_is_today))
+                       last_is_today, adx=adx))
     return res
+
+
+_ADX_CACHE: dict = {}
 
 
 # ─────────────────────────── 매수 후보 판정용 추가 지표 ───────────────────────────
@@ -530,39 +550,35 @@ EXTRA_KEYS = ("ma20", "dist_ma20", "adx", "bo_vol_ratio", "bo_dcr", "htf", "ma5"
               "vol_today", "dcr_today", "tv5", "tvp20")
 
 
+def _wilder(x: np.ndarray, n: int) -> np.ndarray:
+    """와일더 평활(첫 값 = 처음 n개 평균, 이후 (앞값×(n-1)+새값)/n). 판다스 ewm으로 한 번에 계산해요."""
+    seed = np.concatenate([[x[:n].mean()], x[n:]])
+    return pd.Series(seed).ewm(alpha=1 / n, adjust=False).mean().to_numpy()
+
+
 def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14) -> float | None:
-    """ADX(14), 와일더 방식. 20 미만 = 추세 약함/횡보, 20~40 = 추세, 40 이상 = 강한 추세."""
+    """ADX(14), 와일더 방식. 20 미만 = 추세 약함/횡보, 20~40 = 추세, 40 이상 = 강한 추세.
+    (속도) 예전 파이썬 반복문과 같은 값을 넘파이·판다스로 한 번에 계산해요."""
     m = len(close)
     if m < 2 * n + 1:
         return None
-    h, l, c = high.tolist(), low.tolist(), close.tolist()
-    trs, pdm, mdm = [], [], []
-    for t in range(1, m):
-        up, dn = h[t] - h[t - 1], l[t - 1] - l[t]
-        pdm.append(up if (up > dn and up > 0) else 0.0)
-        mdm.append(dn if (dn > up and dn > 0) else 0.0)
-        trs.append(max(h[t], c[t - 1]) - min(l[t], c[t - 1]))
-    s_tr, s_p, s_m = sum(trs[:n]), sum(pdm[:n]), sum(mdm[:n])
-    dxs = []
-    for i in range(n, len(trs) + 1):
-        if i > n:
-            s_tr += trs[i - 1] - s_tr / n
-            s_p += pdm[i - 1] - s_p / n
-            s_m += mdm[i - 1] - s_m / n
-        if s_tr <= 0:
-            dxs.append(0.0)
-            continue
+    h, l, c = (np.asarray(x, dtype=float) for x in (high, low, close))
+    up, dn = h[1:] - h[:-1], l[:-1] - l[1:]
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = np.maximum(h[1:], c[:-1]) - np.minimum(l[1:], c[:-1])
+    if not (np.isfinite(tr).all() and np.isfinite(pdm).all() and np.isfinite(mdm).all()):
+        tr, pdm, mdm = np.nan_to_num(tr), np.nan_to_num(pdm), np.nan_to_num(mdm)
+    s_tr, s_p, s_m = _wilder(tr, n), _wilder(pdm, n), _wilder(mdm, n)
+    with np.errstate(divide="ignore", invalid="ignore"):
         pdi, mdi = 100 * s_p / s_tr, 100 * s_m / s_tr
-        dxs.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0.0)
-    if len(dxs) < n:
+        dx = np.where((s_tr > 0) & ((pdi + mdi) > 0), 100 * np.abs(pdi - mdi) / (pdi + mdi), 0.0)
+    if len(dx) < n:
         return None
-    adx = sum(dxs[:n]) / n
-    for x in dxs[n:]:
-        adx = (adx * (n - 1) + x) / n
-    return float(adx)
+    return float(_wilder(dx, n)[-1])
 
 
-def _extras(dts, high, low, close, vol, price: float, bo_date, last_is_today: bool = False) -> dict:
+def _extras(dts, high, low, close, vol, price: float, bo_date, last_is_today: bool = False, adx="calc") -> dict:
     """20일선 이격, ADX, 돌파일 거래량 배수(직전 50일 평균 대비)·종가 위치(DCR), HTF 여부,
     끌고 가기 점검용 5일선·50일선, 주도주 판정용 20일 평균 거래대금(원)."""
     out = {k: None for k in EXTRA_KEYS}
@@ -594,7 +610,7 @@ def _extras(dts, high, low, close, vol, price: float, bo_date, last_is_today: bo
         ma20 = float(close[-20:].mean())
         out["ma20"] = ma20
         out["dist_ma20"] = (price / ma20 - 1) * 100 if ma20 else None
-    out["adx"] = _adx(high, low, close)
+    out["adx"] = _adx(high, low, close) if adx == "calc" else adx
     if bo_date is not None:
         idx = np.nonzero(dts == np.datetime64(bo_date, "D"))[0]
         if len(idx):
@@ -1353,6 +1369,65 @@ def fetch_market_turnover_hist() -> dict[str, pd.DataFrame]:
         return dict(zip(MARKETS, pool.map(fetch_index_turnover, MARKETS.values())))
 
 
+# ─────────────────────────── 코스피·코스닥 전체 종목 목록 ───────────────────────────
+KIND_LIST_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
+MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+
+def _kind_market(mt: str) -> list[dict]:
+    try:
+        r = session.get(KIND_LIST_URL, params={"method": "download", "searchType": "13", "marketType": mt}, timeout=20)
+        r.raise_for_status()
+        text = r.content.decode("cp949", errors="ignore")
+    except requests.RequestException:
+        return []
+    rows = []
+    for tr in re.findall(r"<tr>([\s\S]*?)</tr>", text):
+        tds = [re.sub(r"<[^>]+>", "", t).strip() for t in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
+        if len(tds) >= 4 and re.fullmatch(r"[0-9A-Z]{1,6}", tds[2] or ""):
+            rows.append({"name": tds[0], "code": tds[2].zfill(6), "industry": tds[3], "product": tds[4] if len(tds) > 4 else ""})
+    return rows
+
+
+def _naver_market(sosok: int, max_pages: int = 60) -> list[dict]:
+    """KIND가 막혔을 때: 네이버 시가총액 순위 페이지에서 이름·코드."""
+    rows, seen = [], set()
+    for page in range(1, max_pages + 1):
+        try:
+            r = session.get(MARKET_SUM_URL, params={"sosok": sosok, "page": page}, timeout=8)
+            text = decode(r.content)
+        except requests.RequestException:
+            break
+        got = re.findall(r'href="/item/main\.naver\?code=(\w{6})" class="tltle">([^<]+)</a>', text)
+        new = [(c, n) for c, n in got if c not in seen]
+        if not new:
+            break
+        for c, n in new:
+            seen.add(c)
+            rows.append({"name": n.strip(), "code": c, "industry": "", "product": ""})
+    return rows
+
+
+def fetch_krx_universe() -> list[dict]:
+    """코스피·코스닥 상장 종목 전체 [{code, name, market, industry, product}]. 스팩·ETF·ETN은 빼요."""
+    if MOCK:
+        rng = _rng("universe")
+        return [{"code": f"9{i:05d}", "name": f"테스트{'피' if i % 3 else '닥'}{i}", "market": "코스피" if i % 3 else "코스닥",
+                 "industry": rng.choice(["반도체 제조업", "의약품 제조업", "소프트웨어 개발 및 공급업", "금융 지원 서비스업"]),
+                 "product": "테스트 제품"} for i in range(1, int(os.environ.get("MOCK_UNIVERSE", "300")) + 1)]
+    out = []
+    for label, mt, sosok in (("코스피", "stockMkt", 0), ("코스닥", "kosdaqMkt", 1)):
+        rows = _kind_market(mt) or _naver_market(sosok)
+        for x in rows:
+            if "스팩" in x["name"] or re.search(r"(ETF|ETN|리츠)$", x["name"]):
+                continue
+            out.append({**x, "market": label})
+    uniq = {}
+    for x in out:
+        uniq.setdefault(x["code"], x)
+    return list(uniq.values())
+
+
 def fetch_market_overview() -> dict[str, dict]:
     """{'코스피': {...}, '코스닥': {...}} — 지수, 전일대비, 등락률, 상승·보합·하락 종목 수, 투자자별 순매수(억원)."""
     if MOCK:
@@ -1812,22 +1887,25 @@ def add_leader_ranks(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     kr = df["code"].map(is_kr) & df["price"].notna()
-    for _, idx in df[kr].groupby("group").groups.items():
-        sub = df.loc[idx]
-        n = len(sub)
-        scores = pd.Series(0.0, index=idx)
-        for key, col in (("lead_rs_rank", "rs"), ("lead_cap_rank", "cap_krw"), ("lead_tv_rank", "tv20")):
-            vals = pd.to_numeric(sub[col], errors="coerce")
-            df.loc[idx, key] = vals.rank(ascending=False, method="min", na_option="bottom")
-            pct = vals.rank(pct=True, method="average").fillna(0.0)
-            scores += pct / 3
-        df.loc[idx, "lead_score"] = scores
-        rs = pd.to_numeric(sub["rs"], errors="coerce").fillna(-1)
-        strong = rs >= LEADER_RS_MIN
-        order = sorted(idx, key=lambda i: (not strong[i], -round(scores[i], 9), -rs[i]))
-        df.loc[order, "lead_rank"] = range(1, n + 1)
-        df.loc[idx, "lead_ok"] = strong
-        df.loc[idx, "lead_n"] = n
+    sub = df.loc[kr, ["group", "rs", "cap_krw", "tv20"]].copy()
+    if sub.empty:
+        return df
+    # (속도) 분류별 순위를 groupby로 한 번에 계산해요(예전엔 분류마다 반복)
+    g = sub.groupby("group")
+    score = pd.Series(0.0, index=sub.index)
+    for key, col in (("lead_rs_rank", "rs"), ("lead_cap_rank", "cap_krw"), ("lead_tv_rank", "tv20")):
+        vals = pd.to_numeric(sub[col], errors="coerce")
+        sub[col] = vals
+        df.loc[sub.index, key] = vals.groupby(sub["group"]).rank(ascending=False, method="min", na_option="bottom")
+        score += vals.groupby(sub["group"]).rank(pct=True, method="average").fillna(0.0) / 3
+    rs = sub["rs"].fillna(-1)
+    strong = rs >= LEADER_RS_MIN
+    tmp = pd.DataFrame({"group": sub["group"], "weak": ~strong, "neg_score": -score.round(9), "neg_rs": -rs},
+                       index=sub.index).sort_values(["group", "weak", "neg_score", "neg_rs"], kind="mergesort")
+    df.loc[tmp.index, "lead_rank"] = tmp.groupby("group").cumcount().to_numpy() + 1
+    df.loc[sub.index, "lead_score"] = score
+    df.loc[sub.index, "lead_ok"] = strong.to_numpy()
+    df.loc[sub.index, "lead_n"] = g["group"].transform("size").to_numpy()
     return df
 
 

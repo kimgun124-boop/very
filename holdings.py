@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-09-28-holdings"
+HOLDINGS_VERSION = "2026-09-28-lock"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -55,6 +55,90 @@ def new_holding(code: str, name: str, avg: float, qty: float, buy_date: str, sto
     return {"id": uuid.uuid4().hex[:10], "code": code, "name": name, "avg": float(avg), "qty": float(qty or 0),
             "buy_date": buy_date, "stop_pct": stop_pct, "half_taken": bool(half_taken), "memo": memo,
             "added_at": now_kst().strftime("%Y-%m-%d %H:%M")}
+
+
+# ─────────────────────────── 비밀번호(보유 종목 잠금) ───────────────────────────
+# 비밀번호·복구 답·복구 코드는 그대로 저장하지 않고 소금(salt)을 친 해시로만 저장해요. 그래서 '보여주기'는 못 하고 '다시 정하기'로 찾아요.
+import hashlib
+import hmac
+import secrets as _secrets
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_settings.json")
+PW_ITER = 200_000
+RECOVERY_QUESTIONS = ["처음 담임했던 학교 이름은?", "어릴 때 살던 동네 이름은?", "가장 좋아하는 책 제목은?",
+                      "처음 산 주식 종목은?", "기억에 남는 선생님 성함은?", "직접 질문 쓰기"]
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings_local(d: dict) -> None:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+
+
+def _hash(text: str, salt: str | None = None) -> dict:
+    salt = salt or _secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", text.encode("utf-8"), bytes.fromhex(salt), PW_ITER).hex()
+    return {"salt": salt, "hash": h, "iter": PW_ITER}
+
+
+def _check(text: str, rec: dict | None) -> bool:
+    if not rec or not text:
+        return False
+    h = hashlib.pbkdf2_hmac("sha256", text.encode("utf-8"), bytes.fromhex(rec["salt"]), int(rec.get("iter", PW_ITER))).hex()
+    return hmac.compare_digest(h, rec["hash"])
+
+
+def _norm_answer(a: str) -> str:
+    return re.sub(r"\s+", "", (a or "")).lower()
+
+
+def new_recovery_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"      # 헷갈리는 0·O·1·I 빼기
+    raw = "".join(_secrets.choice(alphabet) for _ in range(12))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def has_password(st_: dict) -> bool:
+    return bool((st_.get("lock") or {}).get("pw"))
+
+
+def set_password(st_: dict, pw: str, hint: str | None = None, question: str | None = None,
+                 answer: str | None = None, new_code: bool = False) -> str | None:
+    """비밀번호를 정하거나 바꿔요. new_code=True면 새 복구 코드를 만들어 돌려줘요(한 번만 보여 줌)."""
+    lock = dict(st_.get("lock") or {})
+    lock["pw"] = _hash(pw)
+    lock["changed_at"] = now_kst().strftime("%Y-%m-%d %H:%M")
+    if hint is not None:
+        lock["hint"] = hint.strip()
+    if question is not None and answer:
+        lock["question"] = question.strip()
+        lock["answer"] = _hash(_norm_answer(answer))
+    code = None
+    if new_code or not lock.get("code"):
+        code = new_recovery_code()
+        lock["code"] = _hash(code.replace("-", "").upper())
+    st_["lock"] = lock
+    return code
+
+
+def check_password(st_: dict, pw: str) -> bool:
+    return _check(pw, (st_.get("lock") or {}).get("pw"))
+
+
+def check_answer(st_: dict, answer: str) -> bool:
+    return _check(_norm_answer(answer), (st_.get("lock") or {}).get("answer"))
+
+
+def check_code(st_: dict, code: str) -> bool:
+    return _check((code or "").replace("-", "").replace(" ", "").upper(), (st_.get("lock") or {}).get("code"))
 
 
 # ─────────────────────────── 원칙 판단 ───────────────────────────

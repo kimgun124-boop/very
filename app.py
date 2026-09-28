@@ -57,8 +57,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist")
-DATA_VERSION = "2026-09-28-turnover"   # data.py의 DATA_VERSION과 같아야 해요
+            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe")
+DATA_VERSION = "2026-09-28-universe"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -77,7 +77,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-28-holdings"
+HOLDINGS_VERSION = "2026-09-28-lock"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -295,6 +295,36 @@ st.markdown(
   border-bottom: 2px solid #16212B !important; }
 .st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] p { color: #16212B !important; font-weight: 800; }
 .st-key-main_tabs [role="tabpanel"] [role="tab"] p { font-size: 0.9rem !important; }
+/* 잠금 화면 */
+.st-key-lock_box { background: #FFFFFF; border-radius: 14px !important; max-width: 560px; }
+.lk-title { font-size: 1.2rem; font-weight: 800; color: #16212B; }
+.lk-sub { font-size: 0.88rem; color: #51616C; margin: 0.2rem 0 0.6rem; }
+.lk-code { border: 2px dashed #16212B; border-radius: 12px; padding: 0.8rem 1rem; background: #FFFBEA; margin: 0.4rem 0; max-width: 560px; }
+.lk-code b { display: block; font-size: 0.9rem; }
+.lk-code span { display: block; font-size: 1.6rem; font-weight: 800; letter-spacing: 0.12em; font-family: ui-monospace, Consolas, monospace; margin: 0.2rem 0; }
+.lk-code em { font-style: normal; font-size: 0.82rem; color: #7A5A00; }
+/* 보유 종목 탭 · 한눈에 표 */
+.st-key-hold_tabs [role="tablist"] { flex-wrap: wrap; gap: 0.35rem !important; border-bottom: none !important; }
+.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"],
+.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"]:nth-child(n) {
+  border: 1px solid #DCE3E7 !important; border-radius: 999px !important; background: #FFFFFF !important;
+  padding: 0.35rem 0.85rem !important; }
+.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] {
+  background: #16212B !important; border-color: #16212B !important; }
+.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] p { color: #FFFFFF !important; }
+.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"] p { font-size: 0.92rem !important; font-weight: 700; }
+.ho-wrap { overflow-x: auto; background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: 0.3rem 0.5rem; }
+.ho-tbl { width: 100%; border-collapse: collapse; font-size: 0.9rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ho-tbl th { font-size: 0.76rem; color: #6B7A84; text-align: right; padding: 0.55rem 0.6rem; border-bottom: 2px solid #E3E8EB; }
+.ho-tbl td { text-align: right; padding: 0.6rem; border-bottom: 1px solid #EEF1F3; color: #16212B; }
+.ho-tbl .l { text-align: left; }
+.ho-tbl tr:last-child td { border-bottom: none; }
+.ho-code { font-size: 0.75rem; color: #7A8A94; margin-left: 0.35rem; }
+.ho-badge { font-size: 0.8rem; font-weight: 800; padding: 0.2rem 0.6rem; border-radius: 999px; border: 1.5px solid; }
+.ho-sd { min-width: 8rem; } .ho-sd span { font-weight: 800; font-size: 0.85rem; }
+.ho-bar { height: 5px; background: #FDECEC; border-radius: 3px; margin-bottom: 0.2rem; }
+.ho-bar i { display: block; height: 100%; background: #2E9D5B; border-radius: 3px; }
+.ho-memo { color: #51616C; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; }
 /* ── 💼 내 보유 ── */
 [class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
 .hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
@@ -598,6 +628,16 @@ def load_histories(codes: tuple[str, ...]):
                "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
+def load_universe() -> list[dict]:
+    return swr(("krx_universe",), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
+
+
+def load_histories_extra(codes: tuple[str, ...]):
+    """보드 밖 코스피·코스닥 종목 일봉(따로 기억해서 보드 종목은 다시 받지 않아요)."""
+    return swr(("hist_all", codes), 1800, lambda: data.fetch_histories(codes, workers=16),
+               f"코스피·코스닥 전체 {len(codes):,}종목의 일봉을 받는 중이에요. 처음 한 번은 1~3분 걸려요.")
+
+
 def load_histories_overseas(codes: tuple[str, ...]):
     return swr(("hist_os", codes), 900, lambda: data.fetch_histories(codes), "해외 종목 일봉을 불러오는 중이에요.")
 
@@ -710,6 +750,7 @@ NH_FILTERS = {
 MARKETS = {"한국": "KR", "미국": "US", "기타": "OTHER"}
 # 산업을 큰 묶음으로 나눠 칸으로 보여줘요. 여기 없는 산업은 '기타'로 가요.
 SECTOR_CATS = [
+    ("시장 전체", ["코스피 전체", "코스닥 전체"]),
     ("반도체 · IT", ["반도체", "글로벌 반도체", "AI·IT", "AI 인프라(해외)", "AI 소프트웨어(해외)", "OLED",
                     "데이터센터 전력", "우주 데이터센터"]),
     ("에너지 · 산업재", ["2차전지", "전력·에너지", "풍력", "조선", "건설", "산업재", "전략광물"]),
@@ -750,7 +791,33 @@ with st.sidebar:
         market_label = st.segmented_control("시장", list(MARKETS), default="한국", required=True,
                                             key="sb_market2", width="stretch", label_visibility="collapsed") or "한국"
         market = MARKETS[market_label]
-        mkt_stocks = [x for x in STOCKS if _mkt(x["code"]) == market]
+        scope_all = False
+        if market == "KR":
+            scope = st.segmented_control("종목 범위", ["코스피·코스닥 전체", "내 보드"], default="코스피·코스닥 전체", required=True,
+                                         key="sb_scope", width="stretch",
+                                         help="전체: 코스피·코스닥 상장 종목(스팩·ETF 제외)을 모두 살펴요 — 리스트와 신고가·거래량·매수 후보 등 모든 탭이 스크리너처럼 전 종목에서 찾아요. "
+                                              "내 보드: 공부 자료에 넣은 종목만. 앱을 처음 켤 때 한 번은 1~3분 걸려요.")
+            scope_all = scope == "코스피·코스닥 전체"
+    # 전체 범위: 보드에 없는 상장 종목을 '코스피 전체 / 코스닥 전체' 산업으로 붙여요(세부 분류 = 한국거래소 업종)
+    EXTRA_STOCKS = []
+    if scope_all:
+        _have = {x["code"] for x in STOCKS}
+        for u in load_universe():
+            if u["code"] not in _have:
+                EXTRA_STOCKS.append({"sector": f"{u['market']} 전체", "group": u.get("industry") or f"{u['market']} 기타",
+                                     "name": u["name"], "code": u["code"], "desc": u.get("product") or u.get("industry") or "",
+                                     "tags": [], "notes": []})
+    STOCKS_VIEW = STOCKS + EXTRA_STOCKS
+    EXTRA_CODES = tuple(sorted(x["code"] for x in EXTRA_STOCKS))
+    for _x in EXTRA_STOCKS:
+        if _x["sector"] not in SECTOR_ORDER:
+            SECTOR_ORDER = SECTOR_ORDER + [_x["sector"]]
+        if _x["group"] not in GROUP_ORDER:
+            GROUP_ORDER = GROUP_ORDER + [_x["group"]]
+    with st.sidebar:
+        if scope_all:
+            st.caption(f"보드 {len(STOCKS):,} + 상장 종목 {len(EXTRA_STOCKS):,}개 = {len(STOCKS_VIEW):,}개")
+    mkt_stocks = [x for x in STOCKS_VIEW if _mkt(x["code"]) == market]
 
     # ② 산업 — 묶음별 2칸 격자. 아무것도 안 고르면 그 시장 전체
     sector_choices = [sec for sec in SECTOR_ORDER if any(x["sector"] == sec for x in mkt_stocks)]
@@ -1754,7 +1821,7 @@ def render_reports_tab():
         pw = st.text_input("비밀번호", type="password", key="rep_pw")
         if pw and pw == stt["pw"]:
             st.session_state["rep_ok"] = True
-            st.rerun(scope="fragment")
+            _rerun_frag()
         elif pw:
             st.error("비밀번호가 달라요.")
         _render_saved_reports(stt, editable=False)
@@ -1858,7 +1925,7 @@ def render_reports_tab():
                     st.rerun(scope="app")
             if st.button("취소", key="rep_cancel"):
                 st.session_state.pop("rep_draft", None)
-                st.rerun(scope="fragment")
+                _rerun_frag()
     if st.session_state.get("rep_saved_msg"):
         st.success(st.session_state.pop("rep_saved_msg"))
     _render_saved_reports(stt, editable=True)
@@ -1913,22 +1980,318 @@ LEVEL_COLOR = {"red": ("#FDECEC", UP), "orange": ("#FDF1E7", "#D2691E"), "yellow
                "green": ("#EEF8F2", "#1E7A45"), "blue": ("#EEF4FC", DOWN), "gray": ("#F1F4F6", "#51616C")}
 
 
+def _rerun_frag():
+    """칸(fragment)만 다시 그리기. 전체 실행 중이라 칸만 못 그리면 전체를 다시 그려요."""
+    try:
+        st.rerun(scope="fragment")
+    except st.errors.StreamlitAPIException:
+        st.rerun()
+
+
+def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
+    """보유 종목 한 개의 판단 카드(종목 탭 안)."""
+    bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
+    cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
+    price = m.get("price")
+    pnl_col = UP if (j["pnl"] or 0) > 0 else DOWN
+    with st.container(border=True, key=f"hold_card_{h['id']}"):
+        st.markdown(
+            f'<div class="hd-top"><div><b class="hd-name">{html.escape(h["name"])}</b>'
+            f'<span class="hd-code">{h["code"]}</span>'
+            f'<span class="hd-px">{fmt_price(price, cur)}</span>'
+            f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {(j["r"] or 0):+.2f}R</span></div>'
+            f'<span class="hd-verdict" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></div>'
+            f'<div class="hd-sub">평단 {fmt_price(h["avg"], cur)}'
+            + (f' · {h["qty"]:,.0f}주 · 평가손익 {(price - h["avg"]) * h["qty"]:+,.0f}' if h.get("qty") and price else "")
+            + f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
+            + f' · 3R 목표 {fmt_price(j["target3r"], cur)} · 매수일 {h.get("buy_date", "-")}'
+            + (f' · {html.escape(h["memo"])}' if h.get("memo") else "") + "</div>",
+            unsafe_allow_html=True)
+        icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
+        st.markdown('<div class="hd-checks">' + "".join(
+            f'<div class="hd-chk {st_}"><span>{icon[st_]} {html.escape(item)}</span><em>{html.escape(txt)}</em></div>'
+            for st_, item, txt in j["checks"]) + "</div>", unsafe_allow_html=True)
+        st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
+            f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
+
+        t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
+        with t_news:
+            ev = load_evidence(h["code"], h["name"])
+            if stt["ai"]:
+                k = f"hold_ai_{h['id']}"
+                if st.button("🤖 뉴스를 원칙과 연결해 요약", key=f"{k}_btn"):
+                    with st.spinner("뉴스·리포트를 읽는 중이에요."):
+                        txt, err = holdings.ai_news_summary(stt["key"], stt["model"], h["name"], j,
+                                                            ev["news"] + ev["research"])
+                    st.session_state[k] = txt or err
+                if st.session_state.get(k):
+                    st.info(st.session_state[k])
+            c1, c2 = st.columns([1.6, 1])
+            with c1:
+                st.markdown("**최근 뉴스** (네이버 증권 · 구글 뉴스 모음)")
+                if ev["news"]:
+                    st.markdown('<div class="hd-news">' + "".join(
+                        f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
+                        f'<em>{html.escape(x["source"])} · {html.escape(x["time"])} · {x["portal"]}</em></a>'
+                        for x in ev["news"][:12]) + "</div>", unsafe_allow_html=True)
+                else:
+                    st.caption("뉴스를 받지 못했어요.")
+            with c2:
+                st.markdown("**증권사 리포트**")
+                if ev["research"]:
+                    st.markdown('<div class="hd-news">' + "".join(
+                        f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
+                        f'<em>{html.escape(x["source"])} · {html.escape(x["time"])}</em></a>'
+                        for x in ev["research"]) + "</div>", unsafe_allow_html=True)
+                else:
+                    st.caption("최근 리포트가 없거나 받지 못했어요.")
+            st.caption("뉴스는 10분마다 새로 모아요. 제목만으로는 판단이 틀릴 수 있으니 원문을 확인하세요.")
+        with t_chart:
+            candle_chart(h["code"], cur, quotes.get(h["code"]) if data.is_kr(h["code"]) else None,
+                         m.get("high52"), key=f"hold_ch_{h['id']}")
+
+
+def _holdings_overview(rows, dot):
+    """보유 종목 한눈에: 판정·수익률·손절선 여유를 표 하나로."""
+    trs = []
+    for h, m, bars, j in rows:
+        cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
+        bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
+        pnl = j["pnl"] or 0
+        pc = UP if pnl > 0 else (DOWN if pnl < 0 else "#51616C")
+        sd = j["stop_dist"]
+        sd_col = UP if sd is not None and sd < 3 else "#16212B"
+        bar_w = max(0, min(100, (sd or 0) / 15 * 100))
+        trs.append(
+            f'<tr><td class="l"><b>{html.escape(h["name"])}</b><span class="ho-code">{h["code"]}</span></td>'
+            f'<td class="l"><span class="ho-badge" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></td>'
+            f'<td>{fmt_price(m.get("price"), cur)}</td><td>{fmt_price(h["avg"], cur)}</td>'
+            f'<td style="color:{pc};font-weight:800">{pnl:+.2f}%</td><td style="color:{pc}">{(j["r"] or 0):+.2f}R</td>'
+            f'<td>{fmt_price(j["stop_price"], cur)}</td>'
+            f'<td class="ho-sd"><div class="ho-bar"><i style="width:{bar_w:.0f}%"></i></div>'
+            f'<span style="color:{sd_col}">{(sd or 0):.1f}%</span></td>'
+            f'<td>{fmt_price(j["target3r"], cur)}</td>'
+            f'<td class="l ho-memo">{html.escape(h.get("memo") or "")}</td></tr>')
+    st.markdown(
+        '<div class="ho-wrap"><table class="ho-tbl"><thead><tr><th class="l">종목</th><th class="l">원칙 판정</th>'
+        '<th>현재가</th><th>평단</th><th>수익률</th><th>R</th><th>손절선</th><th>손절까지 여유</th><th>3R 목표</th>'
+        '<th class="l">메모</th></tr></thead><tbody>' + "".join(trs) + '</tbody></table></div>',
+        unsafe_allow_html=True)
+    st.caption("🔴 손절·정리 조건 · 🟠 비중 축소 신호 · 🔵 3R 익절 구간 · 🟡 주의 · 🟢 원칙상 보유 — 위 탭에서 종목을 고르면 점검표·뉴스·차트가 나와요.")
+
+
+LOCK_IDLE_MIN = 30        # 연 지 이만큼(분) 지나면 다시 잠가요
+LOCK_MAX_FAIL = 5         # 연속으로 틀리면
+LOCK_WAIT_SEC = 60        # 이만큼(초) 기다려야 해요
+
+
+def _persist_settings(d: dict, stt: dict) -> tuple[bool, str]:
+    holdings.save_settings_local(d)
+    if stt["gh"]:
+        return reports.save_github(d, stt["token"], stt["repo"], stt["branch"], path="user_settings.json")
+    return True, "이 서버에만 임시로 저장했어요(GitHub 토큰이 없으면 앱을 다시 켤 때 사라질 수 있어요)."
+
+
+def _pw_ok(pw: str, pw2: str) -> str | None:
+    if len(pw) < 4:
+        return "비밀번호는 4자 이상으로 정해 주세요."
+    if pw != pw2:
+        return "두 번 넣은 비밀번호가 달라요."
+    return None
+
+
+def _question_inputs(prefix: str, cur: str | None = None) -> tuple[str, str]:
+    qs = holdings.RECOVERY_QUESTIONS
+    idx = qs.index(cur) if cur in qs else (len(qs) - 1 if cur else 0)
+    q = st.selectbox("복구 질문", qs, index=idx, key=f"{prefix}_q")
+    if q == "직접 질문 쓰기":
+        q = st.text_input("질문", value=cur if cur and cur not in qs else "", key=f"{prefix}_qc")
+    a = st.text_input("답(띄어쓰기·대소문자는 상관없어요)", key=f"{prefix}_a")
+    return q, a
+
+
+def _show_code_once():
+    code = st.session_state.get("lock_new_code")
+    if code:
+        st.markdown(f'<div class="lk-code"><b>🔑 복구 코드</b><span>{code}</span>'
+                    '<em>비밀번호를 잊었을 때 쓰는 코드예요. 지금 한 번만 보여 드려요 — 휴대폰 메모나 종이에 꼭 적어 두세요.</em></div>',
+                    unsafe_allow_html=True)
+        if st.button("적어 뒀어요", key="lock_code_ack"):
+            st.session_state.pop("lock_new_code", None)
+            _rerun_frag()
+
+
+def _lock_gate(stt: dict) -> bool:
+    """보유 종목 잠금. 열렸으면 True. 잠겨 있으면 화면(만들기·열기·찾기)을 그리고 False."""
+    now = time.time()
+    if st.session_state.get("hold_unlocked"):
+        # 자동 새로고침이 계속 돌아서 '안 쓴 시간'을 잴 수 없어요 → 연 지 LOCK_IDLE_MIN분이 지나면 다시 잠가요
+        if now - st.session_state.get("hold_seen", now) > LOCK_IDLE_MIN * 60:
+            st.session_state["hold_unlocked"] = False
+            st.info(f"연 지 {LOCK_IDLE_MIN}분이 지나서 다시 잠갔어요.")
+        else:
+            return True
+    cfg = holdings.load_settings()
+    has_hold = bool(holdings.load().get("holdings"))
+    reset_key = _secret("RESET_KEY") or _secret("APP_PASSWORD")
+
+    with st.container(border=True, key="lock_box"):
+        # ① 처음: 비밀번호 만들기
+        if not holdings.has_password(cfg):
+            st.markdown('<div class="lk-title">🔐 보유 종목 비밀번호 만들기</div>'
+                        '<div class="lk-sub">내 보유 종목은 비밀번호를 넣어야만 보여요. 처음 한 번 정해 주세요.</div>',
+                        unsafe_allow_html=True)
+            if has_hold and not reset_key:
+                st.error("저장된 보유 종목은 있는데 비밀번호 설정이 없어졌어요. 다른 사람이 새 비밀번호를 만들지 못하게, "
+                         "Streamlit Secrets에 RESET_KEY = \"아무 문구\"를 넣은 뒤 그 문구로 다시 만들어 주세요.")
+                return False
+            need_key = has_hold and bool(reset_key)
+            pw = st.text_input("새 비밀번호(4자 이상)", type="password", key="lk_new1")
+            pw2 = st.text_input("한 번 더", type="password", key="lk_new2")
+            hint = st.text_input("비밀번호 힌트(선택 · 잠금 화면에 보여요)", key="lk_hint",
+                                 placeholder="예: 우리 반 번호 + 좋아하는 숫자")
+            q, a = _question_inputs("lk_setq")
+            rk = st.text_input("RESET_KEY(Secrets에 넣은 문구)", type="password", key="lk_rk") if need_key else ""
+            if st.button("비밀번호 만들기", type="primary", key="lk_make"):
+                err = _pw_ok(pw, pw2) or (None if a.strip() else "복구 질문의 답을 넣어 주세요.") \
+                    or ("RESET_KEY가 달라요." if need_key and rk != reset_key else None)
+                if err:
+                    st.error(err)
+                else:
+                    code = holdings.set_password(cfg, pw, hint, q, a, new_code=True)
+                    ok, msg = _persist_settings(cfg, stt)
+                    if ok:
+                        st.session_state.update(hold_unlocked=True, hold_seen=now, lock_new_code=code)
+                        _rerun_frag()
+                    st.error(msg)
+            return False
+
+        # ② 잠금 화면: 비밀번호 넣기
+        lock = cfg.get("lock") or {}
+        st.markdown('<div class="lk-title">🔒 내 보유 종목은 잠겨 있어요</div>'
+                    '<div class="lk-sub">비밀번호를 넣으면 열려요. ' + f'열고 {LOCK_IDLE_MIN}분이 지나거나 창을 새로 열면 다시 잠겨요.</div>',
+                    unsafe_allow_html=True)
+        wait = st.session_state.get("lk_until", 0) - now
+        if wait > 0:
+            st.error(f"{LOCK_MAX_FAIL}번 틀려서 잠깐 멈췄어요. {int(wait) + 1}초 뒤에 다시 넣어 주세요.")
+        c1, c2 = st.columns([3, 1])
+        pw = c1.text_input("비밀번호", type="password", key="lk_pw", label_visibility="collapsed",
+                           placeholder="비밀번호", disabled=wait > 0)
+        go = c2.button("열기", type="primary", width="stretch", key="lk_go", disabled=wait > 0)
+        tried = go or (pw and pw != st.session_state.get("lk_last"))   # 자동 새로고침 때 같은 값으로 다시 세지 않게
+        if tried and pw and wait <= 0:
+            st.session_state["lk_last"] = pw
+            if holdings.check_password(cfg, pw):
+                st.session_state.update(hold_unlocked=True, hold_seen=now, lk_fail=0)
+                _rerun_frag()
+            else:
+                n = st.session_state.get("lk_fail", 0) + 1
+                st.session_state["lk_fail"] = n
+                if n >= LOCK_MAX_FAIL:
+                    st.session_state.update(lk_until=now + LOCK_WAIT_SEC, lk_fail=0)
+                st.error(f"비밀번호가 달라요. ({n}/{LOCK_MAX_FAIL})")
+        if lock.get("hint"):
+            st.caption(f"💡 힌트: {lock['hint']}")
+
+        # ③ 비밀번호 찾기(다시 정하기)
+        with st.expander("🔑 비밀번호를 잊으셨나요?"):
+            st.caption("비밀번호는 암호화해서 저장해서 그대로 보여 드릴 수는 없어요. 아래 방법 중 하나로 확인하면 새 비밀번호로 바꿀 수 있어요.")
+            ways = ["복구 질문"] + ["복구 코드"] + (["Secrets의 RESET_KEY"] if reset_key else [])
+            way = st.segmented_control("확인 방법", ways, default="복구 질문", required=True, key="lk_way")
+            if way == "복구 질문":
+                st.markdown(f"**{lock.get('question', '(질문 없음)')}**")
+                proof = st.text_input("답", key="lk_ans")
+                ok_proof = holdings.check_answer(cfg, proof) if proof else False
+            elif way == "복구 코드":
+                proof = st.text_input("복구 코드(예: ABCD-EFGH-JKLM)", key="lk_code")
+                ok_proof = holdings.check_code(cfg, proof) if proof else False
+            else:
+                proof = st.text_input("RESET_KEY", type="password", key="lk_rk2")
+                ok_proof = bool(proof) and proof == reset_key
+            if proof and not ok_proof:
+                st.error("확인이 안 됐어요. 다시 넣어 주세요.")
+            if ok_proof:
+                st.success("확인됐어요. 새 비밀번호를 정해 주세요.")
+                n1 = st.text_input("새 비밀번호", type="password", key="lk_r1")
+                n2 = st.text_input("한 번 더", type="password", key="lk_r2")
+                if st.button("새 비밀번호로 바꾸기", type="primary", key="lk_reset"):
+                    err = _pw_ok(n1, n2)
+                    if err:
+                        st.error(err)
+                    else:
+                        code = holdings.set_password(cfg, n1, new_code=(way == "복구 코드"))
+                        ok, msg = _persist_settings(cfg, stt)
+                        if ok:
+                            st.session_state.update(hold_unlocked=True, hold_seen=now, lk_fail=0,
+                                                    lock_new_code=code if code else None)
+                            _rerun_frag()
+                        st.error(msg)
+    return False
+
+
+def _lock_settings(stt: dict):
+    """열린 상태에서: 잠그기 · 비밀번호 바꾸기 · 힌트/복구 질문 바꾸기 · 복구 코드 새로 받기."""
+    cfg = holdings.load_settings()
+    lock = cfg.get("lock") or {}
+    c1, c2 = st.columns([5, 1])
+    c1.caption(f"🔓 열림 · 연 지 {LOCK_IDLE_MIN}분이 지나면 자동으로 잠겨요"
+               + (f" · 비밀번호 바꾼 날 {lock['changed_at']}" if lock.get("changed_at") else ""))
+    if c2.button("🔒 잠그기", width="stretch", key="lk_lock"):
+        st.session_state["hold_unlocked"] = False
+        _rerun_frag()
+    _show_code_once()
+    with st.expander("⚙️ 비밀번호 · 힌트 · 복구 설정"):
+        what = st.segmented_control("바꿀 것", ["비밀번호", "힌트", "복구 질문", "복구 코드 새로 받기"], default="비밀번호",
+                                    required=True, key="lk_what")
+        cur = st.text_input("지금 비밀번호(확인용)", type="password", key="lk_cur")
+        if what == "비밀번호":
+            n1 = st.text_input("새 비밀번호", type="password", key="lk_c1")
+            n2 = st.text_input("한 번 더", type="password", key="lk_c2")
+        elif what == "힌트":
+            new_hint = st.text_input("새 힌트(비우면 힌트 없음)", value=lock.get("hint", ""), key="lk_ch")
+        elif what == "복구 질문":
+            q, a = _question_inputs("lk_chq", lock.get("question"))
+        else:
+            st.caption("새 코드를 받으면 예전 복구 코드는 더 이상 안 돼요.")
+        if st.button("저장", type="primary", key="lk_save"):
+            if not holdings.check_password(cfg, cur):
+                st.error("지금 비밀번호가 달라요.")
+                return
+            code = None
+            if what == "비밀번호":
+                err = _pw_ok(n1, n2)
+                if err:
+                    st.error(err)
+                    return
+                holdings.set_password(cfg, n1)
+            elif what == "힌트":
+                cfg["lock"]["hint"] = new_hint.strip()
+            elif what == "복구 질문":
+                if not a.strip():
+                    st.error("답을 넣어 주세요.")
+                    return
+                cfg["lock"]["question"] = q.strip()
+                cfg["lock"]["answer"] = holdings._hash(holdings._norm_answer(a))
+            else:
+                code = holdings.new_recovery_code()
+                cfg["lock"]["code"] = holdings._hash(code.replace("-", ""))
+            ok, msg = _persist_settings(cfg, stt)
+            if ok:
+                st.session_state["lock_new_code"] = code
+                st.success(f"{what} 저장했어요.")
+                _rerun_frag()
+            else:
+                st.error(msg)
+
+
 @st.fragment
 def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     """💼 내 보유: 평단가를 넣으면 내 원칙으로 점검하고, 뉴스·리포트 근거를 모아 보여줘요."""
     stt = _rep_status()
     _sec_h("💼 내 보유 종목", "평단가를 넣으면 내 매매 원칙으로 점검해요 · 매수·매도 추천이 아니라 원칙 점검표예요")
-    if stt["pw"] and not st.session_state.get("rep_ok"):
-        pw = st.text_input("비밀번호(보유 종목은 비밀번호를 넣어야 보여요)", type="password", key="hold_pw")
-        if pw and pw == stt["pw"]:
-            st.session_state["rep_ok"] = True
-            st.rerun(scope="fragment")
-        elif pw:
-            st.error("비밀번호가 달라요.")
+    if not _lock_gate(stt):
         return
-    if not stt["pw"]:
-        st.warning("비밀번호(APP_PASSWORD)가 없어서 앱 주소를 아는 누구나 보유 종목을 볼 수 있어요. "
-                   "📥 리포트 탭의 '처음 한 번 설정하기'대로 Secrets에 비밀번호를 넣어 주세요.")
+    _lock_settings(stt)
     store = holdings.load()
     board_labels = {s["code"]: s["name"] for s in STOCKS}
 
@@ -1957,7 +2320,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
             store["holdings"].append(holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo))
             ok, msg = _persist_holdings(store, stt)
             (st.success if ok else st.error)(msg)
-            st.rerun(scope="fragment")
+            _rerun_frag()
 
     if not store["holdings"]:
         st.info("아직 넣은 보유 종목이 없어요. 위에서 종목과 평단가를 넣어 주세요.")
@@ -1984,66 +2347,25 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
                 ctx["market_text"], delta_color="off")
 
     order = {"red": 0, "orange": 1, "blue": 2, "yellow": 3, "green": 4, "gray": 5}
-    for h, m, bars, j in sorted(rows, key=lambda x: order.get(x[3]["level"], 9)):
-        bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
-        cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
-        price = m.get("price")
-        pnl_col = UP if (j["pnl"] or 0) > 0 else DOWN
-        with st.container(border=True, key=f"hold_card_{h['id']}"):
-            st.markdown(
-                f'<div class="hd-top"><div><b class="hd-name">{html.escape(h["name"])}</b>'
-                f'<span class="hd-code">{h["code"]}</span>'
-                f'<span class="hd-px">{fmt_price(price, cur)}</span>'
-                f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {(j["r"] or 0):+.2f}R</span></div>'
-                f'<span class="hd-verdict" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></div>'
-                f'<div class="hd-sub">평단 {fmt_price(h["avg"], cur)}'
-                + (f' · {h["qty"]:,.0f}주 · 평가손익 {(price - h["avg"]) * h["qty"]:+,.0f}' if h.get("qty") and price else "")
-                + f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
-                + f' · 3R 목표 {fmt_price(j["target3r"], cur)} · 매수일 {h.get("buy_date", "-")}'
-                + (f' · {html.escape(h["memo"])}' if h.get("memo") else "") + "</div>",
-                unsafe_allow_html=True)
-            icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
-            st.markdown('<div class="hd-checks">' + "".join(
-                f'<div class="hd-chk {st_}"><span>{icon[st_]} {html.escape(item)}</span><em>{html.escape(txt)}</em></div>'
-                for st_, item, txt in j["checks"]) + "</div>", unsafe_allow_html=True)
-            st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
-                f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
+    dot = {"red": "🔴", "orange": "🟠", "blue": "🔵", "yellow": "🟡", "green": "🟢", "gray": "⚪"}
+    rows = sorted(rows, key=lambda x: order.get(x[3]["level"], 9))
 
-            t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
-            with t_news:
-                ev = load_evidence(h["code"], h["name"])
-                if stt["ai"]:
-                    k = f"hold_ai_{h['id']}"
-                    if st.button("🤖 뉴스를 원칙과 연결해 요약", key=f"{k}_btn"):
-                        with st.spinner("뉴스·리포트를 읽는 중이에요."):
-                            txt, err = holdings.ai_news_summary(stt["key"], stt["model"], h["name"], j,
-                                                                ev["news"] + ev["research"])
-                        st.session_state[k] = txt or err
-                    if st.session_state.get(k):
-                        st.info(st.session_state[k])
-                c1, c2 = st.columns([1.6, 1])
-                with c1:
-                    st.markdown("**최근 뉴스** (네이버 증권 · 구글 뉴스 모음)")
-                    if ev["news"]:
-                        st.markdown('<div class="hd-news">' + "".join(
-                            f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
-                            f'<em>{html.escape(x["source"])} · {html.escape(x["time"])} · {x["portal"]}</em></a>'
-                            for x in ev["news"][:12]) + "</div>", unsafe_allow_html=True)
-                    else:
-                        st.caption("뉴스를 받지 못했어요.")
-                with c2:
-                    st.markdown("**증권사 리포트**")
-                    if ev["research"]:
-                        st.markdown('<div class="hd-news">' + "".join(
-                            f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
-                            f'<em>{html.escape(x["source"])} · {html.escape(x["time"])}</em></a>'
-                            for x in ev["research"]) + "</div>", unsafe_allow_html=True)
-                    else:
-                        st.caption("최근 리포트가 없거나 받지 못했어요.")
-                st.caption("뉴스는 10분마다 새로 모아요. 제목만으로는 판단이 틀릴 수 있으니 원문을 확인하세요.")
-            with t_chart:
-                candle_chart(h["code"], cur, quotes.get(h["code"]) if data.is_kr(h["code"]) else None,
-                             m.get("high52"), key=f"hold_ch_{h['id']}")
+    # 종목마다 탭: 맨 앞 '한눈에' + 종목 탭(판정 색 점 · 이름 · 수익률)
+    labels = ["📊 한눈에"] + [f"{dot.get(j['level'], '⚪')} {h['name']} {(j['pnl'] or 0):+.1f}%" for h, m, b, j in rows]
+    with st.container(key="hold_tabs"):
+        try:
+            tabs = st.tabs(labels, key="hold_tab_sel", on_change="rerun")
+            lazy = True
+        except TypeError:
+            tabs = st.tabs(labels)
+            lazy = False
+    if (not lazy) or tabs[0].open:
+        with tabs[0]:
+            _holdings_overview(rows, dot)
+    for tab, (h, m, bars, j) in zip(tabs[1:], rows):
+        if (not lazy) or tab.open:       # (속도) 고른 종목 탭만 뉴스·차트를 불러와요
+            with tab:
+                _holding_card(h, m, bars, j, quotes, stt)
 
     with st.expander("✏️ 보유 종목 고치기 · 지우기"):
         ed = st.data_editor(pd.DataFrame([{
@@ -2070,7 +2392,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
             store["holdings"] = new
             ok, msg = _persist_holdings(store, stt)
             (st.success if ok else st.error)(msg)
-            st.rerun(scope="fragment")
+            _rerun_frag()
     if stt["gh"]:
         st.caption("보유 종목은 GitHub 저장소의 user_holdings.json에 저장돼요. 저장소가 공개(Public)면 누구나 볼 수 있으니 "
                    "GitHub에서 저장소를 비공개(Private)로 바꿔 두세요.")
@@ -3518,11 +3840,13 @@ _QUOTES: dict = {}
 
 def render_board():
     histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
-    quotes, quote_error = load_quotes(KR_CODES)
+    if EXTRA_CODES:
+        histories.update(load_histories_extra(EXTRA_CODES))
+    quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
     _QUOTES.clear()
     _QUOTES.update(quotes)
     shares_store = load_shares()
-    df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
+    df = data.build_table(STOCKS_VIEW, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
                           monthlies=load_monthlies(ALL_CODES), official52=load_official_52w(KR_CODES))
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
@@ -3540,32 +3864,38 @@ def render_board():
     trends_all, fins_all = load_trends_all(), load_fins_all()
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
+    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"]
     with st.container(key="main_tabs"):
-        t_list, t_hold, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
-            ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"])
-    with t_hold:
-        render_holdings_tab(df, quotes)
-    with t_rep:
-        render_reports_tab()
-    with t_chart:
-        render_chart_tab(df, quotes)
-    with t_money:
-        render_money(df)
-    with t_nh:
-        render_nh_candidates(df, histories, quotes)
-    with t_vs:
-        render_volume_surge(df, histories, quotes)
-    with t_buy:
-        render_buy(df, quotes)
-    with t_eng:
-        render_engine(df, trends_all, leaders_now, fins_all)
-    with t_next:
-        render_next(df, fins_all, trends_all, leaders_now)
-    with t_scn:
-        render_scenario(df, histories, trends_all, leaders_now, fins_all)
-    with t_list:
-        render_list(df, histories, quote_error, shares_store, fins_all)
+        # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
+        try:
+            tabs = st.tabs(names, key="main_tab_sel", on_change="rerun")
+            lazy = True
+        except TypeError:          # 예전 Streamlit
+            tabs = st.tabs(names)
+            lazy = False
+    t_list, t_hold, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = tabs
+
+    def is_open(t) -> bool:
+        return (not lazy) or bool(getattr(t, "open", True))
+
+    jobs = [
+        (t_list, lambda: render_list(df, histories, quote_error, shares_store, fins_all)),
+        (t_hold, lambda: render_holdings_tab(df, quotes)),
+        (t_chart, lambda: render_chart_tab(df, quotes)),
+        (t_rep, lambda: render_reports_tab()),
+        (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
+        (t_vs, lambda: render_volume_surge(df, histories, quotes)),
+        (t_buy, lambda: render_buy(df, quotes)),
+        (t_money, lambda: render_money(df)),
+        (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),
+        (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
+        (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
+    ]
+    for tab, job in jobs:
+        if is_open(tab):
+            with tab:
+                job()
 
 
 def render_list(df, histories, quote_error, shares_store, fins_all=None):
@@ -3596,6 +3926,19 @@ def render_list(df, histories, quote_error, shares_store, fins_all=None):
     if f.empty:
         st.info("조건에 맞는 종목이 없어요. 왼쪽 필터를 넓혀 보세요.")
     else:
+        if len(f) > 300:        # (속도) 전체 종목이면 표를 나눠서 그려요
+            c1, c2, c3 = st.columns([1.3, 1, 2])
+            sort_by = c1.selectbox("정렬", ["신고가 가까운 순", "등락률 높은 순", "거래대금 많은 순", "평소 대비 거래 많은 순",
+                                          "RS 높은 순", "시가총액 큰 순"], key="list_sort")
+            size = c2.selectbox("한 번에", [100, 300, 1000], index=1, key="list_size")
+            col, asc = {"신고가 가까운 순": ("to_high", True), "등락률 높은 순": ("change", False),
+                        "거래대금 많은 순": ("tv_live", False), "평소 대비 거래 많은 순": ("tv_x", False),
+                        "RS 높은 순": ("rs", False), "시가총액 큰 순": ("cap_krw", False)}[sort_by]
+            f = f.assign(_k=pd.to_numeric(f[col], errors="coerce")).sort_values("_k", ascending=asc,
+                                                                                 na_position="last").drop(columns="_k")
+            pages = max(1, -(-len(f) // size))
+            page = c3.number_input(f"쪽 (전체 {len(f):,}종목 · {pages}쪽)", 1, pages, 1, key="list_page")
+            f = f.iloc[(page - 1) * size: page * size]
         with st.container(key="desk_table"):
             render_table(f)
             st.caption("노란 줄 = 최근 신고가 · 신고가까지 빨강 3% 이내, 주황 10% 이내 · 수급은 억원(추정) · 해외는 현지 통화, 15분 지연")
