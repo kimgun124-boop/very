@@ -20,15 +20,20 @@ import stocks as stock_list
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
 # 크롬 자동 번역이 화면 글자를 바꿔 끼우면 'removeChild' 오류로 앱이 멈춰요. 한국어 페이지로 알리고 번역을 막아요.
-import streamlit.components.v1 as _components
-_components.html("""<script>
-try { const d = window.parent.document;
+_NO_TRANSLATE_JS = """<script>
+try { const d = (window.parent && window.parent.document) || document;
   d.documentElement.setAttribute('lang', 'ko'); d.documentElement.setAttribute('translate', 'no');
   d.documentElement.classList.add('notranslate'); d.body.classList.add('notranslate');
   if (!d.querySelector('meta[name=google][content=notranslate]')) {
     const m = d.createElement('meta'); m.name = 'google'; m.content = 'notranslate'; d.head.appendChild(m); }
 } catch (e) {}
-</script>""", height=0)
+</script>"""
+try:        # 새 Streamlit: st.html로 바로 실행(components.html은 곧 없어져요)
+    with st.container(key="no_translate", height=1, border=False):
+        st.html(_NO_TRANSLATE_JS, unsafe_allow_javascript=True)
+except TypeError:
+    import streamlit.components.v1 as _components
+    _components.html(_NO_TRANSLATE_JS, height=0)
 
 # 카드·표의 종목 링크(?chart=코드)로 들어오면 그 종목 차트를 바로 보여줘요
 _qp_chart = st.query_params.get("chart")
@@ -47,8 +52,9 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
-            "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF")
-DATA_VERSION = "2026-09-28-chart"   # data.py의 DATA_VERSION과 같아야 해요
+            "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
+            "market_turnover", "fetch_market_turnover_hist")
+DATA_VERSION = "2026-09-28-turnover"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -210,6 +216,36 @@ st.markdown(
 .st-key-chart_search [data-testid="stButtonGroup"] button p { font-size: 0.95rem !important; }
 .st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] { background: #16212B !important; }
 .st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] p { color: #FFFFFF !important; }
+/* ── 코스피·코스닥 거래대금 ── */
+.tv-box { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: 0.9rem 1rem 0.8rem; margin: 0.2rem 0 1rem; }
+.tv-title { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; margin-bottom: 0.7rem; }
+.tv-title b { font-size: 1.08rem; font-weight: 800; color: #16212B; }
+.tv-title span { font-size: 0.8rem; color: #7A8A94; font-weight: 600; }
+.tv-chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.6rem; margin-bottom: 0.8rem; }
+.tv-chip { background: #F6F8F9; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.65rem 0.85rem; }
+.tv-chip.tot { background: #16212B; border-color: #16212B; }
+.tv-chip.tot .tv-chip-h, .tv-chip.tot .tv-chip-f { color: #9FB0BA; }
+.tv-chip.tot .tv-chip-v, .tv-chip.tot .tv-chip-s { color: #FFFFFF !important; }
+.tv-chip-h { font-size: 0.8rem; color: #6B7A84; font-weight: 700; }
+.tv-chip-v { font-size: 1.6rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.tv-chip-v small { font-size: 0.9rem; margin-left: 0.1rem; }
+.tv-chip-s { font-size: 0.92rem; font-weight: 800; margin-top: 0.1rem; }
+.tv-chip-f { font-size: 0.76rem; color: #7A8A94; margin-top: 0.2rem; }
+.tv-wrap { overflow-x: auto; }
+.tv-tbl { width: 100%; border-collapse: collapse; font-size: 0.88rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tv-tbl th { font-size: 0.76rem; color: #6B7A84; font-weight: 700; text-align: right; padding: 0.45rem 0.55rem;
+  border-bottom: 2px solid #E3E8EB; background: #F6F8F9; }
+.tv-tbl td { text-align: right; padding: 0.5rem 0.55rem; border-bottom: 1px solid #EEF1F3; color: #16212B; }
+.tv-tbl .l { text-align: left; }
+.tv-tbl td.now { font-weight: 800; }
+.tv-tbl tbody tr:nth-child(2n) td { border-bottom: 2px solid #E3E8EB; }
+.tv-x { min-width: 11rem; }
+.tv-bar { position: relative; height: 6px; background: #EEF1F3; border-radius: 3px; margin-bottom: 0.2rem; }
+.tv-bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.tv-bar b { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1.5px; background: #16212B; }
+.tv-x span { font-size: 0.82rem; font-weight: 700; }
+.tv-note { font-size: 0.74rem; color: #7A8A94; margin-top: 0.55rem; line-height: 1.5; }
+.st-key-no_translate { display: none !important; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -920,6 +956,96 @@ def _signal_panel(hist: dict, board: pd.DataFrame | None) -> str:
     return f'<div class="sig">{cells}</div>'
 
 
+def load_turnover_hist() -> dict:
+    return swr(("turnover",), 1800, data.fetch_market_turnover_hist, first_wait=False, empty={})
+
+
+def _shares_txt(v) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{v / 1e8:,.2f}억주" if v >= 1e8 else f"{v / 1e4:,.0f}만주"
+
+
+def _money_txt(v) -> str:
+    return "-" if v is None or pd.isna(v) else data.format_krw(v)
+
+
+def _ratio_cell(x) -> str:
+    if x is None or pd.isna(x):
+        return '<td class="tv-x">-</td>'
+    pct = (x - 1) * 100
+    col = UP if pct >= 10 else (DOWN if pct <= -10 else "#51616C")
+    word = "많음" if pct >= 10 else ("적음" if pct <= -10 else "비슷")
+    w = max(4, min(100, x / 2 * 100))
+    return (f'<td class="tv-x"><div class="tv-bar"><i style="width:{w:.0f}%;background:{col}"></i><b></b></div>'
+            f'<span style="color:{col}">{x:.2f}배 · {pct:+.0f}% {word}</span></td>')
+
+
+def _pct_cell(v) -> str:
+    if v is None or pd.isna(v):
+        return "<td>-</td>"
+    col = UP if v >= 10 else (DOWN if v <= -10 else "#51616C")
+    return f'<td style="color:{col};font-weight:700">{v:+.0f}%</td>'
+
+
+def render_turnover(overview: dict):
+    """코스피·코스닥 오늘 거래대금·거래량(실시간)과 평소(5·20·60일 평균) 대비."""
+    hist = load_turnover_hist()
+    if not hist:
+        st.caption("코스피·코스닥 거래대금 평균을 불러오는 중이에요. 잠시 뒤 새로고침하면 나와요.")
+        return
+    res = {m: data.market_turnover(hist.get(m), overview.get(m)) for m in data.MARKETS}
+    res = {m: r for m, r in res.items() if r}
+    if not res:
+        st.caption("코스피·코스닥 거래대금 자료를 받지 못했어요.")
+        return
+    any_r = next(iter(res.values()))
+    frac, is_open = any_r["frac"], any_r["open"]
+    when = f"장 진행 {frac * 100:.0f}% · 실시간" if is_open else "장 마감 기준(오늘 또는 마지막 거래일)"
+
+    # 요약 카드: 시장별 오늘 거래대금
+    chips = []
+    for m, r in res.items():
+        v = r["val"]
+        x = v["x_now"]
+        col = UP if (x or 1) >= 1.1 else (DOWN if (x or 1) <= 0.9 else "#51616C")
+        chips.append(
+            f'<div class="tv-chip"><div class="tv-chip-h">{m} 거래대금</div>'
+            f'<div class="tv-chip-v">{_money_txt(v["now"])}<small>원</small></div>'
+            f'<div class="tv-chip-s" style="color:{col}">{"이 시각 평소" if is_open else "20일 평균"}의 '
+            f'{(x if is_open else (v["now"] / v["a20"] if v["now"] else float("nan"))):.2f}배</div>'
+            f'<div class="tv-chip-f">마감 예상 {_money_txt(v["proj"])} · 20일 평균 {_money_txt(v["a20"])}</div></div>')
+    tot_now = sum((r["val"]["now"] or 0) for r in res.values())
+    tot_same = sum(r["val"]["same_time"] for r in res.values())
+    chips.append(
+        f'<div class="tv-chip tot"><div class="tv-chip-h">두 시장 합계</div>'
+        f'<div class="tv-chip-v">{_money_txt(tot_now)}<small>원</small></div>'
+        f'<div class="tv-chip-s">{"이 시각 평소" if is_open else "20일 평균"}의 {tot_now / tot_same if tot_same else float("nan"):.2f}배</div>'
+        f'<div class="tv-chip-f">{when}</div></div>')
+
+    rows = []
+    for m, r in res.items():
+        for key, lab, fmt in (("val", "거래대금", _money_txt), ("vol", "거래량", _shares_txt)):
+            v = r[key]
+            rows.append(
+                f'<tr><td class="l"><b>{m}</b></td><td class="l">{lab}</td>'
+                f'<td class="now">{fmt(v["now"])}</td><td>{fmt(v["same_time"]) if is_open else "-"}</td>'
+                f'{_ratio_cell(v["x_now"] if is_open else (v["now"] / v["a20"] if v["now"] else None))}'
+                f'<td>{fmt(v["proj"]) if is_open else fmt(v["now"])}</td>'
+                f'<td>{fmt(v["a5"])}</td><td>{fmt(v["a20"])}</td><td>{fmt(v["a60"])}</td>'
+                f'{_pct_cell(v["vs5"])}{_pct_cell(v["vs20"])}{_pct_cell(v["vs60"])}</tr>')
+    head = ("<tr><th class='l'>시장</th><th class='l'>항목</th><th>오늘 지금까지</th><th>같은 시각 평소</th>"
+            "<th>평소 대비</th><th>마감 예상</th><th>5일 평균</th><th>20일 평균</th><th>60일 평균</th>"
+            "<th>예상 vs 5일</th><th>예상 vs 20일</th><th>예상 vs 60일</th></tr>")
+    st.markdown(
+        f'<div class="tv-box"><div class="tv-title"><b>💵 코스피 · 코스닥 거래대금 · 거래량</b><span>{when}</span></div>'
+        f'<div class="tv-chips">{"".join(chips)}</div>'
+        f'<div class="tv-wrap"><table class="tv-tbl"><thead>{head}</thead><tbody>{"".join(rows)}</tbody></table></div>'
+        f'<div class="tv-note">같은 시각 평소 = 20일 평균 × 장 진행 비율 · 마감 예상 = 지금 속도 그대로 15:30까지 갔을 때 · '
+        f'장 초반·막판은 거래가 몰려서 예상이 크게 나올 수 있어요 · 평균은 30분마다, 오늘 값은 새로고침마다 갱신</div></div>',
+        unsafe_allow_html=True)
+
+
 def render_market(board: pd.DataFrame | None = None):
     """맨 위 시장 요약: 시장신호(신호등·지수 RS) → 코스피·코스닥 카드 + 오늘의 시장 → 해외 지수·환율·유가."""
     overview = load_overview()
@@ -929,6 +1055,7 @@ def render_market(board: pd.DataFrame | None = None):
                for idx in data.INDEXES}
     cards = "".join(_market_card(name, overview.get(name), hist_sm.get(name)) for name in data.MARKETS)
     st.markdown(f'<div class="mk-row">{cards}{_mood_card(overview)}</div>', unsafe_allow_html=True)
+    render_turnover(overview)
 
     chips = []
     for idx in data.INDEXES:
@@ -1395,9 +1522,17 @@ def render_stock_flow(code: str, trends: dict):
                "시장 전체 기준으로 위쪽 '투자자별 순매수 자세히'에 보여줘요.")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=300)
+def load_chart_all(code: str) -> dict:
+    """(속도) 일·주·월봉을 한 번에 동시에 받아 둬요. 봉 종류를 바꿔도 다시 기다리지 않아요."""
+    from concurrent.futures import ThreadPoolExecutor
+    tfs = list(data.CHART_TF)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        return dict(zip(tfs, pool.map(lambda tf: data.fetch_chart(code, tf), tfs)))
+
+
 def load_chart(code: str, tf: str) -> pd.DataFrame:
-    return data.fetch_chart(code, tf)
+    return load_chart_all(code).get(tf, data.empty_frame())
 
 
 MA_SET = {"일봉": ((5, "5일"), (20, "20일"), (60, "60일"), (120, "120일")),
@@ -1420,8 +1555,8 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
         b = b.tail(n)
     x = pd.to_datetime(b["date"]).dt.strftime("%Y-%m" if tf == "월봉" else "%Y-%m-%d")
     panels = ["price"] + (["vol"] if show_vol else []) + (["tv"] if show_tv else [])
-    heights = {1: [1.0], 2: [0.74, 0.26], 3: [0.62, 0.19, 0.19]}[len(panels)]
-    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.035, row_heights=heights)
+    heights = {1: [1.0], 2: [0.78, 0.22], 3: [0.68, 0.16, 0.16]}[len(panels)]
+    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.025, row_heights=heights)
     up_mask = [c >= o for o, c in zip(b["open"], b["close"])]
     fmt = ",.0f" if currency in ("KRW", "JPY") else ",.2f"
     fig.add_trace(go.Candlestick(
@@ -1458,7 +1593,7 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
                          row=r, col=1)
     fig.update_xaxes(type="category", nticks=8, showgrid=False, rangeslider_visible=False, tickangle=0,
                      tickfont=dict(size=12), showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
-    fig.update_layout(height={1: 480, 2: 600, 3: 700}[len(panels)], margin=dict(l=8, r=8, t=36, b=8),
+    fig.update_layout(height={1: 640, 2: 780, 3: 900}[len(panels)], margin=dict(l=4, r=4, t=36, b=6),
                       hovermode="x unified", dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
                       hoverlabel=dict(font_size=13),
                       legend=dict(orientation="h", y=1.05, x=0, font=dict(size=13)),
@@ -1477,7 +1612,7 @@ def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, hi
         default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
         per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
                                    width="stretch") or default_p
-        opts = c3.segmented_control("아래 칸에 표시", ["이동평균", "거래량", "거래대금"], selection_mode="multi",
+        opts = c3.segmented_control("표시", ["이동평균", "거래량", "거래대금"], selection_mode="multi",
                                     default=["이동평균", "거래량", "거래대금"], key=f"{key}_opts2", width="stretch") or []
     with st.spinner("차트를 불러오는 중이에요."):
         bars = load_chart(code, tf)
@@ -1500,7 +1635,13 @@ def naver_search(q: str) -> list[tuple[str, str]]:
         return []
 
 
+@st.fragment
 def render_chart_tab(df: pd.DataFrame, quotes: dict):
+    """(속도) 이 탭 안에서 검색·버튼을 눌러도 이 칸만 다시 그려요. 예전엔 보드 전체(600종목 계산·모든 탭)를 다시 돌려서 느렸어요."""
+    _render_chart_tab(df, quotes)
+
+
+def _render_chart_tab(df: pd.DataFrame, quotes: dict):
     """🕯️ 차트: 종목을 검색해서 일봉·주봉·월봉 캔들로 봐요."""
     board = df.drop_duplicates("code")
     labels = {r.code: f"{r.name} · {r.code} · {'한국' if data.is_kr(r.code) else r.market}" for r in board.itertuples()}
@@ -1575,7 +1716,13 @@ def render_chart_tab(df: pd.DataFrame, quotes: dict):
                  row["high52"] if row is not None and pd.notna(row.get("high52")) else None, key="tabchart")
 
 
+@st.fragment
 def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
+    """(속도) 종목을 바꾸거나 차트 버튼을 눌러도 이 칸만 다시 그려요."""
+    _render_detail(f, histories, trends)
+
+
+def _render_detail(f: pd.DataFrame, histories: dict, trends: dict):
     options = f[f["price"].notna()]
     if options.empty:
         return

@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-chart"
+DATA_VERSION = "2026-09-28-turnover"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -1249,8 +1249,108 @@ def parse_index_overview(basic: dict | None, integ: dict | None, polling: dict |
     pt = integ.get("programTrendInfo") or {}
     program = _num(pt.get("indexTotalReal"))
     status = basic.get("marketStatus") or pol.get("marketStatus")
+    raw_vol = _num(basic.get("accumulatedTradingVolume")) or _num(pol.get("accumulatedTradingVolume"))
+    raw_val = _num(basic.get("accumulatedTradingValue")) or _num(pol.get("accumulatedTradingValue"))
     return {"last": last, "diff": diff, "rate": rate, "time": basic.get("localTradedAt") or pol.get("localTradedAt"),
-            "breadth": breadth, "deal": deal, "program": program, "status": status}
+            "breadth": breadth, "deal": deal, "program": program, "status": status,
+            "raw_vol": raw_vol, "raw_val": raw_val}
+
+
+# ─────────────────────────── 코스피·코스닥 시장 거래대금 · 거래량 (평소 대비) ───────────────────────────
+INDEX_DAY_URL = "https://finance.naver.com/sise/sise_index_day.naver"
+
+
+def parse_index_day(text: str) -> list[dict]:
+    """일별 지수 표 → [{date, close, vol(천주), val(백만원)}]."""
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", text):
+        tds = re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)
+        if len(tds) < 6:
+            continue
+        cells = [re.sub(r"<[^>]+>", "", t).strip() for t in tds]
+        m = re.fullmatch(r"(\d{4})\.(\d{2})\.(\d{2})", cells[0])
+        if not m:
+            continue
+        rows.append({"date": pd.Timestamp(f"{m.group(1)}-{m.group(2)}-{m.group(3)}"), "close": to_num(cells[1]),
+                     "vol": to_num(cells[4]), "val": to_num(cells[5])})
+    return rows
+
+
+def fetch_index_turnover(code: str, pages: int = 11) -> pd.DataFrame:
+    """지수의 일별 거래량(주)·거래대금(원) 약 60거래일. 오늘 행은 장중이면 지금까지 누적이에요."""
+    if MOCK:
+        rng = _rng(code + "turn")
+        dates = pd.bdate_range(end=now_kst().date(), periods=66)
+        base_v, base_a = (560e6, 14e12) if code == "KOSPI" else (1050e6, 9.5e12)
+        rows = [{"date": d, "close": 0.0, "vol": base_v * rng.uniform(0.6, 1.5), "val": base_a * rng.uniform(0.6, 1.5)}
+                for d in dates]
+        return pd.DataFrame(rows)
+
+    def one(page):
+        try:
+            r = session.get(INDEX_DAY_URL, params={"code": code, "page": page}, timeout=8)
+            r.raise_for_status()
+            return parse_index_day(decode(r.content))
+        except requests.RequestException:
+            return []
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        rows = [x for part in pool.map(one, range(1, pages + 1)) for x in part]
+    if not rows:
+        return pd.DataFrame(columns=["date", "close", "vol", "val"])
+    df = pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    df["vol"] = df["vol"] * 1e3      # 천주 → 주
+    df["val"] = df["val"] * 1e6      # 백만원 → 원
+    return df
+
+
+def _fit_unit(raw: float | None, ref: float | None, mults=(1.0, 1e3, 1e6)) -> float | None:
+    """실시간 값의 단위를 모를 때 평소 값과 비슷한 자릿수가 되는 배수를 골라요."""
+    if not raw or not ref:
+        return None
+    frac = session_frac()
+    for m in mults:
+        x = raw * m / (ref * frac)
+        if 0.15 <= x <= 6:
+            return raw * m
+    return None
+
+
+def market_turnover(hist: pd.DataFrame, live: dict | None, today: date | None = None) -> dict | None:
+    """오늘(지금까지) 거래대금·거래량과 5·20·60일 평균, 같은 시각 평소 대비, 마감 예상."""
+    if hist is None or hist.empty:
+        return None
+    today = today or now_kst().date()
+    h = hist.copy()
+    is_today = h["date"].dt.date == today
+    past = h[~is_today].tail(60)
+    if len(past) < 5:
+        return None
+    frac = session_frac()
+    out = {"frac": frac, "open": frac < 1 and now_kst().weekday() < 5, "date": today}
+    for key in ("val", "vol"):
+        s_ = past[key]
+        a5, a20, a60 = s_.tail(5).mean(), s_.tail(20).mean(), s_.mean()
+        now_v = None
+        raw = (live or {}).get("raw_val" if key == "val" else "raw_vol")
+        if raw:
+            now_v = _fit_unit(raw, a20)
+        if now_v is None and is_today.any():
+            now_v = float(h.loc[is_today, key].iloc[-1])
+        if now_v is None and not out["open"]:        # 장 마감·주말: 마지막 거래일
+            now_v = float(h[key].iloc[-1])
+        proj = now_v / frac if now_v else None
+        out[key] = {"now": now_v, "a5": a5, "a20": a20, "a60": a60,
+                    "same_time": a20 * frac, "x_now": (now_v / (a20 * frac)) if now_v else None,
+                    "proj": proj, "vs5": (proj / a5 - 1) * 100 if proj else None,
+                    "vs20": (proj / a20 - 1) * 100 if proj else None, "vs60": (proj / a60 - 1) * 100 if proj else None,
+                    "last20": past[["date", key]].tail(20).rename(columns={key: "v"}).to_dict("records")}
+    return out
+
+
+def fetch_market_turnover_hist() -> dict[str, pd.DataFrame]:
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return dict(zip(MARKETS, pool.map(fetch_index_turnover, MARKETS.values())))
 
 
 def fetch_market_overview() -> dict[str, dict]:
@@ -1270,7 +1370,9 @@ def fetch_market_overview() -> dict[str, dict]:
                                      "하락": total - rise - steady, "하한": rng.randint(0, 2)},
                          "deal": {"개인": -(f + i) + rng.randint(-500, 500), "외국인": f, "기관": i,
                                   "bizdate": now_kst().strftime("%Y%m%d")},
-                         "program": rng.randint(-3000, 3000), "status": "OPEN"}
+                         "program": rng.randint(-3000, 3000), "status": "OPEN",
+                         "raw_vol": (560_000 if code == "KOSPI" else 1_050_000) * session_frac() * rng.uniform(0.7, 1.5),
+                         "raw_val": (14_000_000 if code == "KOSPI" else 9_500_000) * session_frac() * rng.uniform(0.7, 1.6)}
         return out
 
     def one(item):
