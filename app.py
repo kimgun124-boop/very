@@ -27,7 +27,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs",
             "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS",
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
-            "nh_candidates", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
+            "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths")
 if any(not hasattr(data, n) for n in REQUIRED):
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
@@ -380,6 +380,12 @@ def load_histories(codes: tuple[str, ...]):
 
 def load_histories_overseas(codes: tuple[str, ...]):
     return swr(("hist_os", codes), 900, lambda: data.fetch_histories(codes), "해외 종목 일봉을 불러오는 중이에요.")
+
+
+def load_official_52w(codes: tuple[str, ...]) -> dict:
+    """네이버 공식 52주 최고·최저(10분마다). 일봉으로 계산한 값과 대조해서 다르면 공식값으로 고쳐요."""
+    return swr(("h52", codes), 600, lambda: data.fetch_official_52w(codes),
+               "네이버 공식 52주 최고·최저가와 대조하는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
 def load_monthlies(codes: tuple[str, ...]):
@@ -1171,9 +1177,14 @@ def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
               f"{row.change:+.2f}%" if pd.notna(row.change) else None, delta_color="off")
     c2.metric("52주 최고", f"{fmt_price(row.high52, row.currency)}{unit}", f"{row.gap:.1f}%", delta_color="off")
     c3.metric("신고가까지", f"{row.to_high:+.1f}%",
-              "오늘 신고가" if row.days_since_high == 0 else f"고점 후 {row.days_since_high:.0f}거래일",
+              "오늘 신고가" if row.days_since_high == 0 else
+              (f"고점 후 {row.days_since_high:.0f}거래일" if pd.notna(row.days_since_high) else "고점 날짜 확인 필요"),
               delta_color="off")
     c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
+    if getattr(row, "h52_fixed", False) is True:
+        st.caption(f"⚠️ 52주 최고·최저를 네이버 공식값으로 고쳤어요. 일봉 계산값은 최고 "
+                   f"{fmt_price(row.high52_calc, row.currency)}{unit} · 최저 {fmt_price(row.low52_calc, row.currency)}{unit}였어요. "
+                   "이 종목은 일봉 기준 돌파 판정(매수 후보)을 보류해요.")
 
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("종합 RS", _n(row.rs), f"3M {_n(row.rs_3m)} · 6M {_n(row.rs_6m)}", delta_color="off", help=RS_HELP)
@@ -1919,6 +1930,19 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
     cap_missing = int(df["cap_krw"].isna().sum())
+    fixed = df[df["h52_fixed"] == True] if "h52_fixed" in df else df.iloc[0:0]  # noqa: E712
+    if not fixed.empty:
+        with st.expander(f"🔧 52주 최고·최저 교정 {len(fixed)}종목 — 네이버 공식값으로 고쳐서 보여주고 있어요"):
+            view = pd.DataFrame({
+                "종목": fixed["name"], "코드": fixed["code"],
+                "앱 계산 최고": fixed["high52_calc"], "네이버 최고": fixed["high52"],
+                "차이(%)": pd.to_numeric(fixed["h52_diff"], errors="coerce").round(1),
+                "앱 계산 최저": fixed["low52_calc"], "네이버 최저": fixed["low52"],
+            })
+            st.dataframe(view, hide_index=True)
+            st.caption("일봉 데이터로 계산한 값이 네이버 공식 52주 최고·최저와 0.3% 넘게 다른 종목이에요. "
+                       "주로 유·무상증자·액면분할로 과거 주가가 수정된 종목이에요. 표·괴리율·신고가까지는 공식값으로 보여주고, "
+                       "일봉 기준 돌파 판정이 틀릴 수 있어서 🎯 매수 후보에서는 '판정 보류'로 빼요. 매매 전에는 HTS 차트로 확인하세요.")
     if failed.empty and mismatch.empty and not quote_error and cap_missing == 0 and not PENDING_MISS:
         return
     n_items = len(failed) + len(mismatch) + (1 if cap_missing else 0) + len(PENDING_MISS)
@@ -2372,7 +2396,7 @@ def render_board():
     quotes, quote_error = load_quotes(KR_CODES)
     shares_store = load_shares()
     df = data.build_table(STOCKS, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
-                          monthlies=load_monthlies(ALL_CODES))
+                          monthlies=load_monthlies(ALL_CODES), official52=load_official_52w(KR_CODES))
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 

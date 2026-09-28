@@ -388,7 +388,7 @@ def _arrays(hist: pd.DataFrame):
 
 
 def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line",
-                    monthly: pd.DataFrame | None = None) -> dict:
+                    monthly: pd.DataFrame | None = None, official: dict | None = None) -> dict:
     """현재가·등락률·52주 최고/최저·괴리율·신고가 경과일·정배열 여부.
 
     (속도) 600종목을 30초마다 다시 계산하므로 pandas 대신 numpy 배열로 계산해요. 결과는 예전과 같아요.
@@ -398,6 +398,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         "price": None, "prev": None, "change": None, "high52": None, "low52": None,
         "gap": None, "to_high": None, "pos": None, "days_since_high": None,
         "aligned": None, "source": None,
+        "high52_calc": None, "low52_calc": None, "h52_diff": None, "h52_fixed": False, "h52_src": None,
         "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
         **{k: None for k in BO_KEYS},
         **{k: None for k in NH_KEYS},
@@ -444,6 +445,34 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         low52 = float(q_low)
     low52 = min(low52, price)
 
+    # 네이버 공식 52주 최고·최저와 대조. 차이가 H52_TOL%를 넘으면 공식값으로 고치고 표시해 둬요.
+    high52_calc, low52_calc = high52, low52
+    h52_diff, h52_fixed, h52_src = None, False, "일봉 계산"
+    off_hi = (official or {}).get("high52")
+    off_lo = (official or {}).get("low52")
+    if off_hi:
+        live_hi = max([float(x) for x in (q_high, price) if x] or [0.0])
+        final_hi = max(float(off_hi), live_hi)      # 공식값이 늦게 바뀌는 장중 신고가는 실시간 값이 우선
+        h52_diff = (high52_calc / final_hi - 1) * 100
+        if abs(h52_diff) > H52_TOL:
+            h52_fixed, h52_src = True, "네이버 공식(교정)"
+            high52 = final_hi
+            if live_hi >= final_hi:
+                days_since = 0
+            else:
+                near = np.where(np.abs(w_hi / final_hi - 1) * 100 <= H52_TOL)[0]
+                days_since = int((w_d > w_d[near[-1]]).sum()) if len(near) else None
+        else:
+            h52_src = "네이버 공식과 일치"
+    if off_lo:
+        live_lo = min([float(x) for x in (q_low, price) if x] or [float(off_lo)])
+        final_lo = min(float(off_lo), live_lo)
+        if abs(low52_calc / final_lo - 1) * 100 > H52_TOL:
+            low52 = final_lo
+            h52_fixed = True
+            if h52_src != "네이버 공식(교정)":
+                h52_src = "네이버 공식(최저가 교정)"
+
     # 현재가·장중 고가를 오늘 일봉에 반영한 사본으로 정배열·ATR·수익률·돌파 유지를 계산해요.
     cc, hh, ll = closes0.copy(), highs.copy(), lows.copy()
     if last_is_today:
@@ -469,6 +498,11 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         days_since_high=days_since,
         aligned=aligned,
         source=source,
+        high52_calc=high52_calc,
+        low52_calc=low52_calc,
+        h52_diff=h52_diff,
+        h52_fixed=h52_fixed,
+        h52_src=h52_src,
     )
 
     res["atr_pct"] = _atr_np(hh, ll, cc, ATR_DAYS)
@@ -817,6 +851,86 @@ def _detail_api_shares(code: str) -> int | None:
         return None
     n = _num(info.get("listedStockCnt"))
     return int(n) if n and n > 0 else None
+
+
+# ─────────────────────────── 네이버 공식 52주 최고·최저 (대조·교정용) ───────────────────────────
+H52_TOL = 0.3   # %. 일봉으로 계산한 값과 네이버 공식값이 이보다 더 차이 나면 '다르다'로 보고 공식값으로 고쳐요
+
+
+def _pick_52w_items(items, found: dict):
+    """[{code, key, value}, ...] 형식(integration의 totalInfos)에서 52주 최고·최저를 찾아요."""
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        lab = f'{it.get("code") or ""} {it.get("key") or ""} {it.get("title") or ""}'
+        if "52" not in lab:
+            continue
+        v = _num(it.get("value"))
+        if not v or v <= 0:
+            continue
+        if re.search(r"high|최고", lab, re.I):
+            found.setdefault("high52", v)
+        elif re.search(r"low|최저", lab, re.I):
+            found.setdefault("low52", v)
+
+
+def _find_52w_keys(node, found: dict):
+    """필드 이름에 52와 high/low가 들어간 값을 찾아요(응답 모양이 바뀌어도 되도록)."""
+    if isinstance(node, dict):
+        if "value" in node and ("code" in node or "key" in node):
+            _pick_52w_items([node], found)
+        for k, v in node.items():
+            kl = str(k).lower()
+            if isinstance(v, (dict, list)):
+                _find_52w_keys(v, found)
+            elif "52" in kl:
+                n = _num(v)
+                if n and n > 0:
+                    if "high" in kl or "max" in kl:
+                        found.setdefault("high52", n)
+                    elif "low" in kl or "min" in kl:
+                        found.setdefault("low52", n)
+    elif isinstance(node, list):
+        for v in node:
+            _find_52w_keys(v, found)
+
+
+def _official_52w_one(code: str) -> dict:
+    """한 종목의 네이버 공식 52주 최고·최저. ① 모바일 integration ② 종목 메인 페이지 ③ 종목 상세 API 순서."""
+    found: dict = {}
+    info = _get_json([f"{NAVER_MOBILE}/{code}/integration"], timeout=6)
+    if isinstance(info, dict):
+        _pick_52w_items(info.get("totalInfos"), found)
+        if "high52" not in found:
+            _find_52w_keys(info, found)
+    if "high52" not in found:
+        try:
+            r = session.get(ITEM_MAIN_URL, params={"code": code}, timeout=6)
+            r.raise_for_status()
+            m = re.search(r"52주최고[\s\S]{0,300}?<em[^>]*>\s*([\d,]+)\s*</em>[\s\S]{0,200}?<em[^>]*>\s*([\d,]+)\s*</em>",
+                          decode(r.content))
+            if m:
+                found["high52"], found["low52"] = to_num(m.group(1)), to_num(m.group(2))
+        except requests.RequestException:
+            pass
+    if "high52" not in found:
+        info = _get_json([f"{STOCK_API}/domestic/detail/{code}/detail"], params={"codeType": "KRX"}, timeout=6)
+        if isinstance(info, dict):
+            _find_52w_keys(info, found)
+    return {k: float(v) for k, v in found.items() if v}
+
+
+def fetch_official_52w(codes) -> dict[str, dict]:
+    """국내 종목의 네이버 공식 52주 최고·최저 {코드: {high52, low52}}. 못 받은 종목은 빠져요(일봉 계산값을 그대로 써요)."""
+    codes = [c for c in codes if is_kr(c)]
+    if MOCK:
+        return {}
+    out: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for code, got in zip(codes, pool.map(_official_52w_one, codes)):
+            if got.get("high52"):
+                out[code] = got
+    return out
 
 
 def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
@@ -1460,26 +1574,29 @@ def resolve_codes(names) -> tuple[dict[str, str], dict[str, list[tuple[str, str]
 _metrics_memo: dict[str, tuple] = {}
 
 
-def _metrics_cached(code: str, hist, quote, monthly, bo_mode: str) -> dict:
+def _metrics_cached(code: str, hist, quote, monthly, bo_mode: str, official: dict | None = None) -> dict:
     """일봉·월봉이 같은 객체이고 시세(현재가·전일·고가·저가)도 그대로면 지난 계산 결과를 다시 써요.
     장 마감 뒤나 거래가 뜸한 종목은 30초마다 다시 계산하지 않아도 돼요."""
     qkey = (quote.get("price"), quote.get("prev"), quote.get("high"), quote.get("low")) if quote else None
     today = now_kst().date()
+    okey = (official.get("high52"), official.get("low52")) if official else None
     m = _metrics_memo.get(code)
-    if m and m[0] is hist and m[1] is monthly and m[2] == qkey and m[3] == today and m[4] == bo_mode:
-        return m[5]
-    res = compute_metrics(hist, quote, today=today, bo_mode=bo_mode, monthly=monthly)
-    _metrics_memo[code] = (hist, monthly, qkey, today, bo_mode, res)
+    if (m and m[0] is hist and m[1] is monthly and m[2] == qkey and m[3] == today and m[4] == bo_mode
+            and m[5] == okey):
+        return m[6]
+    res = compute_metrics(hist, quote, today=today, bo_mode=bo_mode, monthly=monthly, official=official)
+    _metrics_memo[code] = (hist, monthly, qkey, today, bo_mode, okey, res)
     return res
 
 
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
                 shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line",
-                monthlies: dict | None = None) -> pd.DataFrame:
+                monthlies: dict | None = None, official52: dict | None = None) -> pd.DataFrame:
     rows = []
     for s in stocks:
         naver_name, hist, error = histories.get(s["code"], (None, empty_frame(), "조회 안 됨"))
-        metrics = _metrics_cached(s["code"], hist, quotes.get(s["code"]), (monthlies or {}).get(s["code"]), bo_mode)
+        metrics = _metrics_cached(s["code"], hist, quotes.get(s["code"]), (monthlies or {}).get(s["code"]), bo_mode,
+                                  (official52 or {}).get(s["code"]))
         market, currency = market_of(s["code"])
         n_shares = (shares or {}).get(s["code"])
         cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
@@ -1960,7 +2077,9 @@ def buy_checks(r, market_ok: bool | None, market_text: str, leaders: set, p: dic
         head = ("👑 대장주" if lr == 1 else f"섹터 {int(lr)}위") if ok else f"섹터 {int(lr)}위(RS 70 미만)"
         c["top"] = (ok and lr <= p.get("top_n", 1), f"{head}/{int(ln)}종목 ({', '.join(parts)})")
     days = num(r.get("bo_days"))
-    if r.get("bo_status") == "유지" and days is not None:
+    if r.get("h52_fixed") is True and num(r.get("h52_diff")) is not None:
+        c["breakout"] = (None, f"판정 보류 — 일봉 최고가가 네이버 52주 최고가와 {r.get('h52_diff'):+.1f}% 달라요(HTS 확인)")
+    elif r.get("bo_status") == "유지" and days is not None:
         nth = num(r.get("bo_nth"))
         nth_txt = (" · 52주 안 첫 돌파" if nth == 1 else f" · 52주 안 {int(nth)}번째 돌파") if nth else ""
         ok = days <= p["fresh_days"] and (nth == 1 or not p.get("first_only"))
@@ -2645,7 +2764,7 @@ def _session_bars(hist: pd.DataFrame, quote: dict | None, today: date | None = N
 
 
 def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = None, lookback: int = 250,
-                 spark_n: int = 120, p: dict | None = None) -> dict:
+                 spark_n: int = 120, p: dict | None = None, ref_override: float | None = None) -> dict:
     """신고가 후보 상태.
 
     기준가 = 지금 세션을 뺀 직전 250거래일 최고가(장중 고가). 상태:
@@ -2667,7 +2786,7 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
     prior = prior[np.isfinite(prior)]
     if not len(prior):
         return out
-    ref = float(prior.max())
+    ref = float(ref_override) if ref_override else float(prior.max())
     price, hi_now = float(c[-1]), float(h[-1])
     dist = (ref / price - 1) * 100
     if price > ref:
@@ -2710,7 +2829,12 @@ def nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | Non
         if not is_kr(code):
             continue
         hist = (histories.get(code) or (None, None, None))[1]
-        res = nh_candidate(hist, quotes.get(code), today=today, p=p)
+        # 일봉 최고가가 네이버 공식값과 달라 교정된 종목: 오늘 이전에 쓴 52주 최고가를 기준가로 써요
+        ref = None
+        if r.get("h52_fixed") is True and r.get("days_since_high") == r.get("days_since_high") \
+                and (r.get("days_since_high") or 0) > 0 and r.get("high52") == r.get("high52"):
+            ref = float(r["high52"])
+        res = nh_candidate(hist, quotes.get(code), today=today, p=p, ref_override=ref)
         if res["nh_state"] is None:
             continue
         rows.append({"code": code, **res})
