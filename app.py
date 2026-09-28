@@ -98,6 +98,44 @@ st.markdown(
 .chip-count small { font-size: 0.72rem; font-weight: 600; margin-left: 0.1rem; }
 .chip-names { color: #B9C7CF; font-size: 0.8rem; line-height: 1.45; margin-top: 0.2rem; }
 .radar-empty { color: #9FB0BA; font-size: 0.9rem; }
+/* ── 사이드바(보기 설정) ── */
+[data-testid="stSidebar"] { background: #F6F8F9; border-right: 1px solid #E3E8EB; }
+[data-testid="stSidebar"] .block-container, [data-testid="stSidebarUserContent"] { padding-top: 1.2rem; }
+.sb-title { font-size: 1.15rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em;
+            padding-bottom: 0.55rem; margin-bottom: 0.4rem; border-bottom: 2px solid #16212B; }
+[data-testid="stSidebar"] label p { font-size: 0.8rem !important; font-weight: 700 !important; color: #3A4852 !important; }
+[data-testid="stSidebar"] [data-testid="stButtonGroup"] button { border-radius: 8px; }
+[data-testid="stSidebar"] [role="radiogroup"]:has(> button[data-variant="segmented_control"]) {
+  display: flex !important; flex-wrap: nowrap !important; width: 100%; }
+[data-testid="stSidebar"] button[data-variant="segmented_control"] {
+  flex: 1 1 0 !important; min-width: 0 !important; padding: 0.35rem 0.2rem !important; }
+[data-testid="stSidebar"] [data-testid="stButtonGroup"] button[data-selected="true"] {
+  background: #16212B !important; border-color: #16212B !important; }
+[data-testid="stSidebar"] [data-testid="stButtonGroup"] button[data-selected="true"] p {
+  color: #FFFFFF !important; font-weight: 700; }
+[data-testid="stSidebar"] [data-testid="stExpander"] details { background: #FFFFFF; }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-weight: 700; color: #16212B; }
+/* ── 메인 탭: 기본 · 종목 시그널 · 섹터 흐름 3묶음으로 나눠 보이게 ── */
+.st-key-main_tabs [role="tablist"] { gap: 0.3rem; border-bottom: 2px solid #DCE3E7; padding-bottom: 0; }
+.st-key-main_tabs [role="tab"] {
+  position: relative; --gc: #51616C; --gt: #F1F4F6;
+  background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
+  border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
+.st-key-main_tabs [role="tab"]:nth-child(n+2):nth-child(-n+4) { --gc: #E0672B; --gt: #FDF3EC; }
+.st-key-main_tabs [role="tab"]:nth-child(n+5) { --gc: #1F66C9; --gt: #EEF4FC; }
+.st-key-main_tabs [role="tab"]:nth-child(2),
+.st-key-main_tabs [role="tab"]:nth-child(5) { margin-left: 0.9rem; }
+.st-key-main_tabs [role="tab"]::before {
+  position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
+  letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
+.st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
+.st-key-main_tabs [role="tab"]:nth-child(2)::before { content: "종목 시그널"; }
+.st-key-main_tabs [role="tab"]:nth-child(5)::before { content: "섹터 흐름"; }
+.st-key-main_tabs [role="tab"] p { color: #3A4852; }
+.st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
+.st-key-main_tabs [role="tab"][aria-selected="true"] p,
+.st-key-main_tabs [role="tab"][aria-selected="true"]::before { color: #FFFFFF !important; }
+.st-key-main_tabs .react-aria-SelectionIndicator, .st-key-main_tabs [data-baseweb="tab-highlight"], .st-key-main_tabs [data-baseweb="tab-border"] { display: none; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -487,45 +525,77 @@ NH_FILTERS = {
 }
 
 # ─────────────────────────── 사이드바 ───────────────────────────
-with st.sidebar:
-    st.subheader("보기 설정")
-    sectors = st.multiselect("산업", SECTOR_ORDER, default=["반도체"], placeholder="전체")
-    active_sectors = sectors or SECTOR_ORDER
-    group_choices = [g for g in GROUP_ORDER
-                     if any(s["group"] == g and s["sector"] in active_sectors for s in STOCKS)]
-    groups = st.multiselect("세부 분류", group_choices, placeholder="전체")
-    tags = st.multiselect("리포트 태그", list(TAGS), placeholder="선택 안 함",
-                          help="태그를 고르면 위의 산업·분류와 관계없이 전체 종목에서 그 리포트에 나온 종목만 보여줘요.")
-    query = st.text_input("종목 검색", placeholder="이름이나 코드")
-    max_drop = st.slider("52주 최고가에서 몇 % 이내만 볼까요", 0, 90, 90, step=5,
-                         help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
-    only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
-    only_holding = st.toggle("신고가 돌파 유지 종목만",
-                             help="직전 52주 최고가를 종가로 돌파한 뒤 한 번도 그 아래에서 마감하지 않은 종목만")
-    nh_filter = st.selectbox("신고가 봉 필터", list(NH_FILTERS), index=0,
-                             help="지금 봉(오늘 일봉·이번 주 주봉·이번 달 월봉)의 고가가 52주 또는 역대(상장 이후) 최고가를 넘은 종목만")
-    min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
-    only_earn = st.toggle("영업이익·EPS 정배열만",
-                          help="최근 실적 연도부터 컨센서스(E)까지 영업이익과 EPS가 해마다 모두 증가한 국내 종목만. "
-                               "전망(E)이 없는 종목·적자 종목·해외 종목은 빠져요. 처음 켤 때 종목 수에 따라 30초~1분 걸려요.")
-    earn_years = st.radio("실적 정배열 판정: 최근 실적 몇 년부터", [2, 3], index=1, horizontal=True,
-                          format_func=lambda n: f"{n}년 + 전망(E)")
-    show_flow = st.toggle("종목별 수급 열 보기", value=True,
-                          help="국내 종목의 최근 거래일 개인·외국인·기관 순매수(억원, 종가로 환산한 추정치)와 5일 누적을 표에 붙여요. "
-                               "보고 있는 종목 중 앞쪽 150개까지만 불러와요.")
+MARKETS = {"🇰🇷 한국": "KR", "🇺🇸 미국": "US", "🌏 기타": "OTHER"}
 
-    st.divider()
-    st.caption("주도섹터 기준")
-    recent_days = st.slider("신고가로 인정할 기간(거래일)", 1, 20, 5)
-    min_count = st.slider("분류 안 신고가 종목 수", 2, 5, 2)
+
+def _mkt(code: str) -> str:
+    m = data.market_of(code)[0]
+    return m if m in ("KR", "US") else "OTHER"
+
+
+with st.sidebar:
+    st.markdown('<div class="sb-title">보기 설정</div>', unsafe_allow_html=True)
+
+    # ① 시장 — 한국·미국을 아예 나눠서 봐요
+    market_label = st.segmented_control("시장", list(MARKETS), default="🇰🇷 한국", required=True,
+                                        key="sb_market", width="stretch")
+    market = MARKETS[market_label or "🇰🇷 한국"]
+    mkt_stocks = [x for x in STOCKS if _mkt(x["code"]) == market]
+
+    # ② 산업 — 아무것도 안 고르면 그 시장 전체
+    sector_choices = [sec for sec in SECTOR_ORDER if any(x["sector"] == sec for x in mkt_stocks)]
+    sector_choices += sorted({x["sector"] for x in mkt_stocks} - set(sector_choices))
+    sec_count = {sec: sum(x["sector"] == sec for x in mkt_stocks) for sec in sector_choices}
+    sectors = st.pills("산업", sector_choices, selection_mode="multi", key=f"sb_sectors_{market}",
+                       format_func=lambda sec: f"{sec.replace('(해외)', '')} {sec_count[sec]}",
+                       help="안 고르면 이 시장 전체를 보여줘요. 여러 개 고를 수 있어요.")
+    active_sectors = sectors or sector_choices
+
+    # ③ 세부 분류 · 리포트 태그 · 검색
+    group_choices = [g for g in GROUP_ORDER
+                     if any(x["group"] == g and x["sector"] in active_sectors for x in mkt_stocks)]
+    group_pick = st.selectbox("세부 분류", ["전체", *group_choices], key=f"sb_group_{market}")
+    groups = [] if group_pick == "전체" else [group_pick]
+    tag_choices = [t for t in TAGS if any(t in x["tags"] for x in mkt_stocks)]
+    tags = st.multiselect("리포트 태그", tag_choices, placeholder="선택 안 함", key=f"sb_tags_{market}",
+                          help="태그를 고르면 위의 산업·분류와 관계없이 이 시장 전체에서 그 리포트에 나온 종목만 보여줘요.")
+    query = st.text_input("종목 검색", placeholder="🔍 이름이나 코드", key="sb_query")
+    st.caption(f"{market_label} 종목 {len(mkt_stocks)}개 중 "
+               f"{'전체 산업' if not sectors else ', '.join(s_.replace('(해외)', '') for s_ in sectors)}")
+
+    # ④ 조건 필터 — 평소엔 접어 둬요
+    with st.expander("📐 조건 필터", expanded=False):
+        max_drop = st.slider("52주 최고가에서 몇 % 이내만 볼까요", 0, 90, 90, step=5,
+                             help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
+        min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
+        nh_filter = st.selectbox("신고가 봉 필터", list(NH_FILTERS), index=0,
+                                 help="지금 봉(오늘 일봉·이번 주 주봉·이번 달 월봉)의 고가가 52주 또는 역대(상장 이후) 최고가를 넘은 종목만")
+        only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
+        only_holding = st.toggle("신고가 돌파 유지 종목만",
+                                 help="직전 52주 최고가를 종가로 돌파한 뒤 한 번도 그 아래에서 마감하지 않은 종목만")
+        only_earn = st.toggle("영업이익·EPS 정배열만",
+                              help="최근 실적 연도부터 컨센서스(E)까지 영업이익과 EPS가 해마다 모두 증가한 국내 종목만. "
+                                   "전망(E)이 없는 종목·적자 종목·해외 종목은 빠져요. 처음 켤 때 종목 수에 따라 30초~1분 걸려요.")
+        earn_years = st.radio("실적 정배열 판정: 최근 실적 몇 년부터", [2, 3], index=1, horizontal=True,
+                              format_func=lambda n: f"{n}년 + 전망(E)")
+        show_flow = st.toggle("종목별 수급 열 보기", value=True, disabled=(market != "KR"),
+                              help="국내 종목의 최근 거래일 개인·외국인·기관 순매수(억원, 종가로 환산한 추정치)와 5일 누적을 표에 붙여요. "
+                                   "보고 있는 종목 중 앞쪽 150개까지만 불러와요.")
+        show_flow = show_flow and market == "KR"   # 해외는 수급 자료가 없어서 열을 숨겨요
+
+    with st.expander("🧭 주도섹터 기준", expanded=False):
+        recent_days = st.slider("신고가로 인정할 기간(거래일)", 1, 20, 5)
+        min_count = st.slider("분류 안 신고가 종목 수", 2, 5, 2)
 
     bo_mode = "line"   # 돌파선 = 돌파한 날 넘어선 직전 52주 최고가
 
     st.divider()
-    refresh_label = st.radio("자동 새로고침", list(REFRESH), index=1, horizontal=True)
-    if st.button("시세 지금 새로고침"):
+    refresh_label = st.segmented_control("자동 새로고침", list(REFRESH), default="1분", required=True,
+                                         key="sb_refresh", width="stretch") or "1분"
+    b1, b2 = st.columns(2)
+    if b1.button("시세 새로고침", width="stretch"):
         load_quotes.clear()
-    if st.button("일봉까지 다시 받기", help="52주 최고가가 이상해 보일 때 눌러요."):
+    if b2.button("일봉 다시 받기", width="stretch", help="52주 최고가가 이상해 보일 때 눌러요."):
         swr_clear("hist_kr", "hist_os", "monthly")
         _shares_store().update(t=0.0, ok=False)
         load_quotes.clear()
@@ -533,6 +603,7 @@ with st.sidebar:
 
 # ─────────────────────────── 화면 조각 ───────────────────────────
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    df = df[df["code"].map(_mkt) == market]
     if tags:
         f = df[df["tags"].apply(lambda ts: any(t in ts for t in tags))]
     else:
@@ -807,6 +878,31 @@ def render_radar(df: pd.DataFrame):
     )
 
 
+def fmt_vol(v) -> str:
+    """거래량 → '449만' / '3.5만' / '1.2억' / '8,512'."""
+    if v is None or pd.isna(v):
+        return "-"
+    if v >= 1e8:
+        return f"{v / 1e8:,.1f}억"
+    if v >= 1e5:
+        return f"{v / 1e4:,.0f}만"
+    if v >= 1e4:
+        return f"{v / 1e4:,.1f}만"
+    return f"{v:,.0f}"
+
+
+def _x_color(v) -> str:
+    if v is None or pd.isna(v):
+        return ""
+    if v >= 2:
+        return f"color: {UP}; font-weight: 800"
+    if v >= 1.3:
+        return f"color: {UP}; font-weight: 600"
+    if v < 0.7:
+        return f"color: {DOWN}"
+    return ""
+
+
 def _eok_num(v) -> str:
     """억원 값: 10억 미만은 소수 첫째 자리까지."""
     if v is None or pd.isna(v):
@@ -897,6 +993,9 @@ def render_table(f: pd.DataFrame):
         "현재가": f["price"],
         "시가총액(원)": f["cap_krw"],
         "등락률": f["change"],
+        "거래량": f["vol_live"],
+        "거래대금": f["tv_live"],
+        "평소 대비": f["tv_x"],
         **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
             "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
             "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
@@ -921,7 +1020,7 @@ def render_table(f: pd.DataFrame):
 
     simple = st.toggle("간단히 보기", key="tbl_simple", help="꼭 볼 열만: 신고가까지 · 돌파 · RS · 섹터 순위 · 5일 수급")
     if simple:
-        keep = ["종목", "현재가", "등락률", "신고가까지", "돌파", "RS", "섹터 순위", "분류", "시가총액(원)",
+        keep = ["종목", "현재가", "등락률", "거래량", "평소 대비", "신고가까지", "돌파", "RS", "섹터 순위", "분류", "시가총액(원)",
                 "외국인 5일(억원)", "기관 5일(억원)", "52주 위치"]
         view = view[[c for c in keep if c in view.columns]]
     hot_mask = (pd.to_numeric(f["days_since_high"], errors="coerce") <= recent_days).values
@@ -948,6 +1047,7 @@ def render_table(f: pd.DataFrame):
             "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
             "RS": "{:.0f}", "RS(1M)": "{:.0f}", "RS(3M)": "{:.0f}", "RS(6M)": "{:.0f}",
             "ATR%(20일)": "{:.1f}%",
+            "거래량": fmt_vol, "거래대금": data.format_krw, "평소 대비": "{:.1f}배",
         }
     styled = (
         view.style
@@ -959,6 +1059,7 @@ def render_table(f: pd.DataFrame):
         .map(_rs_color, subset=[c for c in ("RS", "RS(1M)", "RS(3M)", "RS(6M)") if c in view.columns])
         .map(_bo_color, subset=["돌파"])
         .map(_to_high_color, subset=["신고가까지"])
+        .map(_x_color, subset=[c for c in ("평소 대비",) if c in view.columns])
         .map(lambda v: f"color: {UP}; font-weight: 700" if isinstance(v, str) else "",
              subset=[c for c in ("52주 신고가(일·주·월)", "역대 신고가(일·주·월)") if c in view.columns])
         .apply(mark_new_high, axis=1)
@@ -1441,6 +1542,108 @@ def _score_bars(v: pd.DataFrame):
         tooltip=["종목:N", "구성:N", alt.Tooltip("점수:Q", format=".0f")],
     ).properties(height=max(160, 24 * len(order)), width="container")
     st.altair_chart(c)
+
+
+def render_money(df: pd.DataFrame):
+    """💰 거래대금: 지금 어느 섹터에 돈(거래대금)이 몰리는지 + 종목별 실시간 거래량."""
+    d = df[df["code"].map(_mkt) == market].copy()
+    for c in ("tv_live", "tv_x", "vol_live", "change", "price"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d[d["tv_live"].notna()]
+    if d.empty:
+        st.info("거래량 자료가 아직 없어요. 잠시 뒤 새로고침해 보세요.")
+        return
+    live = (d["vol_src"] == "실시간").any()
+    frac = data.session_frac()
+    when = (f"실시간 · 장 진행 {frac * 100:.0f}%" if live and frac < 1 else "실시간(오늘 누적)") if live else "최근 거래일 기준"
+    st.markdown(f'<div class="sec-h"><b>💰 지금 돈이 몰리는 섹터</b><span>{when} · 보드에 넣은 {market_label} 종목 기준</span></div>',
+                unsafe_allow_html=True)
+
+    by = st.segmented_control("묶는 기준", ["세부 분류", "산업"], default="세부 분류", required=True,
+                              key="money_by", label_visibility="collapsed") or "세부 분류"
+    sm = data.sector_money(d, "group" if by == "세부 분류" else "sector")
+    total = d["tv_live"].sum()
+    has = d["tv_x"].notna() & (d["tv_x"] > 0)
+    base = (d.loc[has, "tv_live"] / d.loc[has, "tv_x"]).sum() if has.any() else None
+    tv_b = d.loc[has, "tv_live"].sum()
+    hot = sm[(sm["x"] >= 1.3) & (sm["n"] >= 2)].sort_values("x", ascending=False)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("보드 전체 거래대금", data.format_krw(total) + ("원" if market == "KR" else ""))
+    c2.metric("평소 대비", f"{tv_b / base:.2f}배" if base else "-", help="직전 20거래일 평균 거래대금을 지금 시각까지로 환산해 비교")
+    c3.metric("거래대금 1위 섹터", sm.iloc[0]["sector"] if len(sm) else "-",
+              f"비중 {sm.iloc[0]['share']:.1f}%" if len(sm) else None, delta_color="off")
+    c4.metric("평소보다 뜨거운 섹터", hot.iloc[0]["sector"] if len(hot) else "없음",
+              f"{hot.iloc[0]['x']:.1f}배" if len(hot) else None, delta_color="off")
+
+    top = sm.head(15).copy()
+    top["label"] = top["sector"].astype(str).str.replace("(해외)", "", regex=False)
+    top["tv_eok"] = top["tv"] / 1e8
+    top["heat"] = top["x"].apply(lambda v: "평소의 2배 이상" if v == v and v >= 2 else
+                                 ("1.3~2배" if v == v and v >= 1.3 else ("평소 수준" if v == v and v >= 0.7 else "평소보다 적음")))
+    chart = (
+        alt.Chart(top)
+        .mark_bar(cornerRadiusEnd=4)
+        .encode(
+            y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200, labelOverlap=False)),
+            x=alt.X("tv_eok:Q", title="거래대금(억)" if market == "KR" else "거래대금(현지 통화, 억)"),
+            color=alt.Color("heat:N", title="평소 대비",
+                            scale=alt.Scale(domain=["평소의 2배 이상", "1.3~2배", "평소 수준", "평소보다 적음"],
+                                            range=[UP, "#F08A8F", "#9FB0BA", "#7FA7DE"]),
+                            legend=alt.Legend(orient="top")),
+            tooltip=[alt.Tooltip("label:N", title="섹터"), alt.Tooltip("tv_eok:Q", title="거래대금(억)", format=",.0f"),
+                     alt.Tooltip("share:Q", title="비중(%)", format=".1f"), alt.Tooltip("x:Q", title="평소 대비(배)", format=".2f"),
+                     alt.Tooltip("chg:Q", title="등락(거래대금 가중, %)", format="+.2f"), alt.Tooltip("top:N", title="상위 종목")],
+        )
+        .properties(height=max(220, 26 * len(top)), width="container")
+    )
+    st.altair_chart(chart)
+
+    view = pd.DataFrame({
+        "섹터": sm["sector"], "거래대금": sm["tv"], "비중": sm["share"], "평소 대비": sm["x"],
+        "등락(가중)": sm["chg"], "상승/하락": sm.apply(lambda r: f"{r['up']} / {r['down']}", axis=1),
+        "종목 수": sm["n"], "거래대금 상위 종목": sm["top"],
+    })
+    st.dataframe(
+        view.style.format({"거래대금": data.format_krw, "비중": "{:.1f}%", "평소 대비": "{:.2f}배", "등락(가중)": "{:+.2f}%"},
+                          na_rep="-")
+        .map(_x_color, subset=["평소 대비"])
+        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}; font-weight: 600",
+             subset=["등락(가중)"]),
+        hide_index=True, height=min(420, 36 * (len(view) + 1) + 4),
+        column_config={"섹터": st.column_config.Column(pinned=True)})
+    st.caption("평소 대비 = 지금까지 거래대금 ÷ (직전 20거래일 평균 거래대금 × 장 진행 비율). 1.3배 이상이면 평소보다 돈이 더 도는 섹터예요. "
+               "장 초반(9시~9시 30분)에는 거래가 몰려서 배수가 크게 나오기 쉬워요. 거래대금만으로는 사는 돈인지 파는 돈인지 모르니 등락과 같이 보세요.")
+
+    st.markdown('<div class="sec-h"><b>📊 종목별 실시간 거래량</b><span>거래대금 많은 순</span></div>', unsafe_allow_html=True)
+    c1, c2 = st.columns([2, 1])
+    pick = c1.selectbox("섹터", ["전체", *sm["sector"].tolist()], key="money_pick", label_visibility="collapsed")
+    n_show = c2.segmented_control("표시", [30, 100, "전체"], default=30, required=True, key="money_n",
+                                  label_visibility="collapsed") or 30
+    col = "group" if by == "세부 분류" else "sector"
+    t = d if pick == "전체" else d[d[col] == pick]
+    t = t.sort_values("tv_live", ascending=False)
+    if n_show != "전체":
+        t = t.head(int(n_show))
+    tv_view = pd.DataFrame({
+        "종목": t["name"], "분류": t["group"], "현재가": t["price"], "일간%": t["change"],
+        "거래량": t["vol_live"], "거래대금": t["tv_live"], "평소 대비": t["tv_x"],
+    })
+    whole = tv_view.index[t["currency"].isin(["KRW", "JPY"]).values]
+    st.dataframe(
+        tv_view.style
+        .format({"현재가": "{:,.2f}", "일간%": "{:+.2f}%", "거래량": fmt_vol, "거래대금": data.format_krw,
+                 "평소 대비": "{:.1f}배"}, na_rep="-")
+        .format("{:,.0f}", subset=pd.IndexSlice[whole, ["현재가"]], na_rep="-")
+        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}; font-weight: 600", subset=["일간%"])
+        .map(_x_color, subset=["평소 대비"])
+        .map(lambda _: "font-weight: 600", subset=["종목"]),
+        hide_index=True, height=min(760, 36 * (len(tv_view) + 1) + 4),
+        column_config={"종목": st.column_config.Column(pinned=True)})
+    if market == "KR":
+        st.caption("거래량은 네이버 실시간 누적(몇 초 지연)이에요. 자동 새로고침 주기마다 바뀌어요. 매매 전에는 HTS로 다시 확인하세요.")
+    else:
+        st.caption("해외 종목은 실시간 거래량을 받지 않아서 최근 거래일 일봉 기준이에요.")
 
 
 def render_engine(df: pd.DataFrame, trends, leaders: set, fins=None):
@@ -2412,9 +2615,13 @@ def render_board():
     leaders_now = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
     render_market(df)
-    render_radar(df)
-    t_list, t_nh, t_vs, t_buy, t_eng, t_next, t_scn = st.tabs(
-        ["📋 리스트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"])
+    render_radar(df[df["code"].map(_mkt) == market])
+    with st.container(key="main_tabs"):
+        t_list, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
+            ["📋 리스트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금", "🚀 급상승", "🔭 차기 주도",
+             "🧭 시나리오"])
+    with t_money:
+        render_money(df)
     with t_nh:
         render_nh_candidates(df, histories, quotes)
     with t_vs:

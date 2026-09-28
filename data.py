@@ -160,6 +160,7 @@ def parse_polling(text: str) -> dict[str, dict]:
                 "high": to_num(item.get("hv")),
                 "low": to_num(item.get("lv")),
                 "volume": to_num(item.get("aq")),
+                "value": to_num(item.get("aa")),      # 누적 거래대금(단위가 응답마다 달라 쓸 때 점검)
                 "status": item.get("ms"),
             }
     return out
@@ -1589,6 +1590,76 @@ def _metrics_cached(code: str, hist, quote, monthly, bo_mode: str, official: dic
     return res
 
 
+# ─────────────────────────── 실시간 거래량 · 섹터 거래대금 쏠림 ───────────────────────────
+SESSION_MIN = 390   # 09:00~15:30
+
+
+def session_frac(now: datetime | None = None) -> float:
+    """정규장 중 지금까지 지난 비율(0.05~1). 장 전·장 뒤·주말은 1(하루치 전체)."""
+    now = now or now_kst()
+    if now.weekday() >= 5:
+        return 1.0
+    t = now.hour * 60 + now.minute - 9 * 60
+    if t <= 0 or t >= SESSION_MIN:
+        return 1.0
+    return max(0.05, t / SESSION_MIN)
+
+
+def live_volume(hist: pd.DataFrame | None, quote: dict | None, metrics: dict) -> dict:
+    """오늘(또는 최근 거래일) 거래량·거래대금과 평소(직전 20일 평균, 지금 시각까지로 환산) 대비 배수."""
+    out = {"vol_live": None, "tv_live": None, "tv_x": None, "vol_src": None}
+    price = metrics.get("price")
+    vol, val, src = None, None, None
+    if quote and quote.get("volume"):
+        vol, val, src = float(quote["volume"]), quote.get("value"), "실시간"
+    elif hist is not None and not hist.empty and "volume" in hist:
+        v = hist["volume"].iloc[-1]
+        if v == v:
+            vol, src = float(v), "최근 거래일"
+            price = float(hist["close"].iloc[-1])
+    if not vol or not price:
+        return out
+    est = price * vol
+    tv = est
+    if val:   # 네이버 누적 거래대금: 원 단위면 그대로, 백만원 단위면 환산. 어긋나면 현재가×거래량
+        for mult in (1.0, 1e6):
+            if 0.5 <= val * mult / est <= 2.0:
+                tv = val * mult
+                break
+    tv20 = metrics.get("tv20")
+    frac = session_frac() if src == "실시간" else 1.0
+    out.update(vol_live=vol, tv_live=tv, vol_src=src,
+               tv_x=(tv / (tv20 * frac)) if tv20 else None)
+    return out
+
+
+def sector_money(df: pd.DataFrame, by: str = "group", top_names: int = 3) -> pd.DataFrame:
+    """섹터(세부 분류 또는 산업)별 지금 거래대금 합계, 비중, 평소 대비 배수, 등락, 거래대금 상위 종목."""
+    d = df[pd.to_numeric(df.get("tv_live"), errors="coerce").notna()].copy() if "tv_live" in df else df.iloc[0:0]
+    if d.empty:
+        return pd.DataFrame(columns=["sector", "tv", "share", "x", "chg", "n", "up", "down", "top"])
+    d["tv_live"] = pd.to_numeric(d["tv_live"], errors="coerce")
+    d["tv_base"] = pd.to_numeric(d["tv_live"] / d["tv_x"], errors="coerce")
+    total = d["tv_live"].sum()
+    rows = []
+    for key, g in d.groupby(by):
+        tv = g["tv_live"].sum()
+        has = g["tv_base"].notna() & (g["tv_base"] > 0)
+        base = g.loc[has, "tv_base"].sum() if has.any() else None
+        tv_b = g.loc[has, "tv_live"].sum() if has.any() else None
+        chg = pd.to_numeric(g["change"], errors="coerce")
+        w = (chg * g["tv_live"]).sum() / g.loc[chg.notna(), "tv_live"].sum() if chg.notna().any() else None
+        top = g.sort_values("tv_live", ascending=False).head(top_names)
+        rows.append({
+            "sector": key, "tv": tv, "share": tv / total * 100 if total else None,
+            "x": (tv_b / base) if base else None, "chg": w,
+            "n": len(g), "up": int((chg > 0).sum()), "down": int((chg < 0).sum()),
+            "top": " · ".join(f"{r['name']}({r['change']:+.1f}%)" if r["change"] == r["change"] else r["name"]
+                              for _, r in top.iterrows()),
+        })
+    return pd.DataFrame(rows).sort_values("tv", ascending=False).reset_index(drop=True)
+
+
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
                 shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line",
                 monthlies: dict | None = None, official52: dict | None = None) -> pd.DataFrame:
@@ -1601,9 +1672,11 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict,
         n_shares = (shares or {}).get(s["code"])
         cap_local = metrics["price"] * n_shares if (metrics["price"] and n_shares) else None
         rate = (fx or {}).get(currency)
+        live = live_volume(hist, quotes.get(s["code"]), metrics)
         rows.append({
             **s,
             **metrics,
+            **live,
             "market": market,
             "currency": currency,
             "url": quote_url(s["code"]),
@@ -1719,7 +1792,8 @@ def mock_quote(code: str) -> dict:
         hist = _mock_hist[code] = mock_history(code)
     last = hist.iloc[-1]
     return {"price": float(last["close"]), "prev": float(hist.iloc[-2]["close"]),
-            "high": float(last["high"]), "low": float(last["low"]), "status": "OPEN"}
+            "high": float(last["high"]), "low": float(last["low"]), "status": "OPEN",
+            "volume": float(last["volume"]) * _rng(code + "v").uniform(0.3, 2.5)}
 
 
 # ─────────────────────────── 실적(영업이익·EPS) 정배열 ───────────────────────────
