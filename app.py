@@ -28,12 +28,22 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS",
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
-            "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths")
-if any(not hasattr(data, n) for n in REQUIRED):
+            "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
+            "live_volume", "sector_money", "session_frac")
+DATA_VERSION = "2026-09-28-money"   # data.py의 DATA_VERSION과 같아야 해요
+
+
+def _data_stale() -> bool:
+    return any(not hasattr(data, n) for n in REQUIRED) or getattr(data, "DATA_VERSION", None) != DATA_VERSION
+
+
+if _data_stale():
     # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
     data = importlib.reload(data)
     stock_list = importlib.reload(stock_list)
 _missing = [n for n in REQUIRED if not hasattr(data, n)]
+if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
+    _missing.append(f"버전 {DATA_VERSION}")
 if _missing:
     st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
              "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
@@ -993,9 +1003,9 @@ def render_table(f: pd.DataFrame):
         "현재가": f["price"],
         "시가총액(원)": f["cap_krw"],
         "등락률": f["change"],
-        "거래량": f["vol_live"],
-        "거래대금": f["tv_live"],
-        "평소 대비": f["tv_x"],
+        "거래량": f.get("vol_live"),
+        "거래대금": f.get("tv_live"),
+        "평소 대비": f.get("tv_x"),
         **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
             "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
             "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
@@ -1547,6 +1557,9 @@ def _score_bars(v: pd.DataFrame):
 def render_money(df: pd.DataFrame):
     """💰 거래대금: 지금 어느 섹터에 돈(거래대금)이 몰리는지 + 종목별 실시간 거래량."""
     d = df[df["code"].map(_mkt) == market].copy()
+    if not {"tv_live", "tv_x", "vol_live", "vol_src"} <= set(d.columns):
+        st.warning("거래량 자료를 아직 못 불러왔어요. 오른쪽 아래 'Manage app' → 'Reboot app'을 한 번 눌러 주세요.")
+        return
     for c in ("tv_live", "tv_x", "vol_live", "change", "price"):
         d[c] = pd.to_numeric(d[c], errors="coerce")
     d = d[d["tv_live"].notna()]

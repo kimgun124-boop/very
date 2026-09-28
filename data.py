@@ -41,6 +41,8 @@ HEADERS = {
     ),
     "Referer": "https://finance.naver.com/",
 }
+# app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
+DATA_VERSION = "2026-09-28-money"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
