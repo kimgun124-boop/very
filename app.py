@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import html
+import re
+import os
 
 import altair as alt
 import pandas as pd
@@ -15,6 +17,7 @@ import threading
 import time
 
 import data
+import reports
 import stocks as stock_list
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
@@ -68,6 +71,11 @@ if _data_stale():
 _missing = [n for n in REQUIRED if not hasattr(data, n)]
 if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
     _missing.append(f"버전 {DATA_VERSION}")
+REPORTS_VERSION = "2026-09-28-reports"
+if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
+    reports = importlib.reload(reports)
+if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
+    _missing.append("reports.py 새 파일")
 if _missing:
     st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
              "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
@@ -94,6 +102,25 @@ PENDING_MISS: dict = {}
 if PENDING_NAMES and hasattr(stock_list, "attach"):
     _resolved, PENDING_MISS = load_pending_codes(PENDING_NAMES)
     STOCKS = STOCKS + stock_list.attach(_resolved)
+
+# 앱에서 직접 넣은 리포트(user_reports.json)의 종목을 보드에 합쳐요
+USER_STORE = reports.load_local()
+STOCKS, TAGS = reports.merge(STOCKS, TAGS, USER_STORE)
+for _s in STOCKS:
+    _s.setdefault("tags", [])
+    _s.setdefault("notes", [])
+if any(s["sector"] not in SECTOR_ORDER for s in STOCKS):
+    SECTOR_ORDER = SECTOR_ORDER + sorted({s["sector"] for s in STOCKS} - set(SECTOR_ORDER))
+if any(s["group"] not in GROUP_ORDER for s in STOCKS):
+    GROUP_ORDER = GROUP_ORDER + sorted({s["group"] for s in STOCKS} - set(GROUP_ORDER))
+
+
+def _secret(key: str, default: str = "") -> str:
+    try:
+        v = st.secrets.get(key)
+    except Exception:
+        v = None
+    return str(v or os.environ.get(key, default) or "")
 
 UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
 NEW_HIGH_BG = "#FFF1C9"                # 신고가 행 강조
@@ -179,16 +206,16 @@ st.markdown(
   position: relative; --gc: #51616C; --gt: #F1F4F6;
   background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
   border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
-.st-key-main_tabs [role="tab"]:nth-child(n+3):nth-child(-n+5) { --gc: #E0672B; --gt: #FDF3EC; }
-.st-key-main_tabs [role="tab"]:nth-child(n+6) { --gc: #1F66C9; --gt: #EEF4FC; }
-.st-key-main_tabs [role="tab"]:nth-child(3),
-.st-key-main_tabs [role="tab"]:nth-child(6) { margin-left: 0.9rem; }
+.st-key-main_tabs [role="tab"]:nth-child(n+4):nth-child(-n+6) { --gc: #E0672B; --gt: #FDF3EC; }
+.st-key-main_tabs [role="tab"]:nth-child(n+7) { --gc: #1F66C9; --gt: #EEF4FC; }
+.st-key-main_tabs [role="tab"]:nth-child(4),
+.st-key-main_tabs [role="tab"]:nth-child(7) { margin-left: 0.9rem; }
 .st-key-main_tabs [role="tab"]::before {
   position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
   letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
 .st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
-.st-key-main_tabs [role="tab"]:nth-child(3)::before { content: "종목 시그널"; }
-.st-key-main_tabs [role="tab"]:nth-child(6)::before { content: "섹터 흐름"; }
+.st-key-main_tabs [role="tab"]:nth-child(4)::before { content: "종목 시그널"; }
+.st-key-main_tabs [role="tab"]:nth-child(7)::before { content: "섹터 흐름"; }
 .st-key-main_tabs [role="tab"] p { color: #3A4852; font-size: 0.98rem !important; }
 .st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
 .st-key-main_tabs [role="tab"][aria-selected="true"] p,
@@ -246,6 +273,12 @@ st.markdown(
 .tv-x span { font-size: 0.82rem; font-weight: 700; }
 .tv-note { font-size: 0.74rem; color: #7A8A94; margin-top: 0.55rem; line-height: 1.5; }
 .st-key-no_translate { display: none !important; }
+.rp-badges { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0 0 0.7rem; }
+.rp-badge { font-size: 0.82rem; border-radius: 999px; padding: 0.3rem 0.75rem; border: 1px solid #E3E8EB; background: #FFFFFF; color: #51616C; }
+.rp-badge b { margin-right: 0.25rem; }
+.rp-badge.on { border-color: #2E9D5B; color: #1E7A45; background: #EEF8F2; }
+.rp-badge.off { border-color: #E3C7A0; color: #9A6417; background: #FDF6EC; }
+[class*="st-key-rp_box_"] { background: #FFFFFF; border-radius: 12px !important; }
 /* ── 공통 정리 ── */
 [data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
 .stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
@@ -1633,6 +1666,190 @@ def naver_search(q: str) -> list[tuple[str, str]]:
         return data.search_stock(q)[:12]
     except Exception:
         return []
+
+
+def _rep_status():
+    key, token = _secret("ANTHROPIC_API_KEY"), _secret("GITHUB_TOKEN")
+    repo = _secret("GITHUB_REPO", "kimgun124-boop/very")
+    return {"ai": bool(key), "key": key, "model": _secret("ANTHROPIC_MODEL", reports.DEFAULT_MODEL),
+            "gh": bool(token), "token": token, "repo": repo, "branch": _secret("GITHUB_BRANCH") or None,
+            "pw": _secret("APP_PASSWORD")}
+
+
+def _persist(store: dict, stt: dict) -> tuple[bool, str]:
+    reports.save_local(store)
+    if stt["gh"]:
+        return reports.save_github(store, stt["token"], stt["repo"], stt["branch"])
+    return True, "이 서버에만 임시로 저장했어요(앱을 다시 켜면 사라질 수 있어요)."
+
+
+@st.fragment
+def render_reports_tab():
+    """📥 리포트: 앱에서 직접 리포트를 넣으면 종목을 뽑아 보드에 붙여요."""
+    stt = _rep_status()
+    board = {s["code"]: s for s in STOCKS}
+    by_name = {s["name"]: s for s in STOCKS}
+
+    st.markdown('<div class="sec-h"><b>📥 리포트 넣기</b><span>PDF·캡처 이미지·글을 넣으면 종목을 뽑아 보드에 붙여요</span></div>',
+                unsafe_allow_html=True)
+    badges = [("AI 분석", stt["ai"], "켜짐" if stt["ai"] else "꺼짐 · 이름 맞추기로 분석"),
+              ("영구 저장", stt["gh"], "GitHub 저장소" if stt["gh"] else "꺼짐 · 앱 재시작 시 사라질 수 있음"),
+              ("비밀번호", bool(stt["pw"]), "설정됨" if stt["pw"] else "없음 · 누구나 추가 가능")]
+    st.markdown('<div class="rp-badges">' + "".join(
+        f'<span class="rp-badge {"on" if ok else "off"}"><b>{lab}</b> {txt}</span>' for lab, ok, txt in badges) + "</div>",
+        unsafe_allow_html=True)
+    with st.expander("⚙️ 처음 한 번 설정하기 (AI 분석 · 영구 저장 · 비밀번호)", expanded=not (stt["ai"] and stt["gh"])):
+        st.markdown(
+            "Streamlit 앱 오른쪽 아래 **Manage app → ⋮ → Settings → Secrets** 칸에 아래처럼 넣고 저장하세요.\n\n"
+            "```toml\nANTHROPIC_API_KEY = \"sk-ant-...\"   # AI 분석(이미지·스캔 PDF도 읽음)\n"
+            "GITHUB_TOKEN = \"github_pat_...\"     # 넣은 리포트를 저장소에 영구 저장\n"
+            "GITHUB_REPO = \"kimgun124-boop/very\"\n"
+            "APP_PASSWORD = \"원하는 비밀번호\"      # 나만 리포트를 넣을 수 있게\n```\n"
+            "- **ANTHROPIC_API_KEY**: [Claude Console](https://console.anthropic.com)에서 발급해요. "
+            "Claude 구독과 별도로 쓴 만큼 요금이 나가요. 없으면 '이름 맞추기'로만 분석해요(글자로 된 PDF·글만).\n"
+            "- **GITHUB_TOKEN**: GitHub → Settings → Developer settings → Fine-grained tokens → "
+            "저장소 very만 고르고 **Contents: Read and write** 권한으로 만들어요. 없으면 앱을 다시 켤 때 넣은 리포트가 사라질 수 있어요.\n"
+            "- **APP_PASSWORD**: 앱 주소를 아는 누구나 리포트를 넣거나 API 요금을 쓰지 못하게 막아요. 꼭 넣는 걸 권해요.")
+
+    if stt["pw"] and not st.session_state.get("rep_ok"):
+        pw = st.text_input("비밀번호", type="password", key="rep_pw")
+        if pw and pw == stt["pw"]:
+            st.session_state["rep_ok"] = True
+            st.rerun(scope="fragment")
+        elif pw:
+            st.error("비밀번호가 달라요.")
+        _render_saved_reports(stt, editable=False)
+        return
+
+    # ① 넣기
+    with st.container(border=True, key="rp_box_in"):
+        st.markdown("**① 리포트 넣기**")
+        files = st.file_uploader("파일", type=["pdf", "png", "jpg", "jpeg", "webp", "txt", "md", "html"],
+                                 accept_multiple_files=True, key="rep_files",
+                                 help="PDF 여러 개, 캡처 이미지 여러 장을 한꺼번에 넣어도 돼요.")
+        text = st.text_area("또는 글 붙여넣기", height=110, key="rep_text",
+                            placeholder="리포트 본문, 텔레그램 요약, 기사 내용 등을 붙여넣어도 돼요.")
+        methods = (["🤖 AI로 분석"] if stt["ai"] else []) + ["🔎 이름 맞추기"]
+        c1, c2 = st.columns([2, 1])
+        method = c1.segmented_control("분석 방법", methods, default=methods[0], required=True, key="rep_method")
+        go = c2.button("🔍 분석하기", type="primary", width="stretch", disabled=not (files or text.strip()))
+        if not stt["ai"]:
+            st.caption("AI 키가 없어서 본문에 나온 상장사 이름을 찾아요. 이미지·스캔 PDF는 AI 분석에서만 읽을 수 있어요.")
+    if go:
+        payload = [(f.name, f.getvalue()) for f in (files or [])]
+        if method.startswith("🤖"):
+            with st.spinner("AI가 리포트를 읽고 종목을 뽑는 중이에요. 분량에 따라 30초~2분 걸려요."):
+                res, err = reports.ai_extract(stt["key"], payload, text, stt["model"])
+            if err:
+                st.error(err)
+                return
+            meta = {k: res.get(k, "") for k in ("title", "broker", "date", "summary")}
+            rows = res.get("stocks") or []
+        else:
+            with st.spinner("본문에서 상장사 이름을 찾는 중이에요."):
+                body = "\n".join(reports.file_text(n, raw) for n, raw in payload) + "\n" + text
+                if not body.strip():
+                    st.error("글자를 읽지 못했어요. 이미지·스캔 PDF는 AI 분석이 필요해요.")
+                    return
+                rows = reports.match_stocks(body, STOCKS, reports.krx_listing())
+                first = (files[0].name.rsplit(".", 1)[0] if files else body.strip().split("\n")[0])[:30]
+                meta = {"title": first, "broker": "", "date": now_date(), "summary": ""}
+        draft = []
+        need = [r.get("name") for r in rows if not r.get("code") and r.get("name") and r.get("name") not in by_name
+                and (r.get("market") in (None, "", "KR"))]
+        found, _miss = data.resolve_codes(tuple(need)) if need else ({}, {})
+        for r in rows:
+            name = str(r.get("name") or "").strip()
+            code = str(r.get("code") or "").strip().upper() or found.get(name, "") or (by_name.get(name) or {}).get("code", "")
+            if re.fullmatch(r"\d{1,6}", code):
+                code = code.zfill(6)
+            on = board.get(code)
+            hint = r.get("sector_hint") or ""
+            sector = on["sector"] if on else (hint if hint in SECTOR_ORDER else "기타(리포트 스크린)")
+            draft.append({"넣기": r.get("importance", "상") != "하" or bool(on), "종목명": on["name"] if on else name,
+                          "코드": code, "산업": sector, "세부 분류": on["group"] if on else (r.get("group") or "리포트 추가"),
+                          "한 줄 설명": on["desc"] if on else (r.get("desc") or ""), "리포트 포인트": r.get("point") or "",
+                          "보드에 있음": bool(on)})
+        st.session_state["rep_draft"] = {"meta": meta, "rows": draft,
+                                         "source": ", ".join(f.name for f in files or []) or "붙여넣은 글"}
+
+    # ② 확인·고치기 → 반영
+    dr = st.session_state.get("rep_draft")
+    if dr:
+        with st.container(border=True, key="rp_box_edit"):
+            st.markdown(f"**② 뽑은 종목 확인하기** — {len(dr['rows'])}개. 틀린 건 고치고, 뺄 종목은 '넣기'를 끄세요.")
+            c1, c2, c3 = st.columns([2.2, 1, 1])
+            title = c1.text_input("리포트 제목", dr["meta"].get("title", ""), key="rep_title")
+            broker = c2.text_input("증권사·출처", dr["meta"].get("broker", ""), key="rep_broker")
+            rdate = c3.text_input("날짜", dr["meta"].get("date", ""), key="rep_date", placeholder="26.09.28")
+            summary = st.text_area("핵심 요약", dr["meta"].get("summary", ""), height=80, key="rep_summary")
+            edited = st.data_editor(
+                pd.DataFrame(dr["rows"], columns=["넣기", "종목명", "코드", "산업", "세부 분류", "한 줄 설명", "리포트 포인트", "보드에 있음"]),
+                key="rep_editor", hide_index=True, num_rows="dynamic", width="stretch",
+                column_config={
+                    "넣기": st.column_config.CheckboxColumn(width="small"),
+                    "코드": st.column_config.TextColumn(help="국내 6자리 코드, 해외는 야후 티커(NVDA, 6857.T)", width="small"),
+                    "산업": st.column_config.SelectboxColumn(options=SECTOR_ORDER, required=True),
+                    "한 줄 설명": st.column_config.TextColumn(width="large"),
+                    "리포트 포인트": st.column_config.TextColumn(width="large"),
+                    "보드에 있음": st.column_config.CheckboxColumn(disabled=True, width="small"),
+                })
+            pick = edited[edited["넣기"] == True]  # noqa: E712
+            no_code = pick[pick["코드"].fillna("").astype(str).str.strip() == ""]
+            if len(no_code):
+                st.warning("코드가 비어 있는 종목은 빠져요: " + ", ".join(no_code["종목명"].astype(str)) +
+                           " — 코드를 채우면 들어가요(차트 탭에서 이름으로 검색하면 코드를 알 수 있어요).")
+            n_new = int((~pick["보드에 있음"].fillna(False).astype(bool)).sum()) - len(no_code)
+            c1, c2 = st.columns([3, 1])
+            c1.caption(f"넣을 종목 {len(pick) - len(no_code)}개 (새 종목 {max(n_new, 0)}개 · 이미 있는 종목은 태그와 메모만 붙어요)")
+            if c2.button("✅ 앱에 반영", type="primary", width="stretch", disabled=not title.strip()):
+                stocks_out = [{"name": str(r["종목명"]).strip(), "code": str(r["코드"]).strip(), "sector": r["산업"],
+                               "group": str(r["세부 분류"] or "리포트 추가").strip(), "desc": str(r["한 줄 설명"] or "").strip(),
+                               "point": str(r["리포트 포인트"] or "").strip()}
+                              for _, r in pick.iterrows() if str(r["코드"] or "").strip()]
+                store = reports.load_local()
+                store["reports"].append(reports.new_report(title, broker, rdate, summary, stocks_out, dr["source"]))
+                ok, msg = _persist(store, stt)
+                (st.success if ok else st.error)(msg + (" 보드에 반영하는 중이에요…" if ok else ""))
+                if ok:
+                    st.session_state.pop("rep_draft", None)
+                    st.session_state["rep_saved_msg"] = f"'{title}' 리포트 {len(stocks_out)}종목을 보드에 넣었어요. " \
+                                                        "왼쪽 '리포트 태그'에서 골라 볼 수 있어요."
+                    time.sleep(0.6)
+                    st.rerun(scope="app")
+            if st.button("취소", key="rep_cancel"):
+                st.session_state.pop("rep_draft", None)
+                st.rerun(scope="fragment")
+    if st.session_state.get("rep_saved_msg"):
+        st.success(st.session_state.pop("rep_saved_msg"))
+    _render_saved_reports(stt, editable=True)
+
+
+def now_date() -> str:
+    return data.now_kst().strftime("%y.%m.%d")
+
+
+def _render_saved_reports(stt: dict, editable: bool):
+    store = reports.load_local()
+    reps = list(reversed(store.get("reports", [])))
+    st.markdown(f'<div class="sec-h"><b>📚 넣은 리포트</b><span>{len(reps)}개</span></div>', unsafe_allow_html=True)
+    if not reps:
+        st.caption("아직 앱에서 넣은 리포트가 없어요.")
+        return
+    for rep in reps:
+        with st.expander(f"{reports.tag_name(rep)} · {len(rep.get('stocks', []))}종목 · {rep.get('added_at', '')}"):
+            if rep.get("summary"):
+                st.markdown(rep["summary"])
+            st.dataframe(pd.DataFrame(rep.get("stocks", [])).rename(columns={
+                "name": "종목명", "code": "코드", "sector": "산업", "group": "세부 분류", "desc": "한 줄 설명", "point": "리포트 포인트"}),
+                hide_index=True, width="stretch")
+            if editable and st.button("🗑️ 이 리포트 지우기", key=f"rep_del_{rep['id']}"):
+                store["reports"] = [r for r in store["reports"] if r.get("id") != rep["id"]]
+                ok, msg = _persist(store, stt)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    time.sleep(0.6)
+                    st.rerun(scope="app")
 
 
 @st.fragment
@@ -3073,9 +3290,11 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     with st.container(key="main_tabs"):
-        t_list, t_chart, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
-            ["📋 리스트", "🕯️ 차트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금", "🚀 급상승",
-             "🔭 차기 주도", "🧭 시나리오"])
+        t_list, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = st.tabs(
+            ["📋 리스트", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보", "💰 거래대금",
+             "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"])
+    with t_rep:
+        render_reports_tab()
     with t_chart:
         render_chart_tab(df, quotes)
     with t_money:
