@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-09-28-lock"
+HOLDINGS_VERSION = "2026-09-29-principles"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -51,10 +51,33 @@ def save_local(store: dict) -> None:
 
 
 def new_holding(code: str, name: str, avg: float, qty: float, buy_date: str, stop_pct: float | None,
-                half_taken: bool, memo: str) -> dict:
+                half_taken: bool, memo: str, account: str = "추세") -> dict:
     return {"id": uuid.uuid4().hex[:10], "code": code, "name": name, "avg": float(avg), "qty": float(qty or 0),
             "buy_date": buy_date, "stop_pct": stop_pct, "half_taken": bool(half_taken), "memo": memo,
+            "account": account if account in ("추세", "가치") else "추세",
             "added_at": now_kst().strftime("%Y-%m-%d %H:%M")}
+
+
+# ─────────────────────────── 자본관리(계좌 BEP) ───────────────────────────
+# 스승님 원칙: ① 계좌 원금의 5%가 훼손되지 않게(최대 10%) ② 계좌가 커지면 BEP도 단계적으로 올리고
+# ③ 계좌가 BEP에 닿으면 전액 현금화하고 시장을 다시 관찰한다.
+def account_bep(principal: float, peak: float, step: float = 0.10, base_loss: float = 0.05) -> dict:
+    """원금·최고 평가액으로 지금 지켜야 할 BEP(멈춤선)를 계산해요.
+    최고 평가액이 원금보다 10% 오를 때마다 BEP를 한 칸씩 올려요(+10% → 본전, +20% → 원금+10% …)."""
+    if not principal or principal <= 0:
+        return {}
+    peak = max(peak or principal, principal)
+    k = int(((peak / principal) - 1) // step)
+    bep = principal * (1 - base_loss) if k <= 0 else principal * (1 + step * (k - 1))
+    return {"bep": bep, "hard": principal * 0.90, "level": k, "peak": peak}
+
+
+def value_estimate(net_cash: float | None, op: float | None, opm: float | None) -> float | None:
+    """스승님 절대가치: 순현금 + 영업이익 × (영업이익률의 절반) 배.
+    예) 순현금 1,000억 + 영업이익 100억 × 5배(영업이익률 10%의 절반) = 1,500억. 단위는 넣은 그대로(억원)."""
+    if op is None or opm is None:
+        return None
+    return float(net_cash or 0) + float(op) * max(float(opm), 0) / 2
 
 
 # ─────────────────────────── 비밀번호(보유 종목 잠금) ───────────────────────────
@@ -155,6 +178,8 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
     h: 보유 정보(avg, buy_date, stop_pct, half_taken) / m: 지표(price, atr_pct, bo_*, ma5·20·50, rs …)
     bars: 일봉(오늘 봉 포함) / ctx: market_ok, market_text, leaders, idx_rs, sector_x(분류별 평소 대비 거래대금)
     """
+    if h.get("account") == "가치":
+        return judge_value(h, m, bars, ctx)
     price, avg = _f(m.get("price")), _f(h.get("avg"))
     out = {"verdict": "판단 불가", "level": "gray", "pnl": None, "r": None, "stop_pct": None, "stop_price": None,
            "stop_dist": None, "target3r": None, "max_r": None, "checks": [], "actions": []}
@@ -269,6 +294,11 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
         if lr:
             add("good" if lr == 1 and m.get("lead_ok") else "info", "섹터 순위",
                 ("👑 대장주" if lr == 1 and m.get("lead_ok") else f"섹터 {int(lr)}위") + (f"/{int(ln)}" if ln else ""))
+    # 스승님·깡토 원칙 보태기
+    if st_ == "이탈" and ma_v and price >= ma_v:
+        add("info", "반등 ≠ 돌파", "이탈 뒤 오른 건 되돌림일 수 있어요 — 다시 돌파(신고가·장대양봉·거래량)가 나와야 새 진입 조건")
+    if 0 < r_now < 3 and not h.get("half_taken"):
+        add("info", "손익비", f"지금 {r_now:.1f}R — 승률 30%면 2.33R가 손익분기, 3R부터 '출발선'이라 작은 수익에 먼저 팔지 않는 게 원칙")
     out["checks"] = checks
 
     bad = [c for c in checks if c[0] == "bad"]
@@ -293,6 +323,69 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
     else:
         out.update(verdict="✅ 원칙상 보유", level="green")
         out["actions"] = [f"손절선 {stop_price:,.0f} · 3R 목표 {target3r:,.0f}"]
+    return out
+
+
+def judge_value(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
+    """가치투자 계좌 점검(스승님 원칙): 가치우파에서만 천천히 분할매수, 가치훼손이면 매도, 추세 손절 규칙은 쓰지 않아요."""
+    price, avg = _f(m.get("price")), _f(h.get("avg"))
+    out = {"verdict": "판단 불가", "level": "gray", "pnl": None, "r": None, "stop_pct": None, "stop_price": None,
+           "stop_dist": None, "target3r": None, "max_r": None, "checks": [], "actions": [], "account": "가치"}
+    if not price or not avg:
+        return out
+    pnl = (price / avg - 1) * 100
+    out.update(pnl=pnl, r=None)
+    checks = []
+
+    def add(state, item, text):
+        checks.append((state, item, text))
+
+    # 가치우파/좌파: 60일선 방향과 위치
+    side = None
+    if bars is not None and len(bars) >= 80:
+        c = pd.to_numeric(bars["close"], errors="coerce").to_numpy(dtype=float)
+        ma60 = pd.Series(c).rolling(60).mean().to_numpy()
+        slope = (ma60[-1] / ma60[-21] - 1) * 100 if ma60[-21] == ma60[-21] and ma60[-21] else None
+        low20, low_prev = np.nanmin(c[-20:]), np.nanmin(c[-60:-20])
+        if slope is not None:
+            if c[-1] >= ma60[-1] * 0.97 and slope >= -0.5 and low20 >= low_prev * 0.98:
+                side = "우파"
+                add("good", "가치우파", f"하락을 멈추고 횡보·우상향(60일선 {slope:+.1f}%/20일, 최근 저점이 이전 저점 위)")
+            elif c[-1] < ma60[-1] and slope < 0:
+                side = "좌파"
+                add("bad", "가치좌파", f"아직 내려가는 중(60일선 {slope:+.1f}%/20일, 현재가 60일선 아래) — 떨어지는 칼날")
+            else:
+                side = "중간"
+                add("warn", "방향 확인 중", f"60일선 {slope:+.1f}%/20일 — 하락이 멈췄는지 더 확인")
+    # 절대가치
+    val = value_estimate(_f(h.get("net_cash")), _f(h.get("op")), _f(h.get("opm")))
+    cap = _f(m.get("cap_krw"))
+    if val is not None and cap:
+        cap_eok = cap / 1e8
+        gap = (val / cap_eok - 1) * 100
+        add("good" if gap >= 30 else ("info" if gap >= 0 else "warn"), "절대가치",
+            f"순현금 {h.get('net_cash') or 0:,.0f}억 + 영업이익 {h.get('op'):,.0f}억 × {float(h.get('opm')) / 2:.1f}배 "
+            f"= {val:,.0f}억 · 시가총액 {cap_eok:,.0f}억 대비 {gap:+.0f}%")
+    elif val is None:
+        add("info", "절대가치", "순현금·영업이익·영업이익률을 넣으면 스승님 방식 절대가치를 계산해요(고치기 칸)")
+    if h.get("impaired"):
+        add("bad", "가치훼손", "가치훼손 이슈 체크됨 — 원칙상 매도(가치우파가 좌파로 바뀌는 신호)")
+    if ctx.get("market_ok") is not None:
+        add("info", "시장", ctx.get("market_text", ""))
+    out["checks"] = checks
+    if h.get("impaired"):
+        out.update(verdict="🛑 가치훼손 — 매도 원칙", level="red")
+        out["actions"] = ["가치투자라고 무조건 들고 가는 게 아님 — 가치훼손이면 매도", "계좌 BEP는 그대로 지키기"]
+    elif side == "좌파":
+        out.update(verdict="⏸️ 가치좌파 — 매수 보류", level="orange")
+        out["actions"] = ["하락이 멈추고 횡보·우상향(가치우파)이 확인될 때까지 추가매수 보류",
+                          "가치훼손 이슈가 없는지 점검(실적·공시·산업)"]
+    elif side == "우파":
+        out.update(verdict="✅ 가치우파 — 분할매수 가능", level="green")
+        out["actions"] = ["매수 기간과 총 비중을 정해 두고 천천히 분할매수", "가치훼손 이슈가 생기면 매도"]
+    else:
+        out.update(verdict="👀 방향 확인 중", level="yellow")
+        out["actions"] = ["가치우파 확인 전까지는 서두르지 않기"]
     return out
 
 

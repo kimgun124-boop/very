@@ -77,7 +77,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-28-lock"
+HOLDINGS_VERSION = "2026-09-29-principles"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -145,19 +145,21 @@ def _client_ip() -> str:
     try:
         h = st.context.headers
         xff = h.get("X-Forwarded-For") or h.get("x-forwarded-for")
-        if xff:
+        if isinstance(xff, str) and xff:
             return xff.split(",")[0].strip()
     except Exception:
         pass
     try:
-        return st.context.ip_address or "알 수 없음"
+        ip = st.context.ip_address
+        return ip if isinstance(ip, str) and ip else "알 수 없음"
     except Exception:
         return "알 수 없음"
 
 
 def _client_ua() -> str:
     try:
-        return (st.context.headers.get("User-Agent") or "")[:160]
+        ua = st.context.headers.get("User-Agent")
+        return ua[:160] if isinstance(ua, str) else ""
     except Exception:
         return ""
 
@@ -439,6 +441,16 @@ st.markdown(
 .gate-logo { font-size: 2.6rem; }
 .gate-title { font-size: 1.5rem; font-weight: 800; color: #16212B; margin-top: 0.3rem; }
 .gate-sub { font-size: 0.92rem; color: #51616C; margin-top: 0.3rem; }
+.cap-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.5rem; margin: 0.4rem 0; }
+.cap-row > div { background: #F6F8F9; border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.55rem 0.75rem; }
+.cap-row em { display: block; font-style: normal; font-size: 0.76rem; color: #6B7A84; font-weight: 700; }
+.cap-row b { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+.cap-row span { display: block; font-size: 0.82rem; font-weight: 800; }
+.pr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0.6rem; }
+.pr-card { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.7rem 0.9rem; }
+.pr-card b { font-size: 0.95rem; color: #16212B; }
+.pr-card ul { margin: 0.3rem 0 0 1rem; padding: 0; font-size: 0.85rem; color: #33424C; }
+.ho-acct { font-size: 0.72rem; margin-left: 0.35rem; color: #51616C; }
 /* ── 💼 내 보유 ── */
 [class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
 .hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
@@ -2188,12 +2200,14 @@ def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
             f'<div class="hd-top"><div><b class="hd-name">{html.escape(h["name"])}</b>'
             f'<span class="hd-code">{h["code"]}</span>'
             f'<span class="hd-px">{fmt_price(price, cur)}</span>'
-            f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {(j["r"] or 0):+.2f}R</span></div>'
+            f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {_rtxt(j)}</span></div>'
             f'<span class="hd-verdict" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></div>'
             f'<div class="hd-sub">평단 {fmt_price(h["avg"], cur)}'
             + (f' · {h["qty"]:,.0f}주 · 평가손익 {(price - h["avg"]) * h["qty"]:+,.0f}' if h.get("qty") and price else "")
-            + f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
-            + f' · 3R 목표 {fmt_price(j["target3r"], cur)} · 매수일 {h.get("buy_date", "-")}'
+            + (' · 🌱 가치투자 계좌(손절선 대신 가치우파·가치훼손으로 판단)' if j.get("account") == "가치" else
+               f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
+               f' · 3R 목표 {fmt_price(j["target3r"], cur)}')
+            + f' · 매수일 {h.get("buy_date", "-")}'
             + (f' · {html.escape(h["memo"])}' if h.get("memo") else "") + "</div>",
             unsafe_allow_html=True)
         icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
@@ -2240,6 +2254,88 @@ def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
                          m.get("high52"), key=f"hold_ch_{h['id']}")
 
 
+def _rtxt(j: dict) -> str:
+    return "🌱 가치 계좌" if j.get("account") == "가치" else f"{(j.get('r') or 0):+.2f}R"
+
+
+def _numor(v):
+    try:
+        v = float(v)
+        return v if v == v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_capital(store: dict, rows, stt: dict):
+    """🧮 자본관리: 계좌 원금·현금을 넣으면 지금 지켜야 할 BEP(멈춤선)를 보여줘요(스승님 원칙)."""
+    acc = store.setdefault("account", {})
+    stock_val = sum((m.get("price") or 0) * (h.get("qty") or 0) for h, m, *_ in rows)
+    equity = stock_val + float(acc.get("cash") or 0)
+    principal = float(acc.get("principal") or 0)
+    peak0 = float(acc.get("peak") or 0)
+    today = data.now_kst().strftime("%Y-%m-%d")
+    # 최고 평가액은 오를 때만 기록 — 저장소에 너무 자주 쓰지 않게(저장할 때마다 앱이 새로 배포돼요) 하루 한 번, 1% 넘게 오를 때만
+    if principal and equity > peak0 * 1.01 and acc.get("peak_day") != today:
+        acc.update(peak=round(equity), peak_day=today)
+        _persist_holdings(store, stt)
+    b = holdings.account_bep(principal, float(acc.get("peak") or 0))
+    with st.expander("🧮 자본관리 — 계좌 BEP(멈춤선)", expanded=bool(b) and equity <= b.get("bep", 0) * 1.03):
+        c1, c2, c3 = st.columns([1, 1, 1])
+        p_in = c1.number_input("계좌 원금(원)", min_value=0.0, step=1_000_000.0, value=principal, format="%.0f", key="cap_p")
+        cash = c2.number_input("현금(원)", min_value=0.0, step=100_000.0, value=float(acc.get("cash") or 0), format="%.0f",
+                               key="cap_c")
+        if c3.button("저장", key="cap_save", width="stretch"):
+            acc.update(principal=p_in, cash=cash)
+            if not acc.get("peak") or p_in > acc["peak"]:
+                acc["peak"] = p_in
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(msg)
+            _rerun_frag()
+        if not b:
+            st.caption("원금을 넣으면 '원금 5% 이상 잃지 않기(최대 10%)', '계좌가 커지면 BEP 올리기', "
+                       "'BEP에 닿으면 전액 현금화' 원칙으로 멈춤선을 계산해요. 보유 종목 수량이 있어야 평가액이 맞아요.")
+            return
+        dist = (equity / b["bep"] - 1) * 100
+        col = UP if dist <= 0 else ("#B7861D" if dist < 3 else "#1E7A45")
+        st.markdown(
+            f'<div class="cap-row"><div><em>지금 평가액</em><b>{equity:,.0f}원</b></div>'
+            f'<div><em>최고 평가액</em><b>{b["peak"]:,.0f}원</b></div>'
+            f'<div><em>지켜야 할 BEP</em><b style="color:{col}">{b["bep"]:,.0f}원</b>'
+            f'<span style="color:{col}">여유 {dist:+.1f}%</span></div>'
+            f'<div><em>절대 마지노선(원금 -10%)</em><b>{b["hard"]:,.0f}원</b></div></div>', unsafe_allow_html=True)
+        if equity <= b["bep"]:
+            st.error("🛑 계좌가 BEP에 닿았어요. 원칙: 욕심이 나도 전액 현금화하고 투자를 멈춘 뒤 시장을 다시 관찰하기.")
+        else:
+            st.caption(f"BEP 단계 {b['level']} — 최고 평가액이 원금보다 10% 오를 때마다 BEP를 한 칸씩 올려요"
+                       "(+10% → 본전, +20% → 원금+10% …). 운전의 브레이크처럼, BEP에서 멈출 수 있느냐가 핵심.")
+
+
+PRINCIPLES = [
+    ("자본관리", ["원금의 5%가 훼손되지 않게(최대 10%) — 항상 계좌 전체 기준으로 비중·손절선을 정한다",
+                "계좌가 커지면 BEP도 단계적으로 올린다 / BEP에 닿으면 전액 현금화하고 시장을 다시 본다"]),
+    ("추세추종", ["그룹주(섹터)가 패턴과 거래대금을 만들 때 — 섹터가 안 움직이면 개별 종목 추세도 어렵다",
+                "매수 4조건: 주도섹터 · 돌파(매물대·신고가) · 장대양봉 · 거래량. 하락 뒤 반등은 돌파가 아니다",
+                "주봉으로 추세(60일선 우상향) 먼저, 일봉으로 타점. 상승 → 조정 → 재돌파가 기본 스테이지",
+                "RS는 지수 RS(코스피·코스닥)보다 높아야 대상 — 91이냐 98이냐보다 커트라인 위인지가 중요",
+                "지지 이평선 이탈 = 패턴 훼손 → 매도(너무 좋아 보이면 절반이라도)",
+                "승률 30%면 2.33R가 손익분기, 3R가 최소 목표이자 출발선 — 하방은 닫고 상방은 연다, 물타기 대신 불타기",
+                "트리거가 올 때까지 기다리는 것 = 개인이 기관을 이기는 방법. 변동성 장에선 쉬어도 된다"]),
+    ("가치투자", ["절대가치 = 순현금 + 영업이익 × (영업이익률의 절반) 배",
+                "가치우파(하락 멈춤·횡보·조금씩 우상향) 확인 후 천천히 분할매수 — 매수 기간과 총 비중을 먼저 정한다",
+                "가치훼손 이슈가 생기면(우파 → 좌파) 매도. 가치투자라고 무조건 들고 가지 않는다"]),
+    ("계좌 분리", ["추세 계좌와 가치 계좌는 물과 기름 — 섞지 않는다",
+                 "추세 계좌에서 '많이 빠졌으니 싸다'며 사거나, 20일선 이탈 후 'AI가 좋으니까' 버티지 않는다 → 그건 가치 계좌의 일"]),
+]
+
+
+def _render_principles():
+    with st.expander("📘 내 투자 원칙 (스승님·깡토 정리)"):
+        st.markdown('<div class="pr-grid">' + "".join(
+            f'<div class="pr-card"><b>{html.escape(t)}</b><ul>' + "".join(f"<li>{html.escape(x)}</li>" for x in items)
+            + "</ul></div>" for t, items in PRINCIPLES) + "</div>", unsafe_allow_html=True)
+        st.caption("보유 종목 판정은 이 원칙을 점검표로 옮긴 거예요. 매수·매도 추천이 아니라 원칙 확인용이에요.")
+
+
 def _holdings_overview(rows, dot):
     """보유 종목 한눈에: 판정·수익률·손절선 여유를 표 하나로."""
     trs = []
@@ -2252,10 +2348,11 @@ def _holdings_overview(rows, dot):
         sd_col = UP if sd is not None and sd < 3 else "#16212B"
         bar_w = max(0, min(100, (sd or 0) / 15 * 100))
         trs.append(
-            f'<tr><td class="l"><b>{html.escape(h["name"])}</b><span class="ho-code">{h["code"]}</span></td>'
+            f'<tr><td class="l"><b>{html.escape(h["name"])}</b><span class="ho-code">{h["code"]}</span>'
+            f'<span class="ho-acct">{"🌱가치" if h.get("account") == "가치" else "📈추세"}</span></td>'
             f'<td class="l"><span class="ho-badge" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></td>'
             f'<td>{fmt_price(m.get("price"), cur)}</td><td>{fmt_price(h["avg"], cur)}</td>'
-            f'<td style="color:{pc};font-weight:800">{pnl:+.2f}%</td><td style="color:{pc}">{(j["r"] or 0):+.2f}R</td>'
+            f'<td style="color:{pc};font-weight:800">{pnl:+.2f}%</td><td style="color:{pc}">{_rtxt(j)}</td>'
             f'<td>{fmt_price(j["stop_price"], cur)}</td>'
             f'<td class="ho-sd"><div class="ho-bar"><i style="width:{bar_w:.0f}%"></i></div>'
             f'<span style="color:{sd_col}">{(sd or 0):.1f}%</span></td>'
@@ -2562,9 +2659,13 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
         stop = c4.number_input("손절 %(비우면 8% 또는 ATR)", min_value=0.0, max_value=50.0, step=0.5, value=0.0, key="hold_stop")
         c1, c2 = st.columns([3, 1])
         memo = c1.text_input("메모(선택)", key="hold_memo", placeholder="예: 후공정 섹터 2번째 돌파 진입")
+        acct = c1.segmented_control("계좌", ["추세", "가치"], default="추세", required=True, key="hold_acct",
+                                    format_func=lambda a: "📈 추세추종 계좌" if a == "추세" else "🌱 가치투자 계좌",
+                                    help="추세·가치 계좌는 섞지 않는 게 원칙. 추세 = 돌파 매수·손절선 / 가치 = 가치우파에서 분할매수·가치훼손 시 매도")
         half = c1.checkbox("이미 절반 익절함(손절선을 본전으로)", key="hold_half")
         if c2.button("저장", type="primary", width="stretch", disabled=not (pick and avg > 0)):
-            store["holdings"].append(holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo))
+            store["holdings"].append(holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo,
+                                                          acct or "추세"))
             ok, msg = _persist_holdings(store, stt)
             (st.success if ok else st.error)(msg)
             _rerun_frag()
@@ -2578,6 +2679,8 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     for h in store["holdings"]:
         m, bars, quote = _hold_metrics(h["code"], df, quotes)
         rows.append((h, m, bars, holdings.judge(h, m, bars, ctx)))
+    _render_capital(store, rows, stt)
+    _render_principles()
 
     # 요약
     tot_cost = sum(h["avg"] * h["qty"] for h, *_ in rows if h.get("qty"))
@@ -2618,11 +2721,18 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
         ed = st.data_editor(pd.DataFrame([{
             "종목명": h["name"], "코드": h["code"], "평단가": h["avg"], "수량": h.get("qty") or 0.0,
             "매수일": h.get("buy_date", ""), "손절%": h.get("stop_pct"), "절반 익절함": bool(h.get("half_taken")),
-            "메모": h.get("memo", ""), "_id": h["id"]} for h in store["holdings"]]),
+            "메모": h.get("memo", ""), "계좌": h.get("account", "추세"), "가치훼손": bool(h.get("impaired")),
+            "순현금(억)": h.get("net_cash"), "영업이익(억)": h.get("op"), "영업이익률(%)": h.get("opm"),
+            "_id": h["id"]} for h in store["holdings"]]),
             key="hold_editor", hide_index=True, num_rows="dynamic", width="stretch",
             column_config={"_id": None, "코드": st.column_config.TextColumn(disabled=True),
                            "종목명": st.column_config.TextColumn(disabled=True),
-                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR")})
+                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR (추세 계좌)"),
+                           "계좌": st.column_config.SelectboxColumn(options=["추세", "가치"], required=True),
+                           "가치훼손": st.column_config.CheckboxColumn(help="가치 계좌: 가치훼손 이슈가 생기면 체크 → 매도 원칙"),
+                           "순현금(억)": st.column_config.NumberColumn(help="가치 계좌 절대가치 계산용"),
+                           "영업이익(억)": st.column_config.NumberColumn(help="연간(또는 올해 추정) 영업이익"),
+                           "영업이익률(%)": st.column_config.NumberColumn(help="배수 = 영업이익률의 절반")})
         st.caption("줄을 지우려면 왼쪽 칸을 고르고 휴지통을 누른 뒤 저장하세요. 새 종목은 위 '보유 종목 추가'로 넣어요.")
         if st.button("변경 저장", key="hold_save"):
             by_id = {h["id"]: h for h in store["holdings"]}
@@ -2634,7 +2744,11 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
                 sp = r.get("손절%")
                 h.update(avg=float(r["평단가"]), qty=float(r["수량"] or 0), buy_date=str(r["매수일"] or ""),
                          stop_pct=float(sp) if sp == sp and sp not in (None, "", 0) else None,
-                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""))
+                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""),
+                         account=r.get("계좌") if r.get("계좌") in ("추세", "가치") else "추세",
+                         impaired=bool(r.get("가치훼손")),
+                         net_cash=_numor(r.get("순현금(억)")), op=_numor(r.get("영업이익(억)")),
+                         opm=_numor(r.get("영업이익률(%)")))
                 new.append(h)
             store["holdings"] = new
             ok, msg = _persist_holdings(store, stt)
