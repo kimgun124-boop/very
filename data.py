@@ -19,7 +19,6 @@ import os
 import random
 import time as _time
 import re
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -43,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-29-industry"
+DATA_VERSION = "2026-09-29-sleepfix"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -379,7 +378,7 @@ def fetch_histories(codes, workers: int = 12) -> dict[str, tuple]:
             miss = [c for c in kr if out.get(c) is None or out[c][1] is None or out[c][1].empty]
             if not miss or MOCK:
                 break
-            time.sleep(wait)
+            _time.sleep(wait)
             with ThreadPoolExecutor(max_workers=w) as pool:
                 for c, res in zip(miss, pool.map(fetch_history, miss)):
                     if res[1] is not None and not res[1].empty:
@@ -2012,7 +2011,7 @@ def fetch_stock_trends(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
         out = dict(zip(codes, pool.map(fetch_stock_trend, codes)))
     miss = [c for c, d in out.items() if d is None or d.empty]
     if miss and not MOCK and len(miss) < len(codes):        # 일부만 빠졌으면(네이버가 잠깐 막음) 천천히 한 번 더
-        time.sleep(1.5)
+        _time.sleep(1.5)
         with ThreadPoolExecutor(max_workers=4) as pool:
             out.update(zip(miss, pool.map(_fetch_stock_trend_now, miss)))
     return out

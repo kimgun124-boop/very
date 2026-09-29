@@ -58,7 +58,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map")
-DATA_VERSION = "2026-09-29-industry"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-09-29-sleepfix"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
