@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-09-29-deep"
+HOLDINGS_VERSION = "2026-09-29-masters"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -338,8 +338,10 @@ def _deepen(out, h, m, bars, ctx, stop_pct, pnl, stop_price, target3r, ma_key, m
                 "추세": _state_of(out["checks"], trend_names),
                 "섹터·시장": _state_of(out["checks"], ("시장", "섹터", "섹터 순위"))}
     sc, grade = score_card(sections)
+    masters = masters_view(h, m, bars, ctx, m.get("_flow"), stop_pct, out.get("max_r"))
+    pyr["schedule"] = pyramid_schedule(_f(h.get("avg")), stop_pct)
     out.update(fund=fund["items"], flow=flow["items"], vol=vol["items"], pyramid=pyr, sections=sections,
-               score=sc, grade=grade)
+               score=sc, grade=grade, masters=masters)
     # 판정 보정: 펀더멘털이 가장 중요
     if fund.get("ok") is False and out["level"] in ("green", "yellow"):
         out.update(verdict="⚠️ 펀더멘털 약화 — 비중 점검", level="orange")
@@ -362,6 +364,14 @@ def _deepen(out, h, m, bars, ctx, stop_pct, pnl, stop_price, target3r, ma_key, m
         plan.append(("➖ 쉬면", f"{ma_key} {ma_v:,.0f} 위에서 거래량이 마르며 쉬면 보유 — 조정 거래량이 늘면 경계"))
     plan.append(("📉 내리면", f"손절선 {stop_price:,.0f} 이탈 시 정리(예외 없음)"
                  + (f" · {ma_key} {ma_v:,.0f} 대량 이탈이면 절반 축소 검토" if ma_v and ma_v > stop_price else "")))
+    sched = pyr.get("schedule") or []
+    if sched and pnl > 0:
+        nxt = [x for x in sched if x[1] > (_f(m.get("price")) or 0)]
+        if nxt:
+            plan.append(("🪜 피라미드", " · ".join(f"{k} {p:,.0f}원(첫 매수의 {q}%)" for k, p, q in nxt[:2])
+                         + " — 새 돌파·거래량 동반일 때만, 더 산 뒤엔 손절선도 같이 올리고 목표는 첫 매수가 기준 유지"))
+    if any(x[1] == "깡토 · 시간 손절" for x in masters):
+        plan.append(("⏱️ 시간", "목표에 못 닿고 옆으로 2~3주 — 현금이 필요하면 보유 기간 대비 수익이 낮은 순으로 정리"))
     if flow.get("smart5") is not None and (flow.get("smart5") or 0) < 0 and (flow.get("smart20") or 0) < 0:
         plan.append(("🧭 수급", "외국인+기관이 5일·20일 모두 순매도 — 불타기 보류, 반등해도 비중 늘리지 않기"))
     out["plan"] = plan
@@ -513,6 +523,106 @@ def pyramid_plan(h: dict, m: dict, vol: dict, fund: dict, flow: dict, ctx: dict,
     if pivot and vol50:
         trigger = f"종가가 {pivot:,.0f} 위로 마감 + 거래량 {vol50 * 1.5:,.0f}주(50일 평균 1.5배) 이상 + 장대양봉"
     return {"ok": ok_core, "n_ok": n_ok, "n": len(conds), "conds": conds, "new_stop": new_stop, "trigger": trigger}
+
+
+def distribution_days(idx: pd.DataFrame | None, window: int = 25) -> int | None:
+    """오닐의 '물량이 쏟아진 날': 지수가 전날보다 많은 거래량에 0.2% 넘게 내린 날(최근 25거래일). 4~5일이면 상승장 끝 신호."""
+    if idx is None or len(idx) < window + 2 or "volume" not in idx:
+        return None
+    d = idx.tail(window + 1)
+    c = pd.to_numeric(d["close"], errors="coerce").to_numpy(dtype=float)
+    v = pd.to_numeric(d["volume"], errors="coerce").to_numpy(dtype=float)
+    return int(sum(1 for i in range(1, len(c)) if c[i] < c[i - 1] * 0.998 and v[i] > v[i - 1]))
+
+
+def masters_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, flow_df, stop_pct: float, max_r) -> list:
+    """거장 관점(유명 트레이더 매매법 정리본 기준) — 원칙 점검에 보태는 참고 항목. [복원] 값은 범위로 본 참고치예요."""
+    items = []
+    if bars is None or len(bars) < 210:
+        return items
+    c = pd.to_numeric(bars["close"], errors="coerce").to_numpy(dtype=float)
+    hi = pd.to_numeric(bars["high"], errors="coerce").to_numpy(dtype=float)
+    lo = pd.to_numeric(bars["low"], errors="coerce").to_numpy(dtype=float)
+    v = pd.to_numeric(bars["volume"], errors="coerce").to_numpy(dtype=float)
+    ma = lambda n: pd.Series(c).rolling(n).mean().to_numpy()
+    m50, m150, m200, m20 = ma(50), ma(150), ma(200), ma(20)
+    price = c[-1]
+    # 미너비니 추세 템플릿(2017년 책 기준 8가지)
+    rs = _f(m.get("rs"))
+    hi52, lo52 = np.nanmax(hi[-250:]), np.nanmin(lo[-250:])
+    tt = [price > m150[-1] and price > m200[-1], m150[-1] > m200[-1], m200[-1] > m200[-22],
+          m50[-1] > m150[-1] and m50[-1] > m200[-1], price > m50[-1], price >= lo52 * 1.25,
+          price >= hi52 * 0.75, rs is not None and rs >= 70]
+    n = sum(bool(x) for x in tt)
+    items.append(("good" if n == 8 else ("warn" if n >= 6 else "bad"), "미너비니 추세 템플릿",
+                  f"{n}/8 충족 (150·200일선 위, 200일선 한 달 상승, 50일선 최상단, 52주 저점 +25%↑, 고점 -25% 이내, RS 70↑)"))
+    bo_days = _f(m.get("bo_days"))
+    if m.get("bo_status") == "유지" and bo_days is not None and bo_days <= 10 and price < m20[-1]:
+        items.append(("warn", "미너비니 · 돌파 직후 20일선", "돌파한 지 얼마 안 돼 20일선 아래 마감 — 성공 확률이 절반으로 떨어진다고 봄"))
+    # 와인스타인 단계(30주 ≈ 150일선)
+    slope = (m150[-1] / m150[-21] - 1) * 100
+    if price > m150[-1] and slope > 0.5:
+        stage, st_ = "2단계(상승)", "good"
+    elif price < m150[-1] and slope < -0.5:
+        stage, st_ = "4단계(하락) — 사지 않는 구간", "bad"
+    elif (c[-1] / np.nanmin(c[-250:]) - 1) > 0.6:
+        stage, st_ = "3단계(천장 다지기) 가능성 — 평균선이 평평", "warn"
+    else:
+        stage, st_ = "1단계(바닥 다지기) — 30주선 저항 돌파 전", "info"
+    items.append((st_, "와인스타인 단계", f"30주(150일)선 {slope:+.1f}%/20일 · {stage}"))
+    # 오닐: 추격 매수 · 시장 물량일
+    lvl, avg = _f(m.get("bo_level")), _f(h.get("avg"))
+    if lvl and avg:
+        ext = (avg / lvl - 1) * 100
+        if ext > 5:
+            items.append(("warn", "오닐 · 추격 매수", f"평단이 돌파선보다 {ext:+.1f}% 위 — 피벗 +5% 넘게 쫓아 사면 7~8% 손절이 제 역할을 못함"))
+        elif ext >= -2:
+            items.append(("good", "오닐 · 매수 자리", f"평단이 돌파선 {ext:+.1f}% 안 — 피벗 +5% 이내"))
+    dd = ctx.get("dist_days")
+    if dd:
+        items.append(("bad" if max(dd.values()) >= 5 else ("warn" if max(dd.values()) >= 4 else "info"), "오닐 · 시장 물량일",
+                      "최근 25거래일 " + " · ".join(f"{k} {v}일" for k, v in dd.items()) + " (4~5일이면 상승장 끝 신호)"))
+    # 깡토: 주봉 정배열 · 수급 10% · 시간 손절
+    wk = pd.Series(c, index=pd.to_datetime(bars["date"])).resample("W-FRI").last().dropna()
+    if len(wk) >= 60:
+        w5, w20, w60 = wk.rolling(5).mean().iloc[-1], wk.rolling(20).mean().iloc[-1], wk.rolling(60).mean().iloc[-1]
+        ok = wk.iloc[-1] > w5 > w20 > w60
+        items.append(("good" if ok else "warn", "깡토 · 주봉 정배열", "주봉 종가 > 5주 > 20주 > 60주선" + (" 충족" if ok else " 아님 — 주봉이 먼저")))
+    if flow_df is not None and len(flow_df) and "외국인" in flow_df and "기관" in flow_df:
+        last = flow_df.iloc[-1]
+        q = (last.get("외국인") or 0) + (last.get("기관") or 0)
+        dvol = None
+        try:
+            dd_ = pd.Timestamp(last["date"]).normalize()
+            row = bars[pd.to_datetime(bars["date"]).dt.normalize() == dd_]
+            dvol = float(row["volume"].iloc[-1]) if len(row) else None
+        except (KeyError, ValueError, TypeError):
+            dvol = None
+        if dvol:
+            share = q / dvol * 100
+            items.append(("good" if share >= 10 else ("bad" if share <= -10 else "info"), "깡토 · 기관+외국인 비중",
+                          f"최근 집계일 순매수가 거래량의 {share:+.0f}% (10% 이상이 최소 기준, 아래면 개인이 움직인 것)"))
+    if h.get("buy_date"):
+        try:
+            held = int((pd.to_datetime(bars["date"]) >= pd.Timestamp(h["buy_date"])).sum())
+            if held >= 15 and (max_r or 0) < 1:
+                items.append(("warn", "깡토 · 시간 손절", f"매수 후 {held}거래일인데 1R도 못 감 — 목표 없이 옆으로 가면 2~3주에서 끊는 규칙"))
+        except (ValueError, TypeError):
+            pass
+    # 쟁거: 돌파 당일 급등 · 거래량 실린 하락일
+    if len(c) > 2:
+        chg = (c[-1] / c[-2] - 1) * 100
+        v50 = np.nanmean(v[-51:-1])
+        if chg <= -3 and v50 and v[-1] >= v50 * 1.5:
+            items.append(("bad", "쟁거 · 거래량 실린 하락일", f"{chg:+.1f}% · 거래량 {v[-1] / v50:.1f}배 — 절반 덜고, 되돌리는 거래량 실린 상승일이 나오면 다시 채움"))
+    return items
+
+
+def pyramid_schedule(avg: float | None, stop_pct: float) -> list:
+    """깡토 책의 피라미드: 손절 폭만큼 유리해질 때마다 더 사되 차수가 갈수록 줄이기(1차 30%, 2차 15%, 3차 10%)."""
+    if not avg:
+        return []
+    return [(f"{k}차", avg * (1 + stop_pct / 100 * k), pct) for k, pct in ((1, 30), (2, 15), (3, 10))]
 
 
 def score_card(sections: dict) -> tuple[int, str]:

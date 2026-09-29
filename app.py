@@ -78,7 +78,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-29-deep"
+HOLDINGS_VERSION = "2026-09-29-masters"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -2285,7 +2285,10 @@ def _hold_context(df: pd.DataFrame) -> dict:
         oks.append(ok)
         parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
     sm_money = data.sector_money(df, "group") if "tv_live" in df else pd.DataFrame()
-    return {"market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
+    dist = {name: holdings.distribution_days(hist.get(sym, (None, None))[0]) for name, sym in data.MARKETS.items()}
+    return {"dist_days": {k: v for k, v in dist.items() if v is not None},
+            "n_above60": sum(1 for x in oks if x),
+            "market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
             "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
                        for n, sym in data.MARKETS.items()},
             "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
@@ -2418,7 +2421,7 @@ def _deep_view(j: dict):
             f'<div class="dp-row {st_}"><span>{icon[st_]} {html.escape(it)}</span><em>{html.escape(tx)}</em></div>'
             for st_, it, tx in items) + "</div>")
     st.markdown('<div class="dp-grid">' + block("📊 펀더멘털", j.get("fund")) + block("🧭 수급(외국인·기관)", j.get("flow"))
-                + block("🔊 거래량", j.get("vol")) + "</div>", unsafe_allow_html=True)
+                + block("🔊 거래량", j.get("vol")) + block("🎓 거장 관점", j.get("masters")) + "</div>", unsafe_allow_html=True)
     pyr = j.get("pyramid")
     if pyr:
         rows = "".join(f'<span class="dp-cond {"ok" if ok else "no"}">{"✔" if ok else "✖"} {html.escape(n)}'
@@ -2444,7 +2447,7 @@ def _numor(v):
         return None
 
 
-def _render_capital(store: dict, rows, stt: dict):
+def _render_capital(store: dict, rows, stt: dict, ctx: dict | None = None):
     """🧮 자본관리: 계좌 원금·현금을 넣으면 지금 지켜야 할 BEP(멈춤선)를 보여줘요(스승님 원칙)."""
     acc = store.setdefault("account", {})
     stock_val = sum((m.get("price") or 0) * (h.get("qty") or 0) for h, m, *_ in rows)
@@ -2481,6 +2484,17 @@ def _render_capital(store: dict, rows, stt: dict):
             f'<div><em>지켜야 할 BEP</em><b style="color:{col}">{b["bep"]:,.0f}원</b>'
             f'<span style="color:{col}">여유 {dist:+.1f}%</span></div>'
             f'<div><em>절대 마지노선(원금 -10%)</em><b>{b["hard"]:,.0f}원</b></div></div>', unsafe_allow_html=True)
+        # 깡토 책: 한 번에 잃어도 되는 금액(계좌의 1~2%, 내 원칙 1.5%) ÷ 손절 폭(8%) = 한 종목 최대 투자금,
+        # 장세에 따라 유닛 수: 오르는 장 3 · 옆으로 2 · 내리는 장 1
+        n_up = (ctx or {}).get("n_above60")
+        units = {2: 3, 1: 2, 0: 1}.get(n_up, 2)
+        max_pos = equity * 0.015 / 0.08
+        st.markdown(
+            f'<div class="cap-row"><div><em>한 종목 최대 투자금(위험 1.5% ÷ 손절 8%)</em><b>{max_pos:,.0f}원</b>'
+            f'<span>평가액의 {max_pos / equity * 100:.1f}%</span></div>'
+            f'<div><em>지금 장세 유닛</em><b>{units}유닛</b><span>지수 60일선 위 {n_up if n_up is not None else "-"}/2 → '
+            f'한 유닛 {max_pos / 4:,.0f}원(최대 비중을 4유닛으로)</span></div></div>', unsafe_allow_html=True)
+        st.caption("유닛은 이긴 뒤에만 한 칸 늘리고(목표 3R에 닿아야 이긴 것) 진 뒤에는 한 칸 줄여요. 최대 8종목.")
         if equity <= b["bep"]:
             st.error("🛑 계좌가 BEP에 닿았어요. 원칙: 욕심이 나도 전액 현금화하고 투자를 멈춘 뒤 시장을 다시 관찰하기.")
         else:
@@ -2501,6 +2515,14 @@ PRINCIPLES = [
     ("가치투자", ["절대가치 = 순현금 + 영업이익 × (영업이익률의 절반) 배",
                 "가치우파(하락 멈춤·횡보·조금씩 우상향) 확인 후 천천히 분할매수 — 매수 기간과 총 비중을 먼저 정한다",
                 "가치훼손 이슈가 생기면(우파 → 좌파) 매도. 가치투자라고 무조건 들고 가지 않는다"]),
+    ("거장 관점(유명 트레이더 매매법)", [
+        "오닐: 피벗(손잡이 고점) +5% 넘게 쫓아 사지 않기 · 매수가 기준 7~8% 손절 · 지수 물량일(거래량 늘며 -0.2%↓) 25일에 4~5일이면 상승장 끝",
+        "미너비니: 추세 템플릿 8가지(150·200일선 위, 200일선 상승, 50일선 최상단, 52주 저점 +25%↑·고점 -25% 이내, RS 상위) · 돌파 직후 20일선 아래 마감이면 확률 절반",
+        "와인스타인: 2단계(30주선 위·상승)에서만, 4단계는 사지 않음 · 손절은 %가 아니라 돌파 자리 아래, 15%보다 멀면 안 삼",
+        "쟁거: 거래량 실린 하락일엔 절반 덜고, 되돌리는 거래량 실린 상승일에 다시 채움 · 돌파 지점 아래로 되돌아오면 전량",
+        "깡토 책: 기관+외국인 순매수가 거래량의 10%↑ · 주봉·일봉 정배열 · 피라미드 1차 30%→2차 15%→3차 10% · 2~3주 횡보면 시간 손절"]),
+    ("검증 메모", ["한국 논문(유명 트레이더 매매법 11장): 52주 최고가 하나만으로는 한국에서 예측력이 약하다는 결과도 있음 → 신고가는 주도섹터·실적·수급과 같이 볼 때 의미",
+                "정리본의 [복원]·[2차] 숫자는 원전값이 아님 — 앱의 기준치는 참고용이고 바꿔 가며 확인할 자리"]),
     ("계좌 분리", ["추세 계좌와 가치 계좌는 물과 기름 — 섞지 않는다",
                  "추세 계좌에서 '많이 빠졌으니 싸다'며 사거나, 20일선 이탈 후 'AI가 좋으니까' 버티지 않는다 → 그건 가치 계좌의 일"]),
 ]
@@ -2858,7 +2880,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     for h in store["holdings"]:
         m, bars, quote = _hold_metrics(h["code"], df, quotes)
         rows.append((h, m, bars, holdings.judge(h, m, bars, ctx)))
-    _render_capital(store, rows, stt)
+    _render_capital(store, rows, stt, ctx)
     _render_principles()
 
     # 요약
