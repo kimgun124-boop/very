@@ -1,0 +1,15 @@
+{
+ "lock": {
+  "pw": {
+   "salt": "37977caf305ff5a87b6b4128d92dddcd",
+   "hash": "009f06ecf3da147fc95561d78b00a15c3a212ed111c294f74ba28e6e5584a61c",
+   "iter": 200000
+  },
+  "changed_at": "2026-09-29 12:59",
+  "code": {
+   "salt": "af5741fcf4b8e6f2dd7a5925e6cb5560",
+   "hash": "0528d34479cad637f65aee960fb05a350547735a109a7675588c2f0a8f64bac5",
+   "iter": 200000
+  }
+ }
+}

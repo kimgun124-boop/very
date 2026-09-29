@@ -57,8 +57,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map")
-DATA_VERSION = "2026-09-29-sleepfix"   # data.py의 DATA_VERSION과 같아야 해요
+            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
+DATA_VERSION = "2026-09-29-idxchart"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -758,7 +758,7 @@ def load_universe() -> list[dict]:
 
 def load_industry_map(codes: tuple[str, ...]) -> tuple[dict, dict]:
     """전 종목 공식 업종(하루 기억). 목록과 따로 받아서, 목록을 예전에 받아 뒀어도 업종은 새로 채워져요."""
-    got = swr(("industry_map", "v1"), 86400, lambda: data.fetch_industry_map(codes),
+    got = swr(("industry_map", "v2"), 86400, lambda: data.fetch_industry_map(codes),
               "전 종목의 업종(네이버 업종 · WICS)을 확인하는 중이에요. 처음 한 번 10~30초 걸려요.")
     if not got or not got[0]:
         if time.time() - _UNI_RETRY.get("ind", 0) > 180:          # 못 받았으면 3분 뒤 다시
@@ -1050,6 +1050,9 @@ with st.sidebar:
         min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
         nh_filter = st.selectbox("신고가 봉 필터", list(NH_FILTERS), index=0,
                                  help="지금 봉(오늘 일봉·이번 주 주봉·이번 달 월봉)의 고가가 52주 또는 역대(상장 이후) 최고가를 넘은 종목만")
+        show_halted = st.toggle("거래정지 종목도 보기", value=False,
+                                help="최근 5거래일 동안 거래가 한 주도 없는 종목(거래정지·상장폐지 절차 등)은 가격이 멈춰 있어서 "
+                                     "'신고가까지 0%'처럼 보여요. 기본으로 빼 두고, 켜면 '⛔ 거래정지'로 표시해서 보여줘요.")
         only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
         only_holding = st.toggle("신고가 돌파 유지 종목만",
                                  help="직전 52주 최고가를 종가로 돌파한 뒤 한 번도 그 아래에서 마감하지 않은 종목만")
@@ -1084,6 +1087,8 @@ with st.sidebar:
 # ─────────────────────────── 화면 조각 ───────────────────────────
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["code"].map(_mkt) == market]
+    if "halted" in df and not show_halted:
+        df = df[df["halted"] != True]  # noqa: E712
     if tags:
         f = df[df["tags"].apply(lambda ts: any(t in ts for t in tags))]
     else:
@@ -1556,7 +1561,7 @@ def _rs_color(v):
 
 def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
-        "종목": f["name"],
+        "종목": [("⛔ " + n if h is True else n) for n, h in zip(f["name"], f["halted"] if "halted" in f else [None] * len(f))],
         "코드": f["code"],
         "시장": f["market"],
         "분류": f["group"],
@@ -1924,7 +1929,7 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
 
 
 def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, high52: float | None = None,
-                 key: str = "cc"):
+                 key: str = "cc", is_index: bool = False):
     """일봉·주봉·월봉 캔들 + 이동평균 + 거래량. 국내 종목은 실시간 시세로 마지막 봉을 갱신해요."""
     with st.container(key=f"{key}_bar"):
         c1, c2, c3 = st.columns([1.0, 2.0, 1.6], gap="medium")
@@ -1934,8 +1939,9 @@ def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, hi
         default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
         per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
                                    width="stretch") or default_p
-        opts = c3.segmented_control("표시", ["이동평균", "거래량", "거래대금"], selection_mode="multi",
-                                    default=["이동평균", "거래량", "거래대금"], key=f"{key}_opts2", width="stretch") or []
+        show_opts = ["이동평균", "거래량"] if is_index else ["이동평균", "거래량", "거래대금"]
+        opts = c3.segmented_control("표시", show_opts, selection_mode="multi",
+                                    default=show_opts, key=f"{key}_opts2", width="stretch") or []
     with st.spinner("차트를 불러오는 중이에요."):
         bars = load_chart(code, tf)
     if bars is None or bars.empty:
@@ -2672,6 +2678,43 @@ def render_chart_tab(df: pd.DataFrame, quotes: dict):
     _render_chart_tab(df, quotes)
 
 
+CHART_INDEXES = {"코스피": ("KOSPI", "코스피"), "코스닥": ("KOSDAQ", "코스닥"), "나스닥": ("^IXIC", None),
+                 "S&P 500": ("^GSPC", None), "다우": ("^DJI", None), "니케이225": ("^N225", None)}
+INDEX_CODES = {v[0]: k for k, v in CHART_INDEXES.items()}
+
+
+def _render_index_chart(code: str):
+    """지수 차트(코스피·코스닥은 실시간으로 마지막 봉 갱신)."""
+    label = INDEX_CODES[code]
+    live = None
+    ov_key = CHART_INDEXES[label][1]
+    if ov_key:
+        try:
+            ov = (load_overview() or {}).get(ov_key) or {}
+            if ov.get("last"):
+                live = {"price": ov["last"], "status": ov.get("status") or "OPEN"}
+        except Exception:
+            live = None
+    bars = load_chart(code, "일봉")
+    if live and bars is not None and len(bars):
+        ref = float(bars["close"].iloc[-1])
+        if ref and abs(live["price"] / ref - 1) > 0.3:      # 실시간 값이 이상하면(단위·자료 오류) 쓰지 않아요
+            live = None
+    last = live["price"] if live else (float(bars["close"].iloc[-1]) if bars is not None and len(bars) else None)
+    prev = None
+    if bars is not None and len(bars) >= 2:
+        same_day = pd.Timestamp(bars["date"].iloc[-1]).date() == data.now_kst().date()
+        prev = float(bars["close"].iloc[-2] if (same_day or not live) else bars["close"].iloc[-1])
+    chg = (last / prev - 1) * 100 if last and prev else None
+    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#51616C")
+    st.markdown(
+        f'<div class="ch-head"><b>{label}</b><span class="ch-code">{code}</span>'
+        f'<span class="ch-px" style="color:{col}">{last:,.2f}' + (f" <small>{chg:+.2f}%</small>" if chg is not None else "")
+        + '</span><span class="ch-sub">' + ("실시간 · 마지막 봉이 새로고침마다 바뀌어요" if live else "해외 지수 · 야후 기준(지연)")
+        + "</span></div>" if last else f'<div class="ch-head"><b>{label}</b></div>', unsafe_allow_html=True)
+    candle_chart(code, "IDX", live, None, key="idxchart", is_index=True)
+
+
 def _render_chart_tab(df: pd.DataFrame, quotes: dict):
     """🕯️ 차트: 종목을 검색해서 일봉·주봉·월봉 캔들로 봐요."""
     board = df.drop_duplicates("code")
@@ -2686,6 +2729,17 @@ def _render_chart_tab(df: pd.DataFrame, quotes: dict):
     if st.session_state.get("chart_pick") not in ordered:
         st.session_state.pop("chart_pick", None)
 
+    with st.container(key="chart_idx_bar"):
+        cur_idx = INDEX_CODES.get(st.session_state.get("chart_code"))
+        if st.session_state.get("chart_idx") != cur_idx:
+            st.session_state["chart_idx"] = cur_idx
+        st.segmented_control("📈 지수 차트", list(CHART_INDEXES), key="chart_idx", width="stretch",
+                             on_change=lambda: st.session_state.update(
+                                 chart_code=CHART_INDEXES[st.session_state["chart_idx"]][0])
+                             if st.session_state.get("chart_idx") else None)
+    if st.session_state.get("chart_code") in INDEX_CODES:
+        _render_index_chart(st.session_state["chart_code"])
+        st.caption("종목 차트로 돌아가려면 아래 검색칸에서 종목을 고르세요.")
     with st.container(key="chart_search"):
         c1, c2 = st.columns([1.35, 1], gap="medium")
         q = c1.text_input("🔍 종목 검색", placeholder="종목 이름이나 코드를 치고 엔터 — 예: 삼성, 토마토, 035720",
@@ -2714,7 +2768,7 @@ def _render_chart_tab(df: pd.DataFrame, quotes: dict):
             else:
                 st.caption("검색 결과가 없어요. 이름을 조금 짧게 쓰거나 6자리 코드를 넣어 보세요.")
     code = st.session_state.get("chart_code") or st.session_state.get("chart_pick") or (ordered[0] if ordered else None)
-    if code is None:
+    if code is None or code in INDEX_CODES:
         return
     name, currency, row = (labels.get(code) or "").split(" · ")[0] or names.get(code, code), "KRW", None
     st.session_state["chart_code"] = code

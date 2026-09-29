@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-29-sleepfix"
+DATA_VERSION = "2026-09-29-idxchart"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -1711,7 +1711,23 @@ def fetch_industry_map(codes=None) -> tuple[dict[str, str], dict]:
         diag[label] = len(out) - n0
         if want and len(want - set(out)) <= max(20, len(want) * 0.02):
             break
+    miss = [c for c in want if c not in out][:1500]
+    if miss:                                          # 남은 종목은 종목 페이지의 '업종' 링크에서 하나씩
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            got = dict(zip(miss, pool.map(_item_page_industry, miss)))
+        n0 = len(out)
+        out.update({c: n for c, n in got.items() if n})
+        diag["종목 페이지"] = len(out) - n0
     return out, diag
+
+
+def _item_page_industry(code: str) -> str:
+    try:
+        r = session.get(ITEM_MAIN_URL, params={"code": code}, timeout=8)
+        m = re.search(r'type=upjong&(?:amp;)?no=\d+"[^>]*>([^<]+)</a>', decode(r.content))
+        return _html_unescape(m.group(1).strip()) if m else ""
+    except requests.RequestException:
+        return ""
 
 
 def fetch_krx_universe() -> list[dict]:
@@ -2170,6 +2186,17 @@ def sector_money(df: pd.DataFrame, by: str = "group", top_names: int = 3) -> pd.
     return pd.DataFrame(rows).sort_values("tv", ascending=False).reset_index(drop=True)
 
 
+def is_halted(hist: pd.DataFrame | None, quote: dict | None, days: int = 5) -> bool:
+    """거래정지(또는 사실상 거래가 없는) 종목: 최근 5거래일 거래량이 모두 0이고 오늘도 거래가 없어요.
+    이런 종목은 가격이 멈춰 있어서 52주 최고 = 현재가, 신고가까지 0%처럼 보이지만 실제로는 살 수 없어요."""
+    if hist is None or hist.empty or "volume" not in hist or len(hist) < days:
+        return False
+    v = pd.to_numeric(hist["volume"].tail(days), errors="coerce").fillna(0)
+    if (v > 0).any():
+        return False
+    return not (quote and (quote.get("volume") or 0) > 0)
+
+
 def build_table(stocks: list[dict], histories: dict, quotes: dict,
                 shares: dict | None = None, fx: dict | None = None, bo_mode: str = "line",
                 monthlies: dict | None = None, official52: dict | None = None) -> pd.DataFrame:
@@ -2187,6 +2214,7 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict,
             **s,
             **metrics,
             **live,
+            "halted": is_halted(hist, quotes.get(s["code"])),
             "market": market,
             "currency": currency,
             "url": quote_url(s["code"]),
@@ -2508,7 +2536,7 @@ def fetch_chart(code: str, tf: str = "일봉") -> pd.DataFrame:
         d = mock_history(code, 520)
         return d if tf == "일봉" else _resample(d, "W-FRI" if tf == "주봉" else "MS")
     try:
-        if is_kr(code):
+        if is_kr(code) or code in ("KOSPI", "KOSDAQ", "KPI200"):       # 국내 종목 · 코스피·코스닥 지수
             r = session.get(FCHART_URL, params={"symbol": code, "timeframe": kind, "count": count, "requestType": 0},
                             timeout=8)
             r.raise_for_status()
