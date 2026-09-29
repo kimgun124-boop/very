@@ -58,7 +58,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars")
-DATA_VERSION = "2026-09-28-safe"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-09-28-fill"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -794,10 +794,13 @@ def load_shares() -> dict:
     store.setdefault("t_retry", 0.0)
     now = time.time()
     full = now - store["t"] >= 43200
-    missing = [c for c in ALL_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
-    if not full and not (missing and now - store["t_retry"] >= 600):
+    missing = [c for c in ALL_CODES + EXTRA_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
+    big_new = len(missing) > 200 and now - store.get("t_big", 0.0) >= 120     # 전체 종목을 막 켰을 때는 바로 받기
+    if not full and not (missing and (now - store["t_retry"] >= 600 or big_new)):
         return store
-    kr_t = KR_CODES if full else tuple(c for c in missing if data.is_kr(c))
+    if big_new:
+        store["t_big"] = now
+    kr_t = KR_CODES + EXTRA_CODES if full else tuple(c for c in missing if data.is_kr(c))
     os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
     with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요."):
         kr, kr_diag = data.fetch_kr_shares(kr_t) if kr_t else ({}, {})
@@ -815,7 +818,7 @@ def load_shares() -> dict:
         store["os"] = os_diag
     store["t_retry"] = now
     if full:
-        store["t"] = now if len(kr) >= 0.8 * max(1, len(KR_CODES)) else now - 43200 + 600
+        store["t"] = now if len(kr) >= 0.8 * max(1, len(kr_t)) else now - 43200 + 600
     return store
 
 
@@ -2847,14 +2850,20 @@ def _buy_params() -> dict:
 
 # ─────────────────────────── 차기 주도섹터 · 섹터 안 급상승 엔진 ───────────────────────────
 def load_trends_all():
-    """국내 전 종목 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
-    return swr(("trends_all", KR_CODES), 600, lambda: data.fetch_stock_trends(KR_CODES), first_wait=False)
+    """국내 전 종목(보드 + 코스피·코스닥 전체) 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
+    codes = KR_CODES + EXTRA_CODES
+    return swr(("trends_all", codes), 900, lambda: data.fetch_stock_trends(codes), first_wait=False)
 
 
 def load_fins_all():
-    """국내 전 종목 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
-    return swr(("fins_all", KR_CODES), 43200, lambda: data.fetch_financials_many(KR_CODES, workers=12),
-               first_wait=False)
+    """국내 전 종목(보드 + 코스피·코스닥 전체) 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
+    codes = KR_CODES + EXTRA_CODES
+    return swr(("fins_all", codes), 43200, lambda: data.fetch_financials_many(codes, workers=12), first_wait=False)
+
+
+def load_official_52w_bg(codes: tuple[str, ...]) -> dict:
+    """새로 들어온 전 종목의 네이버 공식 52주 최고·최저(1시간마다, 기다리지 않음)."""
+    return swr(("h52_all", codes), 3600, lambda: data.fetch_official_52w(codes), first_wait=False, empty={}) or {}
 
 
 def _ok_mark(v) -> str:
@@ -4064,7 +4073,9 @@ def render_board():
     _QUOTES.update(quotes)
     shares_store = load_shares()
     df = data.build_table(STOCKS_VIEW, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
-                          monthlies=load_monthlies(ALL_CODES), official52=load_official_52w(KR_CODES))
+                          monthlies=load_monthlies(ALL_CODES + EXTRA_CODES),
+                          official52={**load_official_52w_bg(EXTRA_CODES), **load_official_52w(KR_CODES)}
+                          if EXTRA_CODES else load_official_52w(KR_CODES))
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 
@@ -4079,6 +4090,7 @@ def render_board():
 
     leaders_now = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
+    _TRENDS_BG["v"] = trends_all
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
@@ -4115,17 +4127,30 @@ def render_board():
                 job()
 
 
+def _attach_flows(f: pd.DataFrame) -> pd.DataFrame:
+    """지금 화면에 보이는 종목(쪽)의 수급 열을 채워요. 뒤에서 받아 둔 전 종목 수급이 있으면 그걸 먼저 써요."""
+    flow_keys = list(data.trend_summary(None))
+    if not len(f):
+        return f.assign(**{k: [] for k in flow_keys})
+    trends = {}
+    if show_flow:
+        bg = _TRENDS_BG.get("v") or {}
+        need = tuple(c for c in f["code"] if data.is_kr(c) and (bg.get(c) is None or bg[c].empty))
+        trends = {**bg, **(load_trends(need) if need else {})}
+    _TRENDS_BG["page"] = trends
+    summ = [data.trend_summary(trends.get(c)) for c in f["code"]]
+    return f.assign(**{k: [x[k] for x in summ] for k in flow_keys})
+
+
+_TRENDS_BG: dict = {}
+
+
 def render_list(df, histories, quote_error, shares_store, fins_all=None):
     f = apply_filters(df)
     if only_earn:
         fins = load_financials(tuple(c for c in f["code"] if data.is_kr(c)))
         f = add_earnings(f, fins)
         f = f[f["earn_ok"] == True]  # noqa: E712
-    trends = load_trends(tuple([c for c in f["code"] if data.is_kr(c)][:150])) if show_flow else {}
-    summ = [data.trend_summary(trends.get(c)) for c in f["code"]]
-    flow_keys = list(data.trend_summary(None))
-    f = f.assign(**{k: [x[k] for x in summ] for k in flow_keys}) if len(f) else f.assign(**{k: [] for k in flow_keys})
-
     n_hot = int((f["days_since_high"] <= recent_days).sum())
     n_near = int((f["to_high"] <= 10).sum())
     n_aligned = int((f["aligned"] == True).sum())  # noqa: E712
@@ -4156,12 +4181,13 @@ def render_list(df, histories, quote_error, shares_store, fins_all=None):
             pages = max(1, -(-len(f) // size))
             page = c3.number_input(f"쪽 (전체 {len(f):,}종목 · {pages}쪽)", 1, pages, 1, key="list_page")
             f = f.iloc[(page - 1) * size: page * size]
+        f = _attach_flows(f)
         with st.container(key="desk_table"):
             render_table(f)
             st.caption("노란 줄 = 최근 신고가 · 신고가까지 빨강 3% 이내, 주황 10% 이내 · 수급은 억원(추정) · 해외는 현지 통화, 15분 지연")
         with st.container(key="mobile_view"):
             render_cards(f, n_hot, n_near, n_aligned, fins_all)
-        render_detail(f, histories, trends)
+        render_detail(f, histories, _TRENDS_BG.get("page") or _TRENDS_BG.get("v") or {})
     render_checks(df, quote_error, shares_store)
 
 

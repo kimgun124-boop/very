@@ -19,6 +19,7 @@ import os
 import random
 import time as _time
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -42,7 +43,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-safe"
+DATA_VERSION = "2026-09-28-fill"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -373,6 +374,16 @@ def fetch_histories(codes, workers: int = 12) -> dict[str, tuple]:
     if kr:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             out.update(zip(kr, pool.map(fetch_history, kr)))
+        # 한꺼번에 많이 받으면 네이버가 잠깐 막아서 빈 종목이 생겨요 → 빠진 종목만 천천히 두 번 더 받아요
+        for wait, w in ((2.0, 4), (5.0, 2)):
+            miss = [c for c in kr if out.get(c) is None or out[c][1] is None or out[c][1].empty]
+            if not miss or MOCK:
+                break
+            time.sleep(wait)
+            with ThreadPoolExecutor(max_workers=w) as pool:
+                for c, res in zip(miss, pool.map(fetch_history, miss)):
+                    if res[1] is not None and not res[1].empty:
+                        out[c] = res
     if os_:
         got = _yf_batch(os_, "26mo", "1d")
         out.update({t: (None, df, None) for t, df in got.items()})
@@ -983,8 +994,10 @@ def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
     if MOCK:
         return {c: _rng(c).randint(10_000_000, 900_000_000) for c in codes}, {**diag, "순위표": len(codes)}
     result: dict[str, int] = {}
+    many = len(codes) > 300           # (속도) 종목이 많으면 순위표(약 60쪽)로 한 번에 받고, 빠진 것만 종목별로
+    detail_codes = [] if many else codes
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for code, n in zip(codes, pool.map(_detail_api_shares, codes)):
+        for code, n in zip(detail_codes, pool.map(_detail_api_shares, detail_codes)):
             if n:
                 result[code] = n
     diag["상세API"] = len(result)
@@ -1003,6 +1016,13 @@ def fetch_kr_shares(codes) -> tuple[dict[str, int], dict]:
             if c in shares:
                 result[c] = shares[c]
                 diag["순위표"] += 1
+    if many:
+        missing = [c for c in codes if c not in result]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for code, n in zip(missing, pool.map(_detail_api_shares, missing)):
+                if n:
+                    result[code] = n
+                    diag["상세API"] += 1
     for label, fn in (("종목페이지", _shares_from_item_page), ("모바일", _naver_mobile_shares)):
         missing = [c for c in codes if c not in result]
         if not missing:
@@ -1871,14 +1891,21 @@ def _fetch_stock_trend_now(code: str, days: int = 20) -> pd.DataFrame:
         payload = _get_json([f"{STOCK_API}/domestic/detail/{code}/trend", f"{M_API}/stock/{code}/trend"],
                             params={"tradeType": "KRX", "startIdx": 0, "pageSize": days}, timeout=6)
         df = parse_stock_trend(payload)
-    _trend_cache[code] = (_time.time(), df)
+    # 못 받은 종목(빈 표)은 10분이 아니라 1분 뒤에 다시 받아요
+    _trend_cache[code] = (_time.time() - (TREND_TTL - 60 if df is None or df.empty else 0), df)
     return df
 
 
 def fetch_stock_trends(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
     codes = [c for c in codes if is_kr(c)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        return dict(zip(codes, pool.map(fetch_stock_trend, codes)))
+        out = dict(zip(codes, pool.map(fetch_stock_trend, codes)))
+    miss = [c for c, d in out.items() if d is None or d.empty]
+    if miss and not MOCK and len(miss) < len(codes):        # 일부만 빠졌으면(네이버가 잠깐 막음) 천천히 한 번 더
+        time.sleep(1.5)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            out.update(zip(miss, pool.map(_fetch_stock_trend_now, miss)))
+    return out
 
 
 def trend_summary(df: pd.DataFrame | None) -> dict:
