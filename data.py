@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-universe2"
+DATA_VERSION = "2026-09-28-safe"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -94,7 +94,26 @@ def rows_to_frame(rows) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "close", "high", "low"])
     df = df[df["close"] > 0]
-    return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    return fix_bars(df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True))
+
+
+def fix_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """거래정지·신규상장 날처럼 시가·고가·저가가 0으로 오는 봉을 종가로 채워요(0으로 나누기 오류 방지)."""
+    if df is None or df.empty or "close" not in df:
+        return df
+    c = pd.to_numeric(df["close"], errors="coerce")
+    bad = False
+    for col in ("open", "high", "low"):
+        if col in df:
+            v = pd.to_numeric(df[col], errors="coerce")
+            m = ~(v > 0)
+            if m.any():
+                bad = True
+                df[col] = v.where(~m, c)
+    if bad:
+        df["high"] = np.fmax(pd.to_numeric(df["high"], errors="coerce"), c)
+        df["low"] = np.fmin(pd.to_numeric(df["low"], errors="coerce"), c)
+    return df
 
 
 def chunks(items, size):
@@ -393,8 +412,12 @@ def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
 def _arrays(hist: pd.DataFrame):
     """일봉 DataFrame → (날짜 datetime64[D], 고가, 저가, 종가) numpy 배열. 계산은 전부 이 배열로 해서 빨라요."""
     d = hist["date"].values.astype("datetime64[D]")
-    return (d, hist["high"].to_numpy(dtype=float), hist["low"].to_numpy(dtype=float),
-            hist["close"].to_numpy(dtype=float))
+    c = hist["close"].to_numpy(dtype=float)
+    h, l = hist["high"].to_numpy(dtype=float), hist["low"].to_numpy(dtype=float)
+    if not ((h > 0).all() and (l > 0).all()):        # 서버에 예전에 받아 둔 일봉에도 0이 섞여 있을 수 있어요
+        h = np.where(h > 0, h, c)
+        l = np.where(l > 0, l, c)
+    return d, h, l, c
 
 
 def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None = None, bo_mode: str = "line",
@@ -729,7 +752,7 @@ def _breakout_np(dts: np.ndarray, high: np.ndarray, close: np.ndarray, mode: str
         out.update(
             bo_status="유지", bo_level=cur["level"], bo_date=day(cur["start"]),
             bo_days=last - cur["start"] + 1, bo_held=last - cur["start"] + 1,
-            bo_vs=(cl[-1] / cur["level"] - 1) * 100,
+            bo_vs=(cl[-1] / cur["level"] - 1) * 100 if cur["level"] else None,
         )
     else:                                                 # 지금의 52주 최고가 아래
         w0 = max(0, n - lookback)
@@ -742,7 +765,7 @@ def _breakout_np(dts: np.ndarray, high: np.ndarray, close: np.ndarray, mode: str
         out.update(
             bo_status="이탈", bo_level=ref, bo_date=day(peak_i),
             bo_days=max(1, last - first_below + 1),
-            bo_vs=(cl[-1] / ref - 1) * 100,
+            bo_vs=(cl[-1] / ref - 1) * 100 if ref else None,
             bo_break_date=day(min(first_below, last)),
             bo_held=(runs[-1]["broken"] - runs[-1]["start"]) if runs and runs[-1]["broken"] is not None else None,
         )
@@ -1479,13 +1502,97 @@ def fetch_upjong_map() -> dict[str, str]:
     return out
 
 
+# 공식 업종 이름(네이버 업종 · 한국거래소 업종) → 앱의 산업 칸. 위에서부터 먼저 맞는 규칙을 써요.
+# 반도체·조선·화장품·건설·바이오·금융처럼 원래 있던 산업과 뜻이 똑같을 때만 원래 칸에 넣고,
+# 2차전지·원전·OLED처럼 '업종'이 아니라 '테마'인 것은 업종으로 추측하지 않아요(테마는 네이버 테마 태그로 따로 붙여요).
+INDUSTRY_RULES = [
+    (r"반도체", "반도체"),
+    (r"디스플레이", "디스플레이"),
+    (r"조선|선박", "조선"),
+    (r"우주항공|국방|항공기|무기", "방산·우주항공"),
+    (r"화장품", "화장품"),
+    (r"건설|건축|토목", "건설"),
+    (r"제약|의약|생물공학|바이오|건강관리|생명과학|의료", "바이오·헬스케어"),
+    (r"은행|증권|보험|카드|창업투자|금융|신탁|복합기업|지주", "금융·지주"),
+    (r"전기유틸리티|가스유틸리티|복합유틸리티|유틸리티|석유|가스|에너지|전기업|발전", "에너지·유틸리티"),
+    (r"전기장비|전기제품|전기 장비|전동기|발전기|전선|절연|축전지|일차전지", "전기·전자장비"),
+    (r"통신장비|통신 및 방송 장비|핸드셋|컴퓨터|주변기기|전자장비|전자제품|전자부품|사무용전자|전자기기|계측", "IT하드웨어"),
+    (r"카탈로그소매|전자상거래|통신판매|온라인 소매", "유통·무역"),
+    (r"소프트웨어|IT서비스|정보서비스|자료처리|호스팅|포털|인터넷|양방향미디어", "소프트웨어·인터넷"),
+    (r"게임|방송|엔터테인먼트|광고|출판|영화|미디어|음악|오디오물", "미디어·엔터·게임"),
+    (r"무선통신|다각화된통신|전기 통신|통신서비스|통신업", "통신"),
+    (r"화학|고무|플라스틱|비료|합성", "화학"),
+    (r"철강|비철금속|금속|1차 철강|주조", "철강·금속"),
+    (r"종이|목재|포장|펄프", "종이·포장"),
+    (r"자동차|타이어|트레일러", "자동차"),
+    (r"가정용품|섬유|의류|신발|호화품|레저용|가구|문구|가방|귀금속|완구|생활용품", "소비재"),
+    (r"기계|장비", "기계"),
+    (r"항공사|해운|운송|물류|철도|도로|창고", "운송·물류"),
+    (r"식품|음료|담배|식료품|도축|곡물", "음식료"),
+    (r"가정용품|섬유|의류|신발|호화품|레저용|가구|문구|가방|귀금속|완구|생활용품", "소비재"),
+    (r"호텔|레스토랑|레저|교육|다각화된소비자|여행|숙박|음식점|오락", "소비자 서비스"),
+    (r"백화점|판매업체|소매|도매|무역|상품 중개|유통|전문소매", "유통·무역"),
+    (r"상업서비스|사업지원|인력|경비|전문 서비스|연구개발|엔지니어링", "상업서비스"),
+    (r"부동산|리츠", "부동산"),
+]
+
+
+def classify_industry(industry: str) -> str:
+    """공식 업종 이름을 앱의 산업 칸으로 옮겨요. 맞는 규칙이 없으면 '기타 업종'."""
+    name = industry or ""
+    for pat, sector in INDUSTRY_RULES:
+        if re.search(pat, name):
+            return sector
+    return "기타 업종"
+
+
+def fetch_theme_map(max_pages: int = 10) -> dict[str, list[str]]:
+    """네이버 테마 {테마 이름: [종목코드]}. 2차전지·원전·방산처럼 업종으로 안 나뉘는 흐름을 태그로 붙일 때 써요."""
+    if MOCK:
+        return {"2차전지(소재/부품)": ["900001", "900004", "042700"], "원자력발전": ["900002", "900005"],
+                "방위산업/전쟁 및 테러": ["900003", "012450"]}
+    themes = []
+    for page in range(1, max_pages + 1):
+        try:
+            r = session.get("https://finance.naver.com/sise/theme.naver", params={"page": page}, timeout=10)
+            got = re.findall(r'href="/sise/sise_group_detail\.naver\?type=theme&(?:amp;)?no=(\d+)"[^>]*>([^<]+)</a>', decode(r.content))
+        except requests.RequestException:
+            break
+        new = [g for g in got if g not in themes]
+        if not new:
+            break
+        themes += new
+
+    def one(g):
+        no, name = g
+        try:
+            r = session.get("https://finance.naver.com/sise/sise_group_detail.naver", params={"type": "theme", "no": no},
+                            timeout=10)
+            return _html_unescape(name.strip()), sorted(set(re.findall(r'/item/main\.naver\?code=(\w{6})', decode(r.content))))
+        except requests.RequestException:
+            return _html_unescape(name.strip()), []
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for name, codes in pool.map(one, themes):
+            if codes:
+                out[name] = codes
+    return out
+
+
+def _html_unescape(t: str) -> str:
+    import html as _h
+    return _h.unescape(t)
+
+
 def fetch_krx_universe() -> list[dict]:
     """코스피·코스닥 상장 종목 전체 [{code, name, market, industry, product}]. 스팩·ETF·ETN·우선주는 빼요.
     네이버 모바일 → 한국거래소 KIND → 네이버 PC 순서로 시도해요(해외 서버에서 막히는 곳이 있어서)."""
     if MOCK:
         rng = _rng("universe")
         return [{"code": f"9{i:05d}", "name": f"테스트{'피' if i % 3 else '닥'}{i}", "market": "코스피" if i % 3 else "코스닥",
-                 "industry": rng.choice(["반도체 제조업", "의약품 제조업", "소프트웨어 개발 및 공급업", "금융 지원 서비스업"]),
+                 "industry": rng.choice(["반도체와반도체장비", "제약", "소프트웨어", "증권", "화학", "자동차부품", "조선",
+                                         "디스플레이장비및부품", "식품", "전기제품", "게임엔터테인먼트", "기계"]),
                  "product": "테스트 제품"} for i in range(1, int(os.environ.get("MOCK_UNIVERSE", "300")) + 1)]
     out = []
     UNIVERSE_DIAG.clear()
@@ -3149,6 +3256,8 @@ def _session_bars(hist: pd.DataFrame, quote: dict | None, today: date | None = N
     d = hist["date"].values.astype("datetime64[D]")
     o = hist["open"].to_numpy(dtype=float) if "open" in hist else hist["close"].to_numpy(dtype=float)
     h, l, c = (hist[k].to_numpy(dtype=float) for k in ("high", "low", "close"))
+    if not ((h > 0).all() and (l > 0).all() and (o > 0).all()):
+        h, l, o = np.where(h > 0, h, c), np.where(l > 0, l, c), np.where(o > 0, o, c)
     v = hist["volume"].to_numpy(dtype=float) if "volume" in hist else np.full(len(d), np.nan)
     q = quote or {}
     price, qh, ql, qv = q.get("price"), q.get("high"), q.get("low"), q.get("volume")

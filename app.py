@@ -57,8 +57,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe")
-DATA_VERSION = "2026-09-28-universe2"   # data.py의 DATA_VERSION과 같아야 해요
+            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars")
+DATA_VERSION = "2026-09-28-safe"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -127,6 +127,114 @@ def _secret(key: str, default: str = "") -> str:
     except Exception:
         v = None
     return str(v or os.environ.get(key, default) or "")
+
+
+# ─────────────────────────── 🛡️ 보안: 차단 · 앱 전체 잠금 · 접속 기록 ───────────────────────────
+SEC_MAX_FAIL = 5            # 한 IP가 연속 5번 틀리면
+SEC_WAIT_SEC = 3600         # 1시간 못 들어와요
+SEC_AUTOBAN = 15            # 하루에 15번 넘게 틀리면 영구 차단 목록에 올려요
+
+
+@st.cache_resource
+def _sec_store() -> dict:
+    """모든 접속이 같이 쓰는 보안 기록(서버 메모리). 앱을 다시 켜면 비워져요(차단 목록은 파일에 저장)."""
+    return {"fails": {}, "log": [], "lock": threading.Lock()}
+
+
+def _client_ip() -> str:
+    try:
+        h = st.context.headers
+        xff = h.get("X-Forwarded-For") or h.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    except Exception:
+        pass
+    try:
+        return st.context.ip_address or "알 수 없음"
+    except Exception:
+        return "알 수 없음"
+
+
+def _client_ua() -> str:
+    try:
+        return (st.context.headers.get("User-Agent") or "")[:160]
+    except Exception:
+        return ""
+
+
+def _sec_log(event: str, ip: str, ok: bool | None = None):
+    store = _sec_store()
+    with store["lock"]:
+        store["log"].append({"시각": data.now_kst().strftime("%m/%d %H:%M:%S"), "IP": ip, "일": event,
+                             "결과": "" if ok is None else ("성공" if ok else "실패"), "브라우저": _client_ua()})
+        del store["log"][:-400]
+
+
+def _blocked_ips(cfg: dict) -> set:
+    sec = {x.strip() for x in _secret("BLOCKED_IPS").split(",") if x.strip()}
+    return sec | {b.get("ip") for b in cfg.get("blocked_ips", []) if b.get("ip")}
+
+
+def _app_gate():
+    """모든 화면보다 먼저: 차단된 IP는 막고, '앱 전체 잠금'이 켜져 있으면 비밀번호 없이는 아무것도 안 보여요."""
+    ip = _client_ip()
+    cfg = holdings.load_settings()
+    if not st.session_state.get("_visit_logged"):
+        st.session_state["_visit_logged"] = True
+        _sec_log("접속", ip)
+    if ip in _blocked_ips(cfg):
+        st.error("접근이 차단된 주소예요.")
+        st.stop()
+    sec_lock = _secret("APP_LOCK").lower()
+    lock_on = (bool(cfg.get("app_lock")) or sec_lock in ("on", "true", "1", "yes")) and sec_lock != "off"
+    if not lock_on or not holdings.has_password(cfg) or st.session_state.get("app_unlocked"):
+        return
+    store = _sec_store()
+    now = time.time()
+    rec = store["fails"].setdefault(ip, {"n": 0, "day": 0, "until": 0.0, "t0": now})
+    if now - rec["t0"] > 86400:
+        rec.update(day=0, t0=now)
+    st.markdown('<div class="gate-wrap"><div class="gate-card"><div class="gate-logo">📈</div>'
+                '<div class="gate-title">밸류체인 신고가 보드</div>'
+                '<div class="gate-sub">비공개 앱이에요. 비밀번호를 넣어야 볼 수 있어요.</div></div></div>',
+                unsafe_allow_html=True)
+    c = st.columns([1, 1.2, 1])[1]
+    with c:
+        if rec["until"] > now:
+            st.error(f"너무 많이 틀려서 잠시 막혔어요. {int((rec['until'] - now) // 60) + 1}분 뒤에 다시 시도하세요.")
+            st.stop()
+        pw = st.text_input("비밀번호", type="password", key="gate_pw", label_visibility="collapsed", placeholder="비밀번호")
+        go = st.button("들어가기", type="primary", width="stretch", key="gate_go")
+        tried = go or (pw and pw != st.session_state.get("gate_last"))
+        if tried and pw:
+            st.session_state["gate_last"] = pw
+            if holdings.check_password(cfg, pw):
+                rec.update(n=0)
+                _sec_log("앱 잠금 해제", ip, True)
+                st.session_state.update(app_unlocked=True, hold_unlocked=True, hold_seen=now)
+                st.rerun()
+            rec["n"] += 1
+            rec["day"] += 1
+            _sec_log("앱 비밀번호", ip, False)
+            if rec["day"] >= SEC_AUTOBAN and ip != "알 수 없음":      # 괘씸한 시도: 영구 차단 목록으로
+                cfg.setdefault("blocked_ips", []).append({"ip": ip, "at": data.now_kst().strftime("%Y-%m-%d %H:%M"),
+                                                          "memo": f"하루 {rec['day']}번 비밀번호 틀림(자동 차단)"})
+                holdings.save_settings_local(cfg)
+                if _secret("GITHUB_TOKEN"):
+                    reports.save_github(cfg, _secret("GITHUB_TOKEN"), _secret("GITHUB_REPO", "kimgun124-boop/very"),
+                                        _secret("GITHUB_BRANCH") or None, path="user_settings.json")
+            if rec["n"] >= SEC_MAX_FAIL:
+                rec.update(n=0, until=now + SEC_WAIT_SEC)
+                st.error(f"{SEC_MAX_FAIL}번 틀려서 {SEC_WAIT_SEC // 60}분 동안 막았어요.")
+                st.stop()
+            st.error(f"비밀번호가 달라요. ({rec['n']}/{SEC_MAX_FAIL})")
+        lock = cfg.get("lock") or {}
+        if lock.get("hint"):
+            st.caption(f"💡 힌트: {lock['hint']}")
+        st.caption("비밀번호를 잊었으면(앱 주인만): Streamlit Secrets에 APP_LOCK = \"off\"를 넣고 들어가서 "
+                   "💼 내 보유 탭의 '비밀번호를 잊으셨나요?'로 다시 정한 뒤 APP_LOCK을 지우세요.")
+    st.stop()
+
 
 UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
 NEW_HIGH_BG = "#FFF1C9"                # 신고가 행 강조
@@ -325,6 +433,12 @@ st.markdown(
 .ho-bar { height: 5px; background: #FDECEC; border-radius: 3px; margin-bottom: 0.2rem; }
 .ho-bar i { display: block; height: 100%; background: #2E9D5B; border-radius: 3px; }
 .ho-memo { color: #51616C; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; }
+/* 앱 전체 잠금 화면 */
+.gate-wrap { display: flex; justify-content: center; margin: 12vh 0 1rem; }
+.gate-card { text-align: center; }
+.gate-logo { font-size: 2.6rem; }
+.gate-title { font-size: 1.5rem; font-weight: 800; color: #16212B; margin-top: 0.3rem; }
+.gate-sub { font-size: 0.92rem; color: #51616C; margin-top: 0.3rem; }
 /* ── 💼 내 보유 ── */
 [class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
 .hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
@@ -562,6 +676,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+_app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
+
 
 # ─────────────────────────── 데이터 기억(속도) ───────────────────────────
 # 예전에는 기억 시간(30분·5분·2분…)이 지나면 그 순간 화면이 멈추고 수백 종목을 다시 받았어요.
@@ -638,6 +754,11 @@ def load_universe() -> list[dict]:
         _UNI_RETRY["t"] = time.time()
         swr_clear("krx_universe")
     return val or []
+
+
+def load_themes() -> dict:
+    """네이버 테마(하루 기억, 기다리지 않음 — 받는 동안은 테마 태그만 잠깐 비어 있어요)."""
+    return swr(("naver_themes",), 86400, data.fetch_theme_map, first_wait=False, empty={}) or {}
 
 
 def load_histories_extra(codes: tuple[str, ...]):
@@ -758,12 +879,13 @@ NH_FILTERS = {
 MARKETS = {"한국": "KR", "미국": "US", "기타": "OTHER"}
 # 산업을 큰 묶음으로 나눠 칸으로 보여줘요. 여기 없는 산업은 '기타'로 가요.
 SECTOR_CATS = [
-    ("시장 전체", ["코스피 전체", "코스닥 전체"]),
-    ("반도체 · IT", ["반도체", "글로벌 반도체", "AI·IT", "AI 인프라(해외)", "AI 소프트웨어(해외)", "OLED",
-                    "데이터센터 전력", "우주 데이터센터"]),
-    ("에너지 · 산업재", ["2차전지", "전력·에너지", "풍력", "조선", "건설", "산업재", "전략광물"]),
-    ("소비 · 바이오 · 금융", ["화장품", "바이오·헬스케어", "금융·지주"]),
-    ("기타", ["기타", "기타(리포트 스크린)", "해외 기타"]),
+    ("반도체 · IT", ["반도체", "글로벌 반도체", "AI·IT", "AI 인프라(해외)", "AI 소프트웨어(해외)", "OLED", "디스플레이",
+                    "IT하드웨어", "소프트웨어·인터넷", "통신", "미디어·엔터·게임", "데이터센터 전력", "우주 데이터센터"]),
+    ("에너지 · 산업재", ["2차전지", "전력·에너지", "풍력", "전기·전자장비", "에너지·유틸리티", "조선", "방산·우주항공",
+                      "기계", "건설", "산업재", "자동차", "화학", "철강·금속", "종이·포장", "전략광물", "운송·물류", "상업서비스"]),
+    ("소비 · 바이오 · 금융", ["화장품", "음식료", "소비재", "소비자 서비스", "유통·무역", "바이오·헬스케어", "금융·지주",
+                           "부동산"]),
+    ("기타", ["기타", "기타(리포트 스크린)", "해외 기타", "기타 업종"]),
 ]
 SECTOR_SHORT = {"기타(리포트 스크린)": "리포트", "AI 인프라(해외)": "AI 인프라", "AI 소프트웨어(해외)": "AI SW",
                 "글로벌 반도체": "반도체", "해외 기타": "기타",
@@ -812,10 +934,28 @@ with st.sidebar:
         _have = {x["code"] for x in STOCKS}
         for u in load_universe():
             if u["code"] not in _have:
-                EXTRA_STOCKS.append({"sector": f"{u['market']} 전체", "group": u.get("industry") or f"{u['market']} 기타",
-                                     "name": u["name"], "code": u["code"], "desc": u.get("product") or u.get("industry") or "",
-                                     "tags": [], "notes": []})
+                ind = (u.get("industry") or "").strip()
+                EXTRA_STOCKS.append({
+                    "sector": data.classify_industry(ind) if ind else "기타 업종",
+                    "group": ind or f"{u['market']} 업종 확인 중",
+                    "name": u["name"], "code": u["code"],
+                    "desc": u.get("product") or (f"{ind} 업종" if ind else ""),
+                    "src": f"분류 근거: 공식 업종 '{ind}' (네이버 증권 업종 분류 · 없으면 한국거래소 업종)" if ind else
+                           "분류 근거: 업종 정보를 아직 못 받았어요",
+                    "tags": [], "notes": []})
     STOCKS_VIEW = STOCKS + EXTRA_STOCKS
+    # 네이버 테마(2차전지·원전·방산 등 업종으로 안 나뉘는 흐름)를 '🏷️ 테마' 태그로 붙여요 — 원본 목록은 건드리지 않고 복사본에
+    THEMES = load_themes() if scope_all else {}
+    TAGS_VIEW = dict(TAGS)
+    if THEMES:
+        by_code: dict[str, list[str]] = {}
+        for tname, codes in THEMES.items():
+            tag = f"🏷️ {tname}"
+            TAGS_VIEW[tag] = codes
+            for c in codes:
+                by_code.setdefault(c, []).append(tag)
+        STOCKS_VIEW = [dict(x, tags=list(x.get("tags") or []) + by_code[x["code"]]) if x["code"] in by_code else x
+                       for x in STOCKS_VIEW]
     EXTRA_CODES = tuple(sorted(x["code"] for x in EXTRA_STOCKS))
     for _x in EXTRA_STOCKS:
         if _x["sector"] not in SECTOR_ORDER:
@@ -871,9 +1011,10 @@ with st.sidebar:
                          if any(x["group"] == g and x["sector"] in active_sectors for x in mkt_stocks)]
         group_pick = st.selectbox("세부 분류", ["전체", *group_choices], key=f"sb_group_{market}")
         groups = [] if group_pick == "전체" else [group_pick]
-        tag_choices = [t for t in TAGS if any(t in x["tags"] for x in mkt_stocks)]
-        tags = st.multiselect("리포트 태그", tag_choices, placeholder="선택 안 함", key=f"sb_tags_{market}",
-                              help="태그를 고르면 위의 산업·분류와 관계없이 이 시장 전체에서 그 리포트에 나온 종목만 보여줘요.")
+        _have_tags = {t for x in mkt_stocks for t in (x.get("tags") or [])}
+        tag_choices = [t for t in TAGS_VIEW if t in _have_tags]
+        tags = st.multiselect("리포트 · 테마 태그", tag_choices, placeholder="선택 안 함 (예: 2차전지, 원자력)", key=f"sb_tags_{market}",
+                              help="📥·리포트 태그 = 공부 자료, 🏷️ = 네이버 테마. 고르면 위의 산업·분류와 관계없이 그 태그 종목만 보여줘요.")
         query = st.text_input("종목 검색", placeholder="이름이나 코드", key="sb_query")
 
     # ④ 조건 필터 — 평소엔 접어 둬요
@@ -2245,6 +2386,63 @@ def _lock_gate(stt: dict) -> bool:
     return False
 
 
+def _security_panel(stt: dict):
+    """🛡️ 보안: 앱 전체 잠금 · 접속 기록 · IP 차단/해제 · 점검표."""
+    cfg = holdings.load_settings()
+    with st.expander("🛡️ 보안 — 앱 전체 잠금 · 접속 기록 · 차단"):
+        forced = _secret("APP_LOCK").lower() in ("on", "true", "1", "yes")
+        on = bool(cfg.get("app_lock")) or forced
+        st.markdown(f"**앱 전체 잠금: {'🔒 켜짐' if on else '🔓 꺼짐'}** — 켜면 첫 화면부터 비밀번호가 있어야 보여요(내 보유 비밀번호와 같아요)."
+                    + (" · Secrets의 APP_LOCK으로 켜져 있어요." if forced else ""))
+        cur = st.text_input("지금 비밀번호(확인용)", type="password", key="sec_cur")
+        if not forced and st.button("🔒 앱 전체 잠금 켜기" if not on else "🔓 앱 전체 잠금 끄기", key="sec_toggle"):
+            if not holdings.check_password(cfg, cur):
+                st.error("지금 비밀번호가 달라요.")
+            else:
+                cfg["app_lock"] = not on
+                ok, msg = _persist_settings(cfg, stt)
+                (st.success if ok else st.error)("앱 전체 잠금을 " + ("켰어요." if not on else "껐어요.") + " " + msg)
+                st.session_state["app_unlocked"] = True
+        log = list(reversed(_sec_store()["log"]))
+        st.markdown(f"**최근 접속 기록** ({len(log)}건 · 앱을 다시 켜면 비워져요)")
+        if log:
+            st.dataframe(pd.DataFrame(log[:200]), hide_index=True, height=240, width="stretch")
+        c1, c2, c3 = st.columns([1.3, 1.6, 0.8])
+        ip = c1.text_input("차단할 IP", key="sec_ip", placeholder="예: 203.0.113.7")
+        memo = c2.text_input("메모", key="sec_memo", placeholder="예: 비밀번호 계속 틀림")
+        if c3.button("차단", key="sec_ban", width="stretch", disabled=not ip.strip()):
+            if not holdings.check_password(cfg, cur):
+                st.error("위에 지금 비밀번호를 넣어야 차단할 수 있어요.")
+            elif ip.strip() == _client_ip():
+                st.error("지금 내가 쓰는 주소는 차단할 수 없어요.")
+            else:
+                cfg.setdefault("blocked_ips", []).append({"ip": ip.strip(), "at": data.now_kst().strftime("%Y-%m-%d %H:%M"),
+                                                          "memo": memo.strip()})
+                ok, msg = _persist_settings(cfg, stt)
+                (st.success if ok else st.error)(f"{ip.strip()} 차단했어요. {msg}")
+        bl = cfg.get("blocked_ips", [])
+        if bl:
+            st.markdown(f"**차단 목록** ({len(bl)}개)")
+            for i, b in enumerate(bl):
+                c1, c2 = st.columns([5, 1])
+                c1.caption(f"🚫 {b.get('ip')} · {b.get('at', '')} · {b.get('memo', '')}")
+                if c2.button("해제", key=f"sec_unban_{i}"):
+                    if holdings.check_password(cfg, cur):
+                        cfg["blocked_ips"] = [x for j, x in enumerate(bl) if j != i]
+                        ok, msg = _persist_settings(cfg, stt)
+                        (st.success if ok else st.error)(msg)
+                        _rerun_frag()
+                    else:
+                        st.error("위에 지금 비밀번호를 넣어야 해제할 수 있어요.")
+        st.caption(f"지금 내 주소: {_client_ip()} · 한 주소가 {SEC_MAX_FAIL}번 틀리면 1시간 막고, 하루 {SEC_AUTOBAN}번 넘게 틀리면 자동으로 차단 목록에 올려요.")
+        st.markdown(
+            "**꼭 같이 해 두세요(앱 밖 설정)**\n"
+            "1. **GitHub 저장소 비공개(Private)** — 코드·보유 종목·리포트 파일을 아무도 못 봐요. 저장소 → Settings → Change visibility.\n"
+            "2. **Streamlit 공유 설정 'Only specific people'** — 내가 허락한 이메일만 앱 주소에 들어올 수 있어요. "
+            "앱 오른쪽 위 Share → Who can view this app. 가장 강력한 잠금이에요.\n"
+            "3. **Secrets** — API 키·토큰은 Secrets에만 두고 코드·저장소에 절대 넣지 마세요.")
+
+
 def _lock_settings(stt: dict):
     """열린 상태에서: 잠그기 · 비밀번호 바꾸기 · 힌트/복구 질문 바꾸기 · 복구 코드 새로 받기."""
     cfg = holdings.load_settings()
@@ -2308,6 +2506,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     if not _lock_gate(stt):
         return
     _lock_settings(stt)
+    _security_panel(stt)
     store = holdings.load()
     board_labels = {s["code"]: s["name"] for s in STOCKS}
 
@@ -2580,6 +2779,8 @@ def _render_detail(f: pd.DataFrame, histories: dict, trends: dict):
             cap_text += f" (약 {data.format_krw(row.cap_krw)}원)"
         st.markdown(f"**{cap_text}**  \n상장주식수 {row.shares:,.0f}주")
     st.write(f"**{row['group']}**  \n{row.desc}")
+    if isinstance(row.get("src"), str) and row.get("src"):
+        st.caption(row["src"])
     if row.tags:
         st.caption("리포트 태그: " + ", ".join(row.tags))
 
