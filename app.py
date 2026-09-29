@@ -57,8 +57,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars")
-DATA_VERSION = "2026-09-28-fill"   # data.py의 DATA_VERSION과 같아야 해요
+            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map")
+DATA_VERSION = "2026-09-29-industry"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -749,11 +749,23 @@ _UNI_RETRY = {"t": 0.0}
 
 def load_universe() -> list[dict]:
     """전체 종목 목록(하루 기억). 못 받았으면(빈 목록) 하루 동안 비워 두지 않고 2분마다 다시 시도해요."""
-    val = swr(("krx_universe",), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
+    val = swr(("krx_universe", "v2"), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
     if not val and time.time() - _UNI_RETRY["t"] > 120:
         _UNI_RETRY["t"] = time.time()
         swr_clear("krx_universe")
     return val or []
+
+
+def load_industry_map(codes: tuple[str, ...]) -> tuple[dict, dict]:
+    """전 종목 공식 업종(하루 기억). 목록과 따로 받아서, 목록을 예전에 받아 뒀어도 업종은 새로 채워져요."""
+    got = swr(("industry_map", "v1"), 86400, lambda: data.fetch_industry_map(codes),
+              "전 종목의 업종(네이버 업종 · WICS)을 확인하는 중이에요. 처음 한 번 10~30초 걸려요.")
+    if not got or not got[0]:
+        if time.time() - _UNI_RETRY.get("ind", 0) > 180:          # 못 받았으면 3분 뒤 다시
+            _UNI_RETRY["ind"] = time.time()
+            swr_clear("industry_map")
+        return {}, (got[1] if got else {})
+    return got
 
 
 def load_themes() -> dict:
@@ -890,7 +902,9 @@ SECTOR_CATS = [
                            "부동산"]),
     ("기타", ["기타", "기타(리포트 스크린)", "해외 기타", "기타 업종"]),
 ]
-SECTOR_SHORT = {"기타(리포트 스크린)": "리포트", "AI 인프라(해외)": "AI 인프라", "AI 소프트웨어(해외)": "AI SW",
+SECTOR_SHORT = {"소프트웨어·인터넷": "SW·인터넷", "미디어·엔터·게임": "엔터·게임", "에너지·유틸리티": "에너지·유틸",
+                "전기·전자장비": "전기장비", "방산·우주항공": "방산·우주", "소비자 서비스": "레저·교육",
+                "바이오·헬스케어": "바이오·헬스", "기타(리포트 스크린)": "리포트", "AI 인프라(해외)": "AI 인프라", "AI 소프트웨어(해외)": "AI SW",
                 "글로벌 반도체": "반도체", "해외 기타": "기타",
                 "바이오·헬스케어": "바이오·헬스", "데이터센터 전력": "DC 전력", "우주 데이터센터": "우주 DC"}
 
@@ -933,11 +947,14 @@ with st.sidebar:
             scope_all = scope == "코스피·코스닥 전체"
     # 전체 범위: 보드에 없는 상장 종목을 '코스피 전체 / 코스닥 전체' 산업으로 붙여요(세부 분류 = 한국거래소 업종)
     EXTRA_STOCKS = []
+    IND_MAP, IND_DIAG = {}, {}
     if scope_all:
         _have = {x["code"] for x in STOCKS}
-        for u in load_universe():
+        _uni = load_universe()
+        IND_MAP, IND_DIAG = load_industry_map(tuple(sorted(u["code"] for u in _uni if u["code"] not in _have)))
+        for u in _uni:
             if u["code"] not in _have:
-                ind = (u.get("industry") or "").strip()
+                ind = (u.get("industry") or IND_MAP.get(u["code"]) or "").strip()
                 EXTRA_STOCKS.append({
                     "sector": data.classify_industry(ind) if ind else "기타 업종",
                     "group": ind or f"{u['market']} 업종 확인 중",
@@ -967,7 +984,13 @@ with st.sidebar:
             GROUP_ORDER = GROUP_ORDER + [_x["group"]]
     with st.sidebar:
         if scope_all and EXTRA_STOCKS:
-            st.caption(f"보드 {len(STOCKS):,} + 상장 종목 {len(EXTRA_STOCKS):,}개 = {len(STOCKS_VIEW):,}개")
+            n_ind = sum(1 for x in EXTRA_STOCKS if x["sector"] != "기타 업종")
+            st.caption(f"보드 {len(STOCKS):,} + 상장 종목 {len(EXTRA_STOCKS):,}개 = {len(STOCKS_VIEW):,}개 · "
+                       f"업종 분류 {n_ind:,}/{len(EXTRA_STOCKS):,}"
+                       + (" (" + ", ".join(f"{k} {v:,}" for k, v in IND_DIAG.items() if v) + ")" if IND_DIAG else ""))
+            if n_ind < len(EXTRA_STOCKS) * 0.5 and st.button("업종 다시 확인하기", key="ind_retry", width="stretch"):
+                swr_clear("industry_map")
+                st.rerun()
         elif scope_all:
             diag = " · ".join(f"{k} {v}" for k, v in getattr(data, "UNIVERSE_DIAG", {}).items()) or "응답 없음"
             st.warning(f"코스피·코스닥 전체 목록을 아직 못 받았어요({diag}). 지금은 내 보드 종목만 보여요. "

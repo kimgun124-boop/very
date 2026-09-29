@@ -43,7 +43,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-28-fill"
+DATA_VERSION = "2026-09-29-industry"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -1536,7 +1536,7 @@ INDUSTRY_RULES = [
     (r"은행|증권|보험|카드|창업투자|금융|신탁|복합기업|지주", "금융·지주"),
     (r"전기유틸리티|가스유틸리티|복합유틸리티|유틸리티|석유|가스|에너지|전기업|발전", "에너지·유틸리티"),
     (r"전기장비|전기제품|전기 장비|전동기|발전기|전선|절연|축전지|일차전지", "전기·전자장비"),
-    (r"통신장비|통신 및 방송 장비|핸드셋|컴퓨터|주변기기|전자장비|전자제품|전자부품|사무용전자|전자기기|계측", "IT하드웨어"),
+    (r"통신장비|통신 및 방송 장비|핸드셋|컴퓨터|주변기기|전자장비|전자제품|전자부품|사무용전자|전자기기|계측|하드웨어", "IT하드웨어"),
     (r"카탈로그소매|전자상거래|통신판매|온라인 소매", "유통·무역"),
     (r"소프트웨어|IT서비스|정보서비스|자료처리|호스팅|포털|인터넷|양방향미디어", "소프트웨어·인터넷"),
     (r"게임|방송|엔터테인먼트|광고|출판|영화|미디어|음악|오디오물", "미디어·엔터·게임"),
@@ -1554,6 +1554,9 @@ INDUSTRY_RULES = [
     (r"백화점|판매업체|소매|도매|무역|상품 중개|유통|전문소매", "유통·무역"),
     (r"상업서비스|사업지원|인력|경비|전문 서비스|연구개발|엔지니어링", "상업서비스"),
     (r"부동산|리츠", "부동산"),
+    (r"자본재", "산업재"),
+    (r"내구소비재", "소비재"),
+    (r"^소재$|소재 ", "화학"),
 ]
 
 
@@ -1605,13 +1608,120 @@ def _html_unescape(t: str) -> str:
     return _h.unescape(t)
 
 
+WICS_MID = {"G1010": "에너지", "G1510": "소재", "G2010": "자본재", "G2020": "상업서비스와공급품", "G2030": "운송",
+            "G2510": "자동차와부품", "G2520": "내구소비재와의류", "G2530": "호텔,레스토랑,레저 등", "G2550": "소매(유통)",
+            "G2560": "교육서비스", "G3010": "식품과기본식료품소매", "G3020": "식품,음료,담배", "G3030": "가정용품과개인용품",
+            "G3510": "건강관리장비와서비스", "G3520": "제약과생물공학", "G4010": "은행", "G4020": "증권",
+            "G4030": "다각화된금융", "G4040": "보험", "G4050": "부동산", "G4510": "소프트웨어와서비스",
+            "G4520": "기술하드웨어와장비", "G4530": "반도체와반도체장비", "G4535": "전자와 전기제품", "G4540": "디스플레이",
+            "G5010": "전기통신서비스", "G5020": "미디어와엔터테인먼트", "G5510": "유틸리티"}
+
+
+def _wics_map() -> dict[str, str]:
+    """WICS(에프앤가이드 산업분류) 중분류 {코드: 업종}. 네이버 업종을 못 받을 때 쓰는 두 번째 공식 분류."""
+    out: dict[str, str] = {}
+    day = now_kst().date()
+    for back in range(0, 8):                         # 가장 가까운 영업일 자료
+        dt = (day - timedelta(days=back)).strftime("%Y%m%d")
+
+        def one(item):
+            cd, name = item
+            try:
+                r = session.get("https://www.wiseindex.com/Index/GetIndexComponets",
+                                params={"ceil_yn": 0, "dt": dt, "sec_cd": cd}, timeout=10)
+                j = r.json()
+            except (requests.RequestException, ValueError):
+                return name, []
+            rows = j.get("list") if isinstance(j, dict) else None
+            return name, [str(x.get("CMP_CD")) for x in rows or [] if x.get("CMP_CD")]
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for name, codes in pool.map(one, WICS_MID.items()):
+                for c in codes:
+                    out.setdefault(c.zfill(6), name)
+        if len(out) > 300:
+            break
+    return out
+
+
+def _naver_mobile_industry_map() -> dict[str, str]:
+    """네이버 모바일 업종 API {코드: 업종}(응답 모양이 바뀌어도 되게 넓게 찾아요)."""
+    try:
+        j = session.get("https://m.stock.naver.com/api/stocks/industry", headers=JSON_HEADERS, timeout=10).json()
+    except (requests.RequestException, ValueError):
+        return {}
+    groups = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            no = n.get("no") or n.get("industryCode") or n.get("groupCode")
+            name = n.get("name") or n.get("industryName") or n.get("groupName")
+            if no and name and not n.get("itemCode"):
+                groups.append((str(no), str(name)))
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(j)
+
+    def one(g):
+        no, name = g
+        codes = set()
+        for page in range(1, 6):
+            try:
+                jj = session.get(f"https://m.stock.naver.com/api/stocks/industry/{no}",
+                                 params={"page": page, "pageSize": 100}, headers=JSON_HEADERS, timeout=10).json()
+            except (requests.RequestException, ValueError):
+                break
+            found = set(re.findall(r'"itemCode"\s*:\s*"(\w{6})"', json.dumps(jj)))
+            if not found - codes:
+                break
+            codes |= found
+        return name, codes
+
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for name, codes in pool.map(one, groups[:120]):
+            for c in codes:
+                out.setdefault(c, name)
+    return out
+
+
+def fetch_industry_map(codes=None) -> tuple[dict[str, str], dict]:
+    """전 종목 업종 {코드: 공식 업종 이름}과 출처별 개수.
+    ① 네이버 업종(PC) ② 네이버 모바일 업종 ③ WICS 순서로, 앞에서 빠진 종목만 다음 출처로 채워요."""
+    if MOCK:
+        names = ["반도체와반도체장비", "제약", "소프트웨어", "증권", "화학", "자동차부품", "조선", "디스플레이장비및부품",
+                 "식품", "전기제품", "게임엔터테인먼트", "기계", "우주항공과국방", "해운사", "호텔,레스토랑,레저"]
+        got = {c: names[int(c[-3:]) % len(names)] for c in (codes or [])}
+        return got, {"네이버 업종": len(got)}
+    want = set(codes or [])
+    out: dict[str, str] = {}
+    diag: dict[str, int] = {}
+    for label, fn in (("네이버 업종", fetch_upjong_map), ("네이버 모바일 업종", _naver_mobile_industry_map),
+                      ("WICS", _wics_map)):
+        try:
+            got = fn()
+        except Exception:
+            got = {}
+        n0 = len(out)
+        for c, name in got.items():
+            if c not in out and name:
+                out[c] = name.strip()
+        diag[label] = len(out) - n0
+        if want and len(want - set(out)) <= max(20, len(want) * 0.02):
+            break
+    return out, diag
+
+
 def fetch_krx_universe() -> list[dict]:
     """코스피·코스닥 상장 종목 전체 [{code, name, market, industry, product}]. 스팩·ETF·ETN·우선주는 빼요.
     네이버 모바일 → 한국거래소 KIND → 네이버 PC 순서로 시도해요(해외 서버에서 막히는 곳이 있어서)."""
     if MOCK:
         rng = _rng("universe")
         return [{"code": f"9{i:05d}", "name": f"테스트{'피' if i % 3 else '닥'}{i}", "market": "코스피" if i % 3 else "코스닥",
-                 "industry": rng.choice(["반도체와반도체장비", "제약", "소프트웨어", "증권", "화학", "자동차부품", "조선",
+                 "industry": "" if i % 2 == 0 else rng.choice(["반도체와반도체장비", "제약", "소프트웨어", "증권", "화학", "자동차부품", "조선",
                                          "디스플레이장비및부품", "식품", "전기제품", "게임엔터테인먼트", "기계"]),
                  "product": "테스트 제품"} for i in range(1, int(os.environ.get("MOCK_UNIVERSE", "300")) + 1)]
     out = []
