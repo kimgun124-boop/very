@@ -2189,10 +2189,13 @@ def sector_money(df: pd.DataFrame, by: str = "group", top_names: int = 3) -> pd.
 def is_halted(hist: pd.DataFrame | None, quote: dict | None, days: int = 5) -> bool:
     """거래정지(또는 사실상 거래가 없는) 종목: 최근 5거래일 거래량이 모두 0이고 오늘도 거래가 없어요.
     이런 종목은 가격이 멈춰 있어서 52주 최고 = 현재가, 신고가까지 0%처럼 보이지만 실제로는 살 수 없어요."""
-    if hist is None or hist.empty or "volume" not in hist or len(hist) < days:
+    if hist is None or len(hist) < days or "volume" not in hist:
         return False
-    v = pd.to_numeric(hist["volume"].tail(days), errors="coerce").fillna(0)
-    if (v > 0).any():
+    v = hist["volume"].to_numpy()[-days:]
+    try:
+        if (np.nan_to_num(v.astype(float)) > 0).any():
+            return False
+    except (TypeError, ValueError):
         return False
     return not (quote and (quote.get("volume") or 0) > 0)
 

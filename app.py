@@ -9,6 +9,7 @@ import re
 import os
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -77,7 +78,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-29-principles"
+HOLDINGS_VERSION = "2026-09-29-deep"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -451,6 +452,24 @@ st.markdown(
 .pr-card b { font-size: 0.95rem; color: #16212B; }
 .pr-card ul { margin: 0.3rem 0 0 1rem; padding: 0; font-size: 0.85rem; color: #33424C; }
 .ho-acct { font-size: 0.72rem; margin-left: 0.35rem; color: #51616C; }
+/* 깊은 분석 */
+.dp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.5rem 0 0.4rem; }
+.dp-score { color: #FFFFFF; font-weight: 800; border-radius: 8px; padding: 0.25rem 0.6rem; font-size: 0.95rem; }
+.dp-chip { border: 1.5px solid; border-radius: 999px; padding: 0.15rem 0.55rem; font-size: 0.8rem; font-weight: 700; background: #FFFFFF; }
+.dp-head em { font-style: normal; font-size: 0.72rem; color: #7A8A94; margin-left: auto; }
+.dp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.5rem; margin-bottom: 0.5rem; }
+.dp-block { border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.55rem 0.7rem; background: #FFFFFF; }
+.dp-block > b { font-size: 0.88rem; }
+.dp-row { margin-top: 0.3rem; } .dp-row span { display: block; font-size: 0.82rem; font-weight: 800; }
+.dp-row em { font-style: normal; font-size: 0.8rem; color: #51616C; }
+.dp-row.bad span { color: #B3261E; } .dp-row.good span { color: #1E7A45; }
+.dp-pyr { border: 1px dashed #6B3FC4; border-radius: 10px; padding: 0.55rem 0.7rem; background: #FAF7FF; margin-bottom: 0.5rem; }
+.dp-pyr b { font-size: 0.88rem; color: #4B2A99; } .dp-pyr div { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.35rem; }
+.dp-cond { font-size: 0.78rem; border-radius: 6px; padding: 0.15rem 0.45rem; }
+.dp-cond.ok { background: #EEF8F2; color: #1E7A45; } .dp-cond.no { background: #F3F4F6; color: #7A8A94; }
+.dp-plan { border-left: 4px solid #2E6B6F; background: #F4F9F9; border-radius: 6px; padding: 0.55rem 0.8rem; margin-bottom: 0.5rem; }
+.dp-plan b { font-size: 0.88rem; } .dp-plan div { display: flex; gap: 0.6rem; margin-top: 0.3rem; font-size: 0.84rem; }
+.dp-plan span { min-width: 5.5rem; font-weight: 800; } .dp-plan em { font-style: normal; color: #33424C; }
 /* ── 💼 내 보유 ── */
 [class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
 .hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
@@ -751,6 +770,112 @@ def swr_clear(*prefixes: str):
             store["items"].pop(k, None)
 
 
+CORE_CAP = 3000e8          # 처음 화면: 시가총액 3,000억 이상
+CORE_N = 500               # 최대 500종목(공부 자료 종목 먼저)
+HIST_TTL = 1800
+
+
+@st.cache_resource
+def _hist_store() -> dict:
+    """(속도) 일봉을 종목마다 따로 기억해요. 종목 구성이 바뀌어도 새로 들어온 종목만 받아요."""
+    return {"data": {}, "t": {}, "lock": threading.Lock(), "bg": {"running": False, "queue": set(), "total": 0, "done": 0}}
+
+
+def _hist_put(got: dict):
+    S = _hist_store()
+    now = time.time()
+    with S["lock"]:
+        for c, res in got.items():
+            ok = res is not None and res[1] is not None and not res[1].empty
+            if ok or c not in S["data"]:
+                S["data"][c] = res
+            S["t"][c] = now if ok else now - HIST_TTL + 120      # 못 받았으면 2분 뒤 다시
+
+
+def _hist_bg(codes):
+    """뒤에서 천천히 받기(화면을 막지 않아요). 한 번에 하나의 작업만 돌아요."""
+    S = _hist_store()
+    with S["lock"]:
+        new = set(codes) - S["bg"]["queue"]
+        S["bg"]["queue"].update(new)
+        S["bg"]["total"] += len(new)
+        if S["bg"]["running"] or not S["bg"]["queue"]:
+            return
+        S["bg"]["running"] = True
+
+    def run():
+        try:
+            while True:
+                with S["lock"]:
+                    batch = list(S["bg"]["queue"])[:150]
+                    S["bg"]["queue"].difference_update(batch)
+                if not batch:
+                    break
+                _hist_put(data.fetch_histories(batch, workers=6))
+                with S["lock"]:
+                    S["bg"]["done"] += len(batch)
+                time.sleep(0.3)
+        finally:
+            with S["lock"]:
+                S["bg"]["running"] = False
+                if not S["bg"]["queue"]:
+                    S["bg"].update(total=0, done=0)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def get_histories(codes, wait: bool = True, label: str = "") -> dict:
+    """codes의 일봉. 처음 보는 종목은 wait=True면 받아서 보여주고, 오래된 종목은 뒤에서 새로 받아요."""
+    S = _hist_store()
+    now = time.time()
+    missing = [c for c in codes if c not in S["data"]]
+    stale = [c for c in codes if c in S["data"] and now - S["t"].get(c, 0) > HIST_TTL]
+    if missing and wait:
+        with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
+            _hist_put(data.fetch_histories(missing, workers=12))
+        missing = []
+    if stale or missing:
+        _hist_bg(stale + missing)
+    d = S["data"]
+    return {c: d[c] for c in codes if c in d}
+
+
+def _recent_high(hist, quote, days: int) -> bool:
+    """최근 days거래일 안에 52주 신고가를 썼는지(오늘 실시간 고가 포함)."""
+    if hist is None or len(hist) < 60:
+        return False
+    h = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)[-250:]
+    hi52 = np.nanmax(h)
+    qh = max(float((quote or {}).get("high") or 0), float((quote or {}).get("price") or 0))
+    if qh and qh >= hi52 * 0.999:
+        return True
+    last = len(h) - 1 - int(np.nanargmax(h[::-1]))
+    return (len(h) - 1 - last) <= days
+
+
+def core_view(quotes: dict, shares: dict) -> tuple[set, set, dict]:
+    """주요 500(시총 3,000억↑, 공부 자료 종목 먼저) + 시총이 작아도 최근 신고가 종목."""
+    board_kr = [x["code"] for x in STOCKS if data.is_kr(x["code"])]
+    all_kr = board_kr + list(EXTRA_CODES)
+
+    def cap(c):
+        q, n = quotes.get(c) or {}, shares.get(c)
+        return (q.get("price") or 0) * (n or 0)
+    caps = {c: cap(c) for c in all_kr}
+    known = sum(1 for v in caps.values() if v)
+    if known < 100:                                   # 시가총액을 아직 못 받았으면 공부 자료 종목으로
+        core = set(board_kr)
+    else:
+        b = sorted([c for c in board_kr if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
+        e = sorted([c for c in EXTRA_CODES if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
+        core = set((b + e)[:CORE_N])
+    rest = [c for c in all_kr if c not in core]
+    hist_rest = get_histories(rest, wait=False)       # 작은 종목은 뒤에서
+    small_hi = {c for c, res in hist_rest.items()
+                if res and res[1] is not None and _recent_high(res[1], quotes.get(c), max(5, recent_days))}
+    S = _hist_store()["bg"]
+    return core, small_hi, {"rest": len(rest), "loaded": len(hist_rest), "bg": dict(S)}
+
+
 def load_histories(codes: tuple[str, ...]):
     return swr(("hist_kr", codes), 1800, lambda: data.fetch_histories(codes),
                "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
@@ -951,12 +1076,16 @@ with st.sidebar:
                                             key="sb_market2", width="stretch", label_visibility="collapsed") or "한국"
         market = MARKETS[market_label]
         scope_all = False
+        scope_core = False
         if market == "KR":
-            scope = st.segmented_control("종목 범위", ["코스피·코스닥 전체", "내 보드"], default="코스피·코스닥 전체", required=True,
-                                         key="sb_scope", width="stretch",
-                                         help="전체: 코스피·코스닥 상장 종목(스팩·ETF 제외)을 모두 살펴요 — 리스트와 신고가·거래량·매수 후보 등 모든 탭이 스크리너처럼 전 종목에서 찾아요. "
-                                              "내 보드: 공부 자료에 넣은 종목만. 앱을 처음 켤 때 한 번은 1~3분 걸려요.")
-            scope_all = scope == "코스피·코스닥 전체"
+            scope = st.segmented_control("종목 범위", ["주요 500", "전체", "내 보드"], default="주요 500", required=True,
+                                         key="sb_scope2", width="stretch",
+                                         format_func=lambda x: {"주요 500": "주요 500+신고가", "전체": "전체", "내 보드": "내 보드"}[x],
+                                         help="주요 500+신고가(기본·빠름): 시가총액 3,000억 이상 중 공부 자료 종목 우선 500개 + "
+                                              "시총이 작아도 최근 52주 신고가를 쓴 종목은 모두 보여줘요(작은 종목은 뒤에서 받아서 몇 분 안에 채워져요).\n"
+                                              "전체: 코스피·코스닥 상장 종목 모두(처음 켤 때 느려요). 내 보드: 공부 자료 종목만.")
+            scope_all = scope in ("주요 500", "전체")
+            scope_core = scope == "주요 500"
     # 전체 범위: 보드에 없는 상장 종목을 '코스피 전체 / 코스닥 전체' 산업으로 붙여요(세부 분류 = 한국거래소 업종)
     EXTRA_STOCKS = []
     IND_MAP, IND_DIAG = {}, {}
@@ -2172,13 +2301,23 @@ def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict) -> tuple[dict, pd.D
     bars_live = data.chart_with_live(bars, quote if data.is_kr(code) else None, "일봉")
     hit = df[df["code"] == code]
     if len(hit):
-        return hit.iloc[0].to_dict(), bars_live, quote
-    m = data.compute_metrics(bars, quote) if bars is not None and not bars.empty else {}
+        m = hit.iloc[0].to_dict()
+    else:
+        m = data.compute_metrics(bars, quote) if bars is not None and not bars.empty else {}
+    if data.is_kr(code):                       # 펀더멘털(연간 영업이익·EPS·컨센서스)과 수급(외국인·기관)
+        m["_fins"] = load_fin_one(code)
+        m["_flow"] = load_trends((code,)).get(code)
     return m, bars_live, quote
 
 
+@st.cache_data(ttl=43200, show_spinner=False, max_entries=300)
+def load_fin_one(code: str):
+    return data.fetch_financials(code)
+
+
 LEVEL_COLOR = {"red": ("#FDECEC", UP), "orange": ("#FDF1E7", "#D2691E"), "yellow": ("#FFF8E1", "#B7861D"),
-               "green": ("#EEF8F2", "#1E7A45"), "blue": ("#EEF4FC", DOWN), "gray": ("#F1F4F6", "#51616C")}
+               "green": ("#EEF8F2", "#1E7A45"), "blue": ("#EEF4FC", DOWN), "gray": ("#F1F4F6", "#51616C"),
+               "purple": ("#F4EEFC", "#6B3FC4")}
 
 
 def _rerun_frag():
@@ -2216,6 +2355,7 @@ def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
             for st_, item, txt in j["checks"]) + "</div>", unsafe_allow_html=True)
         st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
             f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
+        _deep_view(j)
 
         t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
         with t_news:
@@ -2252,6 +2392,44 @@ def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
         with t_chart:
             candle_chart(h["code"], cur, quotes.get(h["code"]) if data.is_kr(h["code"]) else None,
                          m.get("high52"), key=f"hold_ch_{h['id']}")
+
+
+SEC_ICON = {"good": ("🟢", "#1E7A45"), "info": ("⚪", "#51616C"), "warn": ("🟡", "#B7861D"), "bad": ("🔴", UP)}
+
+
+def _deep_view(j: dict):
+    """점수(펀더멘털 35·추세 25·수급 15·거래량 15·섹터·시장 10) + 분석 표 + 불타기 점검 + 상황별 대응."""
+    if j.get("score") is None:
+        return
+    secs = j.get("sections") or {}
+    chips = "".join(
+        f'<span class="dp-chip" style="border-color:{SEC_ICON.get(v, SEC_ICON["info"])[1]}">{SEC_ICON.get(v, SEC_ICON["info"])[0]} {k}</span>'
+        for k, v in secs.items())
+    gcol = {"A": "#1E7A45", "B": "#2E6B6F", "C": "#B7861D", "D": UP}.get(j.get("grade"), "#51616C")
+    st.markdown(f'<div class="dp-head"><span class="dp-score" style="background:{gcol}">{j["grade"]} · {j["score"]}점</span>'
+                f'{chips}<em>가중치: 펀더멘털 35 · 추세 25 · 수급 15 · 거래량 15 · 섹터·시장 10</em></div>',
+                unsafe_allow_html=True)
+    icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
+
+    def block(title, items):
+        if not items:
+            return ""
+        return (f'<div class="dp-block"><b>{title}</b>' + "".join(
+            f'<div class="dp-row {st_}"><span>{icon[st_]} {html.escape(it)}</span><em>{html.escape(tx)}</em></div>'
+            for st_, it, tx in items) + "</div>")
+    st.markdown('<div class="dp-grid">' + block("📊 펀더멘털", j.get("fund")) + block("🧭 수급(외국인·기관)", j.get("flow"))
+                + block("🔊 거래량", j.get("vol")) + "</div>", unsafe_allow_html=True)
+    pyr = j.get("pyramid")
+    if pyr:
+        rows = "".join(f'<span class="dp-cond {"ok" if ok else "no"}">{"✔" if ok else "✖"} {html.escape(n)}'
+                       f'{(" · " + html.escape(v)) if v else ""}</span>' for n, ok, v in pyr["conds"])
+        st.markdown(f'<div class="dp-pyr"><b>🔥 불타기(피라미딩) 점검 — {pyr["n_ok"]}/{pyr["n"]}'
+                    f'{" · 오늘 충족" if pyr["ok"] else ""}</b><div>{rows}</div></div>', unsafe_allow_html=True)
+    plan = j.get("plan") or []
+    if plan:
+        st.markdown('<div class="dp-plan"><b>🗺️ 앞으로 이렇게 대응</b>' + "".join(
+            f'<div><span>{html.escape(k)}</span><em>{html.escape(v)}</em></div>' for k, v in plan) + "</div>",
+            unsafe_allow_html=True)
 
 
 def _rtxt(j: dict) -> str:
@@ -2350,7 +2528,8 @@ def _holdings_overview(rows, dot):
         trs.append(
             f'<tr><td class="l"><b>{html.escape(h["name"])}</b><span class="ho-code">{h["code"]}</span>'
             f'<span class="ho-acct">{"🌱가치" if h.get("account") == "가치" else "📈추세"}</span></td>'
-            f'<td class="l"><span class="ho-badge" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></td>'
+            f'<td class="l"><span class="ho-badge" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span>'
+            f'{(" <span class=\'ho-acct\'>" + str(j.get("grade")) + " · " + str(j.get("score")) + "점</span>") if j.get("score") is not None else ""}</td>'
             f'<td>{fmt_price(m.get("price"), cur)}</td><td>{fmt_price(h["avg"], cur)}</td>'
             f'<td style="color:{pc};font-weight:800">{pnl:+.2f}%</td><td style="color:{pc}">{_rtxt(j)}</td>'
             f'<td>{fmt_price(j["stop_price"], cur)}</td>'
@@ -2696,8 +2875,8 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     c[3].metric("시장", "60일선 위" if ctx["market_ok"] else ("60일선 아래" if ctx["market_ok"] is False else "-"),
                 ctx["market_text"], delta_color="off")
 
-    order = {"red": 0, "orange": 1, "blue": 2, "yellow": 3, "green": 4, "gray": 5}
-    dot = {"red": "🔴", "orange": "🟠", "blue": "🔵", "yellow": "🟡", "green": "🟢", "gray": "⚪"}
+    order = {"red": 0, "orange": 1, "purple": 2, "blue": 3, "yellow": 4, "green": 5, "gray": 6}
+    dot = {"red": "🔴", "orange": "🟠", "purple": "🔥", "blue": "🔵", "yellow": "🟡", "green": "🟢", "gray": "⚪"}
     rows = sorted(rows, key=lambda x: order.get(x[3]["level"], 9))
 
     # 종목마다 탭: 맨 앞 '한눈에' + 종목 탭(판정 색 점 · 이름 · 수익률)
@@ -3041,14 +3220,14 @@ def _buy_params() -> dict:
 
 # ─────────────────────────── 차기 주도섹터 · 섹터 안 급상승 엔진 ───────────────────────────
 def load_trends_all():
-    """국내 전 종목(보드 + 코스피·코스닥 전체) 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
-    codes = KR_CODES + EXTRA_CODES
+    """화면에 보이는 국내 종목의 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
+    codes = VIEW_CODES["kr"] or (KR_CODES + EXTRA_CODES)
     return swr(("trends_all", codes), 900, lambda: data.fetch_stock_trends(codes), first_wait=False)
 
 
 def load_fins_all():
-    """국내 전 종목(보드 + 코스피·코스닥 전체) 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
-    codes = KR_CODES + EXTRA_CODES
+    """화면에 보이는 국내 종목의 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
+    codes = VIEW_CODES["kr"] or (KR_CODES + EXTRA_CODES)
     return swr(("fins_all", codes), 43200, lambda: data.fetch_financials_many(codes, workers=12), first_wait=False)
 
 
@@ -4253,20 +4432,44 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 _QUOTES: dict = {}
+VIEW_CODES: dict = {"kr": (), "all": ()}
 
 
 def render_board():
-    histories = {**load_histories(KR_CODES), **load_histories_overseas(OS_CODES)}
-    if EXTRA_CODES:
-        histories.update(load_histories_extra(EXTRA_CODES))
     quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
     _QUOTES.clear()
     _QUOTES.update(quotes)
     shares_store = load_shares()
-    df = data.build_table(STOCKS_VIEW, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
-                          monthlies=load_monthlies(ALL_CODES + EXTRA_CODES),
-                          official52={**load_official_52w_bg(EXTRA_CODES), **load_official_52w(KR_CODES)}
-                          if EXTRA_CODES else load_official_52w(KR_CODES))
+    core_info = None
+    if scope_core:
+        core, small_hi, core_info = core_view(quotes, shares_store["data"])
+        keep = core | small_hi | set(OS_CODES)
+        stocks_use = []
+        for x in STOCKS_VIEW:
+            if x["code"] in keep:
+                if x["code"] in small_hi and x["code"] not in core:
+                    x = dict(x, tags=list(x.get("tags") or []) + ["🆕 소형 신고가"])
+                stocks_use.append(x)
+        core_info.update(core=len(core), small_hi=len(small_hi))
+    else:
+        stocks_use = STOCKS_VIEW
+    view_kr = tuple(sorted({x["code"] for x in stocks_use if data.is_kr(x["code"])}))
+    view_os = tuple(sorted({x["code"] for x in stocks_use if not data.is_kr(x["code"])}))
+    histories = get_histories(view_kr + view_os, wait=True,
+                              label="일봉을 불러오는 중이에요. 처음 켤 때 한 번만 조금 걸리고, 이후엔 바뀐 종목만 받아요.")
+    VIEW_CODES["kr"], VIEW_CODES["all"] = view_kr, view_kr + view_os
+    kr_board = tuple(c for c in view_kr if c in set(KR_CODES))
+    df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
+                          monthlies=load_monthlies(view_kr + view_os),
+                          official52={**load_official_52w_bg(tuple(c for c in view_kr if c not in set(KR_CODES))),
+                                      **load_official_52w(kr_board)})
+    if core_info:
+        bg = core_info["bg"]
+        st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
+                   f"{core_info['small_hi']}종목"
+                   + (f" · 작은 종목 일봉 뒤에서 받는 중 {bg['done']:,}/{bg['total']:,}" if bg.get("running") else
+                      f" · 작은 종목 {core_info['loaded']:,}/{core_info['rest']:,} 확인 완료")
+                   + " · 모두 보려면 사이드바 '전체'")
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 
