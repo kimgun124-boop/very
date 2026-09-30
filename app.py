@@ -75,7 +75,7 @@ if _data_stale():
 _missing = [n for n in REQUIRED if not hasattr(data, n)]
 if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
     _missing.append(f"버전 {DATA_VERSION}")
-REPORTS_VERSION = "2026-09-28-reports"
+REPORTS_VERSION = "2026-09-30-sync"
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
@@ -113,6 +113,36 @@ if PENDING_NAMES and hasattr(stock_list, "attach"):
     STOCKS = STOCKS + stock_list.attach(_resolved)
 
 # 앱에서 직접 넣은 리포트(user_reports.json)의 종목을 보드에 합쳐요
+@st.cache_resource
+def _sync_from_github() -> str:
+    """(Hugging Face 등 다른 서버용) 앱이 켜질 때 한 번, GitHub에 저장된 보유 종목·비밀번호·리포트를 받아와요.
+    Streamlit 서버는 저장소를 그대로 받아 오지만, 다른 서버는 코드만 옮겨 오기 때문이에요."""
+    def sec(k, d=""):
+        try:
+            v = st.secrets.get(k)
+        except Exception:
+            v = None
+        return str(v or os.environ.get(k, d) or "")
+    token = sec("GITHUB_TOKEN")
+    if not token:
+        return "GitHub 토큰 없음(이 서버의 파일만 사용)"
+    repo, branch = sec("GITHUB_REPO", "kimgun124-boop/very"), sec("GITHUB_BRANCH") or None
+    got = []
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("user_holdings.json", "user_settings.json", "user_reports.json"):
+        d = reports.fetch_github_json(name, token, repo, branch)
+        if d is not None:
+            try:
+                with open(os.path.join(base, name), "w", encoding="utf-8") as f:
+                    import json as _json
+                    _json.dump(d, f, ensure_ascii=False, indent=1)
+                got.append(name)
+            except OSError:
+                pass
+    return "GitHub에서 받음: " + (", ".join(got) or "없음")
+
+
+SYNC_STATUS = _sync_from_github()
 USER_STORE = reports.load_local()
 STOCKS, TAGS = reports.merge(STOCKS, TAGS, USER_STORE)
 for _s in STOCKS:
@@ -721,8 +751,29 @@ def _bg_store() -> dict:
     return {"lock": threading.Lock(), "items": {}}
 
 
-MEM_SOFT = 650     # MB: 넘으면 뒤에서 새로 받기를 잠시 멈춰요
-MEM_HARD = 800     # MB: 넘으면 화면에 안 쓰는 기억을 비워요
+# Streamlit 무료 서버는 앱마다 메모리를 690MB~2.7GB 사이로 그때그때 나눠 줘요 → 가장 적을 때(690MB)에 맞춰요
+IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
+MEM_SOFT = int(os.environ.get("MEM_SOFT_MB", "380" if IS_STREAMLIT_CLOUD else "650"))   # 넘으면 뒤쪽 새로 받기 멈춤
+MEM_HARD = int(os.environ.get("MEM_HARD_MB", "480" if IS_STREAMLIT_CLOUD else "800"))   # 넘으면 기억 비우기
+BIG_SERVER = MEM_SOFT >= 2000                           # Hugging Face(16GB) 같은 넉넉한 서버
+
+
+def _mem_log(n_rows: int):
+    """(원인 찾기) 5분마다 서버 로그에 메모리와 기억 창고 크기를 한 줄씩 남겨요 — Manage app → 로그에서 보여요."""
+    now = time.time()
+    if now - _GC.get("logt", 0) < 300:
+        return
+    _GC["logt"] = now
+    try:
+        S = _hist_store()
+        from streamlit.runtime import get_instance
+        rt = get_instance()
+        n_sess = len(rt._session_mgr.list_active_sessions()) if hasattr(rt, "_session_mgr") else -1
+    except Exception:
+        S, n_sess = {"data": {}, "light": {}}, -1
+    print(f"[MEM] {time.strftime('%m/%d %H:%M:%S')} rss={rss_mb():.0f}MB sessions={n_sess} "
+          f"hist={len(S['data'])} light={len(S['light'])} swr={len(_bg_store()['items'])} rows={n_rows} "
+          f"threads={threading.active_count()}", flush=True)
 
 
 def rss_mb() -> float:
@@ -1227,7 +1278,8 @@ with st.sidebar:
         scope_all = False
         scope_core = False
         if market == "KR":
-            scope = st.segmented_control("종목 범위", ["내 보드", "주요 500", "전체"], default="내 보드", required=True,
+            scope = st.segmented_control("종목 범위", ["내 보드", "주요 500"] if IS_STREAMLIT_CLOUD else ["내 보드", "주요 500", "전체"],
+                                         default="주요 500" if BIG_SERVER else "내 보드", required=True,
                                          key="sb_scope3", width="stretch",
                                          format_func=lambda x: {"주요 500": "주요500+신고가", "전체": "전체", "내 보드": "내 보드"}[x],
                                          help="내 보드(기본·가벼움): 공부 자료 종목만.\n"
@@ -4783,6 +4835,7 @@ def render_board():
     if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
         gc.collect()
     _GC["mb"] = mem_guard(set(view_kr + view_os) | set(KR_CODES))
+    _mem_log(len(df))
     if core_info:
         bg = core_info["bg"]
         st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
