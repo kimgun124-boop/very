@@ -45,6 +45,7 @@ _qp_chart = st.query_params.get("chart")
 if _qp_chart:
     st.session_state["chart_code"] = _qp_chart
     st.session_state["detail_code"] = _qp_chart
+    st.session_state["main_tab_sel"] = "🕯️ 차트"       # 카드·신고가 후보에서 누르면 차트 탭으로 바로
     del st.query_params["chart"]
 
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
@@ -59,7 +60,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
-DATA_VERSION = "2026-09-29-idxchart"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-09-30-mem"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -78,7 +79,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-29-masters"
+HOLDINGS_VERSION = "2026-09-30-v2"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -724,6 +725,11 @@ def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = Tr
     first_wait=False면 처음에도 기다리지 않고 empty를 준 뒤 뒤에서 받아요(없어도 화면이 되는 데이터용)."""
     store = _bg_store()
     with store["lock"]:
+        if key not in store["items"] and isinstance(key, tuple):
+            # (메모리) 종목 구성이 바뀔 때마다 새 키가 생겨 옛 데이터가 쌓였어요 → 같은 종류는 최근 2개만 남겨요
+            same = [k for k, v in store["items"].items() if isinstance(k, tuple) and k[0] == key[0] and not v["busy"]]
+            for k in sorted(same, key=lambda k: store["items"][k]["t"])[:-1]:
+                store["items"].pop(k, None)
         item = store["items"].setdefault(key, {"value": None, "t": 0.0, "busy": False})
         has_value = item["value"] is not None
         need = (not has_value) or time.time() - item["t"] >= ttl
@@ -778,7 +784,9 @@ HIST_TTL = 1800
 @st.cache_resource
 def _hist_store() -> dict:
     """(속도) 일봉을 종목마다 따로 기억해요. 종목 구성이 바뀌어도 새로 들어온 종목만 받아요."""
-    return {"data": {}, "t": {}, "lock": threading.Lock(), "bg": {"running": False, "queue": set(), "total": 0, "done": 0}}
+    return {"data": {}, "t": {}, "light": {}, "lock": threading.Lock(),
+            "bg": {"running": False, "queue": set(), "total": 0, "done": 0},
+            "lbg": {"running": False, "queue": set(), "total": 0, "done": 0}}
 
 
 def _hist_put(got: dict):
@@ -790,6 +798,70 @@ def _hist_put(got: dict):
             if ok or c not in S["data"]:
                 S["data"][c] = res
             S["t"][c] = now if ok else now - HIST_TTL + 120      # 못 받았으면 2분 뒤 다시
+
+
+LIGHT_TTL = 3600
+
+
+def _light_put(got: dict):
+    """(메모리) 화면에 안 나오는 작은 종목은 일봉 표 대신 최근 260일 고가·종가만 가볍게 기억해요."""
+    S = _hist_store()
+    now = time.time()
+    with S["lock"]:
+        for c, res in got.items():
+            df = res[1] if res else None
+            if df is not None and not df.empty:
+                S["light"][c] = (pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype="float32")[-260:], now)
+            elif c not in S["light"]:
+                S["light"][c] = (None, now - LIGHT_TTL + 300)
+
+
+def _light_bg(codes):
+    S = _hist_store()
+    with S["lock"]:
+        new = set(codes) - S["lbg"]["queue"]
+        S["lbg"]["queue"].update(new)
+        S["lbg"]["total"] += len(new)
+        if S["lbg"]["running"] or not S["lbg"]["queue"]:
+            return
+        S["lbg"]["running"] = True
+
+    def run():
+        try:
+            while True:
+                with S["lock"]:
+                    batch = list(S["lbg"]["queue"])[:100]
+                    S["lbg"]["queue"].difference_update(batch)
+                if not batch:
+                    break
+                _light_put(data.fetch_histories(batch, workers=4))
+                with S["lock"]:
+                    S["lbg"]["done"] += len(batch)
+                time.sleep(0.5)
+        finally:
+            with S["lock"]:
+                S["lbg"]["running"] = False
+                if not S["lbg"]["queue"]:
+                    S["lbg"].update(total=0, done=0)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def get_light(codes) -> dict:
+    S = _hist_store()
+    now = time.time()
+    need = [c for c in codes if c not in S["light"] or now - S["light"][c][1] > LIGHT_TTL]
+    if need:
+        _light_bg(need)
+    return {c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}
+
+
+def _hist_drop(keep: set):
+    """(메모리) 화면에서 빠진 종목의 일봉 표는 비워요(다시 보이면 새로 받아요)."""
+    S = _hist_store()
+    with S["lock"]:
+        for c in [c for c in S["data"] if c not in keep]:
+            S["data"].pop(c, None)
+            S["t"].pop(c, None)
 
 
 def _hist_bg(codes):
@@ -840,16 +912,48 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
 
 
 def _recent_high(hist, quote, days: int) -> bool:
-    """최근 days거래일 안에 52주 신고가를 썼는지(오늘 실시간 고가 포함)."""
+    """최근 days거래일 안에 52주 신고가를 썼는지(오늘 실시간 고가 포함). hist = 일봉 표 또는 고가 배열."""
     if hist is None or len(hist) < 60:
         return False
-    h = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)[-250:]
+    h = (np.asarray(hist, dtype=float) if isinstance(hist, np.ndarray)
+         else pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float))[-250:]
     hi52 = np.nanmax(h)
     qh = max(float((quote or {}).get("high") or 0), float((quote or {}).get("price") or 0))
     if qh and qh >= hi52 * 0.999:
         return True
     last = len(h) - 1 - int(np.nanargmax(h[::-1]))
     return (len(h) - 1 - last) <= days
+
+
+def _first_high_ago(hist, lookback: int = 20) -> int | None:
+    """최근 lookback거래일 안에서 52주 신고가를 '처음' 쓴 날이 며칠 전인지(없으면 None)."""
+    if hist is None or len(hist) < 260:
+        return None
+    h = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)
+    prior = pd.Series(h).shift(1).rolling(250, min_periods=200).max().to_numpy()
+    tail = np.arange(len(h) - lookback, len(h))
+    hits = [i for i in tail if prior[i] == prior[i] and h[i] > prior[i]]
+    return (len(h) - 1 - hits[0]) if hits else None
+
+
+def mark_sector_first(df: pd.DataFrame, histories: dict) -> pd.DataFrame:
+    """깡토: 변동성 장에선 섹터에서 '가장 먼저' 신고가를 쓴 종목을 우선 본다 → sector_first 표시."""
+    if df.empty or "days_since_high" not in df:
+        return df
+    recent = df[pd.to_numeric(df["days_since_high"], errors="coerce") <= 20]
+    ago = {}
+    for c in recent["code"]:
+        res = histories.get(c)
+        if res and res[1] is not None:
+            a = _first_high_ago(res[1])
+            if a is not None:
+                ago[c] = a
+    df = df.assign(nh_first_ago=df["code"].map(ago), sector_first=False)
+    sub = df[df["nh_first_ago"].notna()]
+    for _, g in sub.groupby("group"):
+        if len(g) >= 2:
+            df.loc[g["nh_first_ago"].idxmax(), "sector_first"] = True
+    return df
 
 
 def core_view(quotes: dict, shares: dict) -> tuple[set, set, dict]:
@@ -869,11 +973,10 @@ def core_view(quotes: dict, shares: dict) -> tuple[set, set, dict]:
         e = sorted([c for c in EXTRA_CODES if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
         core = set((b + e)[:CORE_N])
     rest = [c for c in all_kr if c not in core]
-    hist_rest = get_histories(rest, wait=False)       # 작은 종목은 뒤에서
-    small_hi = {c for c, res in hist_rest.items()
-                if res and res[1] is not None and _recent_high(res[1], quotes.get(c), max(5, recent_days))}
-    S = _hist_store()["bg"]
-    return core, small_hi, {"rest": len(rest), "loaded": len(hist_rest), "bg": dict(S)}
+    light = get_light(rest)                           # 작은 종목은 뒤에서, 고가만 가볍게
+    small_hi = {c for c, hs in light.items() if _recent_high(hs, quotes.get(c), max(5, recent_days))}
+    S = _hist_store()["lbg"]
+    return core, small_hi, {"rest": len(rest), "loaded": len(light), "bg": dict(S)}
 
 
 def load_histories(codes: tuple[str, ...]):
@@ -1016,7 +1119,7 @@ def price_chart(chart: pd.DataFrame, colors: list[str], height: int = 260):
     st.altair_chart(c)
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False, max_entries=20)
 def load_quotes(codes: tuple[str, ...]):
     return data.fetch_quotes(codes)
 
@@ -1702,7 +1805,9 @@ def _rs_color(v):
 
 def render_table(f: pd.DataFrame):
     view = pd.DataFrame({
-        "종목": [("⛔ " + n if h is True else n) for n, h in zip(f["name"], f["halted"] if "halted" in f else [None] * len(f))],
+        "종목": [("⛔ " if h is True else "") + ("🥇 " if sf is True else "") + n
+               for n, h, sf in zip(f["name"], f["halted"] if "halted" in f else [None] * len(f),
+                                   f["sector_first"] if "sector_first" in f else [None] * len(f))],
         "코드": f["code"],
         "시장": f["market"],
         "분류": f["group"],
@@ -1784,13 +1889,26 @@ def render_table(f: pd.DataFrame):
     codes_in_view = list(f["code"])
 
     def _pick_row():
+        """한 번 누르면 아래 자세히 보기, 같은 종목을 한 번 더 누르면 🕯️ 차트 탭으로."""
         sel = st.session_state.get("list_table")
         rows = getattr(getattr(sel, "selection", None), "rows", None) or (sel or {}).get("selection", {}).get("rows", [])
-        if rows and rows[0] < len(codes_in_view):
-            st.session_state["detail_code"] = codes_in_view[rows[0]]
-            st.session_state["chart_code"] = codes_in_view[rows[0]]
+        now = time.time()
+        last = st.session_state.get("_list_last")
+        code = codes_in_view[rows[0]] if rows and rows[0] < len(codes_in_view) else None
+        # 선택된 줄을 한 번 더 누르면 선택이 풀리면서 여기로 와요 → 그게 '두 번 누르기'. (앱이 계산 중이면 늦게 올 수 있어서 넉넉히 30초)
+        again = last is not None and now - last[1] < 30 and (code is None or code == last[0])
+        if again:
+            st.session_state["chart_code"] = last[0]
+            st.session_state["main_tab_sel"] = "🕯️ 차트"
+            st.session_state.pop("_list_last", None)
+            return
+        if code:
+            st.session_state["detail_code"] = code
+            st.session_state["chart_code"] = code
+            st.session_state["_list_last"] = (code, now)
 
-    st.caption("👆 종목 줄을 누르면 아래 '종목 자세히 보기'에 캔들 차트가 떠요.")
+    st.caption("👆 종목 줄을 한 번 누르면 아래 '종목 자세히 보기', 같은 줄을 한 번 더 누르면 🕯️ 차트 탭으로 넘어가요. "
+               "🥇 = 섹터에서 가장 먼저 신고가")
     st.dataframe(
         styled,
         hide_index=True,
@@ -1990,7 +2108,7 @@ def render_stock_flow(code: str, trends: dict):
                "시장 전체 기준으로 위쪽 '투자자별 순매수 자세히'에 보여줘요.")
 
 
-@st.cache_data(ttl=300, show_spinner=False, max_entries=300)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=40)
 def load_chart_all(code: str) -> dict:
     """(속도) 일·주·월봉을 한 번에 동시에 받아 둬요. 봉 종류를 바꿔도 다시 기다리지 않아요."""
     from concurrent.futures import ThreadPoolExecutor
@@ -2096,7 +2214,7 @@ def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, hi
                + ("마지막 봉은 실시간 시세로 갱신돼요." if quote else "해외 종목은 야후 일봉 기준이에요."))
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
 def naver_search(q: str) -> list[tuple[str, str]]:
     try:
         return data.search_stock(q)[:12]
@@ -2262,7 +2380,7 @@ def render_reports_tab():
 
 
 # ─────────────────────────── 💼 내 보유 ───────────────────────────
-@st.cache_data(ttl=600, show_spinner=False, max_entries=200)
+@st.cache_data(ttl=600, show_spinner=False, max_entries=60)
 def load_evidence(code: str, name: str) -> dict:
     if data.MOCK:
         return holdings.mock_gather(code, name)
@@ -2286,7 +2404,15 @@ def _hold_context(df: pd.DataFrame) -> dict:
         parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
     sm_money = data.sector_money(df, "group") if "tv_live" in df else pd.DataFrame()
     dist = {name: holdings.distribution_days(hist.get(sym, (None, None))[0]) for name, sym in data.MARKETS.items()}
-    return {"dist_days": {k: v for k, v in dist.items() if v is not None},
+    vol_days = 0
+    for sym in data.MARKETS.values():
+        ih = hist.get(sym, (None, None))[0]
+        if ih is not None and len(ih) > 21:
+            ch = pd.to_numeric(ih["close"], errors="coerce").pct_change().tail(20).abs() * 100
+            vol_days = max(vol_days, int((ch >= 3).sum()))
+    return {"vol_mode": vol_days >= 3, "vol_days": vol_days,
+            "ladder": (holdings.load().get("settings") or {}).get("ladder", "2R"),
+            "dist_days": {k: v for k, v in dist.items() if v is not None},
             "n_above60": sum(1 for x in oks if x),
             "market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
             "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
@@ -2295,7 +2421,7 @@ def _hold_context(df: pd.DataFrame) -> dict:
             "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
 
 
-def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict) -> tuple[dict, pd.DataFrame, dict | None]:
+def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict, name: str = "") -> tuple[dict, pd.DataFrame, dict | None]:
     """보드에 있으면 보드 지표를, 없으면 일봉으로 바로 계산해요."""
     quote = quotes.get(code)
     if quote is None and data.is_kr(code):
@@ -2310,6 +2436,7 @@ def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict) -> tuple[dict, pd.D
     if data.is_kr(code):                       # 펀더멘털(연간 영업이익·EPS·컨센서스)과 수급(외국인·기관)
         m["_fins"] = load_fin_one(code)
         m["_flow"] = load_trends((code,)).get(code)
+    m["_news"] = load_evidence(code, name or m.get("name") or code)   # 최신 뉴스·증권사 리포트(10분마다)
     return m, bars_live, quote
 
 
@@ -2359,6 +2486,7 @@ def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
         st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
             f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
         _deep_view(j)
+        _quick_edit(h, stt)
 
         t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
         with t_news:
@@ -2410,7 +2538,7 @@ def _deep_view(j: dict):
         for k, v in secs.items())
     gcol = {"A": "#1E7A45", "B": "#2E6B6F", "C": "#B7861D", "D": UP}.get(j.get("grade"), "#51616C")
     st.markdown(f'<div class="dp-head"><span class="dp-score" style="background:{gcol}">{j["grade"]} · {j["score"]}점</span>'
-                f'{chips}<em>가중치: 펀더멘털 35 · 추세 25 · 수급 15 · 거래량 15 · 섹터·시장 10</em></div>',
+                f'{chips}<em>가중치: 펀더멘털 35 · 추세 30 · 거래량 15 · 수급 10(보너스) · 섹터·시장 10</em></div>',
                 unsafe_allow_html=True)
     icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
 
@@ -2439,12 +2567,139 @@ def _rtxt(j: dict) -> str:
     return "🌱 가치 계좌" if j.get("account") == "가치" else f"{(j.get('r') or 0):+.2f}R"
 
 
+def _merge_holdings(items: list) -> list:
+    """같은 종목(코드)끼리 합치기: 수량 합산, 평단은 수량 가중 평균(수량이 없으면 단순 평균), 매수일은 가장 이른 날."""
+    out, by = [], {}
+    for h in items:
+        c = h["code"]
+        if c not in by:
+            by[c] = dict(h)
+            out.append(by[c])
+            continue
+        a = by[c]
+        qa, qb = float(a.get("qty") or 0), float(h.get("qty") or 0)
+        if qa + qb > 0:
+            a["avg"] = (a["avg"] * qa + h["avg"] * qb) / (qa + qb)
+        else:
+            a["avg"] = (a["avg"] + h["avg"]) / 2
+        a["qty"] = qa + qb
+        dates = [d for d in (a.get("buy_date"), h.get("buy_date")) if d]
+        a["buy_date"] = min(dates) if dates else ""
+        memos = [m for m in (a.get("memo"), h.get("memo")) if m]
+        a["memo"] = " / ".join(dict.fromkeys(memos))
+    return out
+
+
+def _holdings_manager(store: dict, stt: dict):
+    """✏️ 보유 종목 관리: 표에서 바로 고치고, 🗑️ 체크해서 지우고, 같은 종목은 합치기."""
+    hs = store["holdings"]
+    codes = [h["code"] for h in hs]
+    dups = sorted({h["name"] for h in hs if codes.count(h["code"]) > 1})
+    with st.expander(f"✏️ 보유 종목 관리 — 고치기 · 지우기 · 합치기 ({len(hs)}종목)", expanded=bool(dups)):
+        if dups:
+            st.warning("같은 종목이 두 번 이상 들어 있어요: " + ", ".join(dups) + " → 아래 '🔗 같은 종목 합치기'를 누르면 수량을 합치고 평단을 다시 계산해요.")
+        ed = st.data_editor(pd.DataFrame([{
+            "🗑️": False, "종목명": h["name"], "코드": h["code"], "평단가": h["avg"], "수량": h.get("qty") or 0.0,
+            "매수일": h.get("buy_date", ""), "손절%": h.get("stop_pct"), "절반 익절함": bool(h.get("half_taken")),
+            "계좌": h.get("account", "추세"), "메모": h.get("memo", ""), "가치훼손": bool(h.get("impaired")),
+            "순현금(억)": h.get("net_cash"), "영업이익(억)": h.get("op"), "영업이익률(%)": h.get("opm"),
+            "_id": h["id"]} for h in hs]),
+            key=f"hold_editor_{len(hs)}", hide_index=True, num_rows="fixed", width="stretch",
+            column_config={"_id": None,
+                           "🗑️": st.column_config.CheckboxColumn("🗑️ 삭제", help="지울 종목을 체크하고 아래 '체크한 종목 삭제'", width="small"),
+                           "코드": st.column_config.TextColumn(disabled=True, width="small"),
+                           "종목명": st.column_config.TextColumn(disabled=True),
+                           "평단가": st.column_config.NumberColumn(format="%.0f"),
+                           "수량": st.column_config.NumberColumn(format="%.0f"),
+                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR (추세 계좌)"),
+                           "계좌": st.column_config.SelectboxColumn(options=["추세", "가치"], required=True, width="small"),
+                           "가치훼손": st.column_config.CheckboxColumn(help="가치 계좌: 가치훼손 이슈가 생기면 체크 → 매도 원칙"),
+                           "순현금(억)": st.column_config.NumberColumn(help="가치 계좌 절대가치 계산용"),
+                           "영업이익(억)": st.column_config.NumberColumn(help="연간(또는 올해 추정) 영업이익"),
+                           "영업이익률(%)": st.column_config.NumberColumn(help="배수 = 영업이익률의 절반")})
+        n_del = int(ed["🗑️"].sum()) if len(ed) else 0
+        c1, c2, c3 = st.columns(3)
+        do_save = c1.button("💾 변경 저장", key="hm_save", type="primary", width="stretch")
+        do_del = c2.button(f"🗑️ 체크한 종목 삭제 ({n_del})", key="hm_del", width="stretch", disabled=n_del == 0)
+        do_merge = c3.button("🔗 같은 종목 합치기", key="hm_merge", width="stretch", disabled=not dups)
+        st.caption("칸을 눌러 바로 고친 뒤 '변경 저장' · 지울 종목은 🗑️ 체크 후 '삭제' · 새 종목은 위 '➕ 보유 종목 추가'(이미 있는 종목이면 추가 매수로 합쳐져요)")
+        if do_save or do_del or do_merge:
+            by_id = {h["id"]: h for h in hs}
+            new = []
+            for _, r in ed.iterrows():
+                h = by_id.get(r.get("_id"))
+                if not h or (do_del and bool(r["🗑️"])):
+                    continue
+                sp = r.get("손절%")
+                h.update(avg=float(r["평단가"]), qty=float(r["수량"] or 0), buy_date=str(r["매수일"] or ""),
+                         stop_pct=float(sp) if sp == sp and sp not in (None, "", 0) else None,
+                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""),
+                         account=r.get("계좌") if r.get("계좌") in ("추세", "가치") else "추세",
+                         impaired=bool(r.get("가치훼손")),
+                         net_cash=_numor(r.get("순현금(억)")), op=_numor(r.get("영업이익(억)")),
+                         opm=_numor(r.get("영업이익률(%)")))
+                new.append(h)
+            if do_merge:
+                new = _merge_holdings(new)
+            store["holdings"] = new
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(("삭제했어요. " if do_del else "합쳤어요. " if do_merge else "저장했어요. ") + msg)
+            _rerun_frag()
+
+
+def _quick_edit(h: dict, stt: dict):
+    """종목 탭 안에서 바로 고치기·삭제."""
+    with st.expander("✏️ 이 종목 수정 · 삭제"):
+        c1, c2, c3, c4 = st.columns(4)
+        avg = c1.number_input("평단가", value=float(h["avg"]), step=100.0, format="%.0f", key=f"qe_avg_{h['id']}")
+        qty = c2.number_input("수량", value=float(h.get("qty") or 0), step=1.0, format="%.0f", key=f"qe_qty_{h['id']}")
+        stop = c3.number_input("손절 %(0 = 8%/ATR)", value=float(h.get("stop_pct") or 0), step=0.5, key=f"qe_stop_{h['id']}")
+        acct = c4.selectbox("계좌", ["추세", "가치"], index=0 if h.get("account", "추세") == "추세" else 1, key=f"qe_acct_{h['id']}")
+        half = st.checkbox("절반 익절함", value=bool(h.get("half_taken")), key=f"qe_half_{h['id']}")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        if c1.button("💾 저장", key=f"qe_save_{h['id']}", type="primary", width="stretch"):
+            store = holdings.load()
+            for x in store["holdings"]:
+                if x["id"] == h["id"]:
+                    x.update(avg=avg, qty=qty, stop_pct=stop or None, account=acct, half_taken=half)
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(msg)
+            _rerun_frag()
+        sure = c3.checkbox("정말 지울게요", key=f"qe_sure_{h['id']}")
+        if c2.button("🗑️ 삭제", key=f"qe_del_{h['id']}", width="stretch", disabled=not sure):
+            store = holdings.load()
+            store["holdings"] = [x for x in store["holdings"] if x["id"] != h["id"]]
+            ok, msg = _persist_holdings(store, stt)
+            (st.success if ok else st.error)(f"{h['name']} 삭제했어요. " + msg)
+            _rerun_frag()
+
+
 def _numor(v):
     try:
         v = float(v)
         return v if v == v else None
     except (TypeError, ValueError):
         return None
+
+
+def _render_mode(store: dict, stt: dict, ctx: dict):
+    """변동성 장세 알림 + 손절 사다리(R 단위 트레일링 스톱) 선택."""
+    if ctx.get("vol_mode"):
+        st.warning(f"🌊 변동성 큰 횡보장 — 최근 20거래일 중 지수가 ±3% 넘게 움직인 날 {ctx.get('vol_days')}일. "
+                   "깡토 원칙: 쿠션 있는 종목은 추세가 무너지기 전까지 홀딩, 늦게 산 종목은 손절 -5∼6%·목표 +15∼18%로 타이트하게"
+                   "(손익비 1:3은 그대로, 기준 가격만 좁힘). 확신이 부족하면 비중을 줄이거나 쉬어도 돼요.")
+    cur = (store.get("settings") or {}).get("ladder", "2R")
+    c1, c2 = st.columns([2, 3])
+    lad = c1.segmented_control("🪜 손절 사다리(수익이 날수록 손절선 올리기)", ["1R", "2R", "끄기"], default=cur, required=True,
+                               key="hold_ladder",
+                               format_func=lambda x: {"1R": "1R 간격", "2R": "2R 간격(기본)", "끄기": "끄기"}[x],
+                               help="1R 간격: 1R 오르면 본전, 2R이면 +1R … (초보·변동성 장) / 2R 간격: 2R에 본전, 4R에 +2R … "
+                                    "/ 끄기: 절반 익절 전까지 처음 손절선 유지. 익숙해지면 간격을 넓혀 가라는 게 깡토 권장")
+    c2.caption("예) 손절 8%·1R 간격이면 +8%에 손절선 = 평단, +16%에 손절선 = 평단+8%. 노이즈에 털릴 수 있어 익숙해지면 2R·3R로 넓혀요.")
+    if lad and lad != cur:
+        store.setdefault("settings", {})["ladder"] = lad
+        _persist_holdings(store, stt)
+        _rerun_frag()
 
 
 def _render_capital(store: dict, rows, stt: dict, ctx: dict | None = None):
@@ -2521,6 +2776,16 @@ PRINCIPLES = [
         "와인스타인: 2단계(30주선 위·상승)에서만, 4단계는 사지 않음 · 손절은 %가 아니라 돌파 자리 아래, 15%보다 멀면 안 삼",
         "쟁거: 거래량 실린 하락일엔 절반 덜고, 되돌리는 거래량 실린 상승일에 다시 채움 · 돌파 지점 아래로 되돌아오면 전량",
         "깡토 책: 기관+외국인 순매수가 거래량의 10%↑ · 주봉·일봉 정배열 · 피라미드 1차 30%→2차 15%→3차 10% · 2~3주 횡보면 시간 손절"]),
+    ("깡토 Q&A · 횡보장", [
+        "변동성 큰 횡보장: 지켜보기보다 타이트하게 — 손절 -5~6%면 목표 +15~18%(손익비 1:3 유지, 기준 가격만 변경)",
+        "수익 쿠션 있는 종목은 추세가 무너지기 전까지 홀딩, 늦게 산 후발 종목만 타이트하게",
+        "변동성 장 종목: 시총 크고 RS 높고 섹터가 같이 움직이고 거래량 최대, 섹터에서 가장 먼저 신고가 쓴 종목",
+        "R 사다리: 1R 오르면 손절 본전, 2R이면 +1R … 처음엔 1R 간격, 익숙해지면 2R·3R로 넓히기",
+        "수급·매크로·시즈널리티는 보너스 알파 — 메인 팩터는 추세, 그 추세를 만드는 건 이익(하이브리드)",
+        "숫자 없는 내러티브 종목은 해도 되지만 비중을 줄여서, 넘버스+내러티브가 같이 있는 종목이 우선",
+        "IPO 셋업: 상장 첫날 시가를 넘을 때",
+        "실적이 어긋나면 — 추세 계좌: 맞았냐보다 추세가 꺾였냐 / 가치 계좌: 단순히 다음 분기로 밀린 거면 홀딩",
+        "고멀티플: 추세 계좌에선 시장이 높게 쳐준다는 뜻이라 오히려 괜찮음, 가치 계좌에선 후순위"]),
     ("검증 메모", ["한국 논문(유명 트레이더 매매법 11장): 52주 최고가 하나만으로는 한국에서 예측력이 약하다는 결과도 있음 → 신고가는 주도섹터·실적·수급과 같이 볼 때 의미",
                 "정리본의 [복원]·[2차] 숫자는 원전값이 아님 — 앱의 기준치는 참고용이고 바꿔 가며 확인할 자리"]),
     ("계좌 분리", ["추세 계좌와 가치 계좌는 물과 기름 — 섞지 않는다",
@@ -2865,8 +3130,12 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
                                     help="추세·가치 계좌는 섞지 않는 게 원칙. 추세 = 돌파 매수·손절선 / 가치 = 가치우파에서 분할매수·가치훼손 시 매도")
         half = c1.checkbox("이미 절반 익절함(손절선을 본전으로)", key="hold_half")
         if c2.button("저장", type="primary", width="stretch", disabled=not (pick and avg > 0)):
-            store["holdings"].append(holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo,
-                                                          acct or "추세"))
+            nh = holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo, acct or "추세")
+            if any(x["code"] == pick[0] for x in store["holdings"]):
+                store["holdings"] = _merge_holdings(store["holdings"] + [nh])
+                st.info(f"{pick[1]}은(는) 이미 있어서 추가 매수로 합쳤어요(수량 합산·평단 재계산).")
+            else:
+                store["holdings"].append(nh)
             ok, msg = _persist_holdings(store, stt)
             (st.success if ok else st.error)(msg)
             _rerun_frag()
@@ -2878,8 +3147,9 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
     ctx = _hold_context(df)
     rows = []
     for h in store["holdings"]:
-        m, bars, quote = _hold_metrics(h["code"], df, quotes)
+        m, bars, quote = _hold_metrics(h["code"], df, quotes, h["name"])
         rows.append((h, m, bars, holdings.judge(h, m, bars, ctx)))
+    _render_mode(store, stt, ctx)
     _render_capital(store, rows, stt, ctx)
     _render_principles()
 
@@ -2918,43 +3188,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
             with tab:
                 _holding_card(h, m, bars, j, quotes, stt)
 
-    with st.expander("✏️ 보유 종목 고치기 · 지우기"):
-        ed = st.data_editor(pd.DataFrame([{
-            "종목명": h["name"], "코드": h["code"], "평단가": h["avg"], "수량": h.get("qty") or 0.0,
-            "매수일": h.get("buy_date", ""), "손절%": h.get("stop_pct"), "절반 익절함": bool(h.get("half_taken")),
-            "메모": h.get("memo", ""), "계좌": h.get("account", "추세"), "가치훼손": bool(h.get("impaired")),
-            "순현금(억)": h.get("net_cash"), "영업이익(억)": h.get("op"), "영업이익률(%)": h.get("opm"),
-            "_id": h["id"]} for h in store["holdings"]]),
-            key="hold_editor", hide_index=True, num_rows="dynamic", width="stretch",
-            column_config={"_id": None, "코드": st.column_config.TextColumn(disabled=True),
-                           "종목명": st.column_config.TextColumn(disabled=True),
-                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR (추세 계좌)"),
-                           "계좌": st.column_config.SelectboxColumn(options=["추세", "가치"], required=True),
-                           "가치훼손": st.column_config.CheckboxColumn(help="가치 계좌: 가치훼손 이슈가 생기면 체크 → 매도 원칙"),
-                           "순현금(억)": st.column_config.NumberColumn(help="가치 계좌 절대가치 계산용"),
-                           "영업이익(억)": st.column_config.NumberColumn(help="연간(또는 올해 추정) 영업이익"),
-                           "영업이익률(%)": st.column_config.NumberColumn(help="배수 = 영업이익률의 절반")})
-        st.caption("줄을 지우려면 왼쪽 칸을 고르고 휴지통을 누른 뒤 저장하세요. 새 종목은 위 '보유 종목 추가'로 넣어요.")
-        if st.button("변경 저장", key="hold_save"):
-            by_id = {h["id"]: h for h in store["holdings"]}
-            new = []
-            for _, r in ed.iterrows():
-                h = by_id.get(r.get("_id"))
-                if not h:
-                    continue
-                sp = r.get("손절%")
-                h.update(avg=float(r["평단가"]), qty=float(r["수량"] or 0), buy_date=str(r["매수일"] or ""),
-                         stop_pct=float(sp) if sp == sp and sp not in (None, "", 0) else None,
-                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""),
-                         account=r.get("계좌") if r.get("계좌") in ("추세", "가치") else "추세",
-                         impaired=bool(r.get("가치훼손")),
-                         net_cash=_numor(r.get("순현금(억)")), op=_numor(r.get("영업이익(억)")),
-                         opm=_numor(r.get("영업이익률(%)")))
-                new.append(h)
-            store["holdings"] = new
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(msg)
-            _rerun_frag()
+    _holdings_manager(store, stt)
     if stt["gh"]:
         st.caption("보유 종목은 GitHub 저장소의 user_holdings.json에 저장돼요. 저장소가 공개(Public)면 누구나 볼 수 있으니 "
                    "GitHub에서 저장소를 비공개(Private)로 바꿔 두세요.")
@@ -3173,6 +3407,10 @@ def _render_detail(f: pd.DataFrame, histories: dict, trends: dict):
         if row.currency != "KRW" and pd.notna(row.cap_krw):
             cap_text += f" (약 {data.format_krw(row.cap_krw)}원)"
         st.markdown(f"**{cap_text}**  \n상장주식수 {row.shares:,.0f}주")
+    if st.button("🕯️ 차트 탭에서 크게 보기", key=f"to_chart_{code}"):
+        st.session_state["chart_code"] = code
+        st.session_state["main_tab_sel"] = "🕯️ 차트"
+        st.rerun()
     st.write(f"**{row['group']}**  \n{row.desc}")
     if isinstance(row.get("src"), str) and row.get("src"):
         st.caption(row["src"])
@@ -3244,7 +3482,7 @@ def _buy_params() -> dict:
 def load_trends_all():
     """화면에 보이는 국내 종목의 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
     codes = VIEW_CODES["kr"] or (KR_CODES + EXTRA_CODES)
-    return swr(("trends_all", codes), 900, lambda: data.fetch_stock_trends(codes), first_wait=False)
+    return swr(("trends_all", codes), 1800, lambda: data.fetch_stock_trends(codes, workers=6), first_wait=False)
 
 
 def load_fins_all():
@@ -4479,12 +4717,15 @@ def render_board():
     view_os = tuple(sorted({x["code"] for x in stocks_use if not data.is_kr(x["code"])}))
     histories = get_histories(view_kr + view_os, wait=True,
                               label="일봉을 불러오는 중이에요. 처음 켤 때 한 번만 조금 걸리고, 이후엔 바뀐 종목만 받아요.")
+    if scope_core:
+        _hist_drop(set(view_kr + view_os) | set(KR_CODES))
     VIEW_CODES["kr"], VIEW_CODES["all"] = view_kr, view_kr + view_os
     kr_board = tuple(c for c in view_kr if c in set(KR_CODES))
     df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
                           monthlies=load_monthlies(view_kr + view_os),
                           official52={**load_official_52w_bg(tuple(c for c in view_kr if c not in set(KR_CODES))),
                                       **load_official_52w(kr_board)})
+    df = mark_sector_first(df, histories)
     if core_info:
         bg = core_info["bg"]
         st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "

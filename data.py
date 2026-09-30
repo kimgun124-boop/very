@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-29-idxchart"
+DATA_VERSION = "2026-09-30-mem"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -561,15 +561,18 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     if last_is_today and q_vol and not (vv[-1] >= q_vol):
         vv[-1] = float(q_vol)                          # 일봉(30분마다)보다 실시간 누적 거래량이 더 최신
     # (속도) ADX는 일봉이 바뀔 때만 다시 계산해요(장중 몇 분 사이엔 거의 안 변해요)
+    # (메모리) 일봉 표 자체를 붙잡지 않고 '길이·마지막 날짜·마지막 종가'로만 같은 일봉인지 확인해요.
+    # 예전엔 표를 붙잡아 둬서 새로 받을 때마다 옛 표가 메모리에 쌓였어요(리소스 초과 원인).
     key = id(hist)
+    sig = (len(hh), str(dts[-1]) if len(dts) else "", float(cc[-2]) if len(cc) > 1 else 0.0)
     hit = _ADX_CACHE.get(key)
-    if hit is not None and hit[0] is hist and hit[1] == len(hh):
-        adx = hit[2]
+    if hit is not None and hit[0] == sig:
+        adx = hit[1]
     else:
         adx = _adx(hh, ll, cc)
-        _ADX_CACHE[key] = (hist, len(hh), adx)
-        if len(_ADX_CACHE) > 6000:
+        if len(_ADX_CACHE) > 4000:
             _ADX_CACHE.clear()
+        _ADX_CACHE[key] = (sig, adx)
     res.update(_extras(dts, hh, ll, cc, vv, price, res.get("bo_date") if res.get("bo_status") == "유지" else None,
                        last_is_today, adx=adx))
     return res
