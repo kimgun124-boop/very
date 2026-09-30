@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-09-29-masters"
+HOLDINGS_VERSION = "2026-09-30-v2"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -186,8 +186,13 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
     if not price or not avg:
         return out
     atr = _f(m.get("atr_pct"))
-    stop_pct = _f(h.get("stop_pct")) or max(8.0, atr or 0.0)
+    base_stop = _f(h.get("stop_pct")) or max(8.0, atr or 0.0)
     pnl = (price / avg - 1) * 100
+    # 깡토: 수익 쿠션(1R 이상 수익)이 있으면 추세가 꺾이기 전까지 홀딩, 늦게 산 후발은 타이트하게
+    cushion = pnl >= base_stop
+    vol_mode = bool(ctx.get("vol_mode"))
+    tight = vol_mode and not cushion and not h.get("stop_pct")
+    stop_pct = min(base_stop, 6.0) if tight else base_stop   # 변동성 장세 후발: -5~6% (손익비 1:3 유지 → 목표 +18%)
     r_now = pnl / stop_pct
     # 매수일 이후 최고가 → 2R·3R 도달 이력
     max_r, hi_since = None, None
@@ -201,11 +206,20 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
         if len(b):
             hi_since = float(pd.to_numeric(b["high"], errors="coerce").max())
             max_r = ((hi_since / avg - 1) * 100) / stop_pct
-    breakeven = (max_r or 0) >= 2 or bool(h.get("half_taken"))
-    stop_price = avg if breakeven else avg * (1 - stop_pct / 100)
+    # R 사다리(트레일링 스톱): 1R 간격 → 1R에 본전, 2R에 +1R … / 2R 간격 → 2R에 본전, 4R에 +2R … / 끄기
+    ladder = ctx.get("ladder") or "2R"
+    step = {"1R": 1, "2R": 2}.get(ladder)
+    lock_r = None                      # 손절선을 올려 둔 R(0 = 본전)
+    if step and max_r is not None and max_r >= step:
+        lock_r = (int(max_r // step) - 1) * step
+    if h.get("half_taken"):
+        lock_r = max(lock_r or 0, 0)
+    breakeven = lock_r is not None
+    stop_price = avg * (1 + lock_r * stop_pct / 100) if breakeven else avg * (1 - stop_pct / 100)
+    stop_label = ("본전" if lock_r == 0 else f"+{lock_r}R") if breakeven else f"-{stop_pct:.0f}%"
     target3r = avg * (1 + 3 * stop_pct / 100)
     out.update(pnl=pnl, r=r_now, stop_pct=stop_pct, stop_price=stop_price, stop_dist=(price / stop_price - 1) * 100,
-               target3r=target3r, max_r=max_r)
+               target3r=target3r, max_r=max_r, cushion=cushion, tight=tight, ladder=ladder, lock_r=lock_r)
 
     checks = []   # (상태 good/warn/bad/info, 항목, 설명)
 
@@ -214,11 +228,19 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
 
     # 1) 손절
     if price <= stop_price:
-        add("bad", "손절선", f"현재가가 손절선 {stop_price:,.0f} 아래 — {'본전 손절(2R 이상 갔던 종목)' if breakeven else f'1R(-{stop_pct:.0f}%)'} 도달")
+        add("bad", "손절선", f"현재가가 손절선 {stop_price:,.0f} 아래 — "
+            + (f"사다리 손절({stop_label}, 매수 후 최고 {max_r:.1f}R)" if breakeven and max_r is not None
+               else ("본전 손절(절반 익절 종목)" if breakeven else f"1R({stop_label})")) + " 도달")
     else:
         add("good" if out["stop_dist"] > 3 else "warn", "손절선",
-            f"{'본전' if breakeven else f'-{stop_pct:.0f}%'} {stop_price:,.0f} · 여유 {out['stop_dist']:.1f}%"
-            + (" (ATR이 8%보다 커서 ATR로 넓힘)" if not h.get("stop_pct") and atr and atr > 8 else ""))
+            f"{stop_label} {stop_price:,.0f} · 여유 {out['stop_dist']:.1f}%"
+            + (f" (🪜 {ladder} 사다리로 올린 손절선)" if lock_r and lock_r > 0 else "")
+            + (" (변동성 장세 후발 종목이라 -6%로 좁힘)" if tight else "")
+            + (" (ATR이 8%보다 커서 ATR로 넓힘)" if not tight and not h.get("stop_pct") and atr and atr > 8 else ""))
+    if vol_mode:
+        add("good" if cushion else "warn", "쿠션" if cushion else "후발",
+            f"수익 +{pnl:.1f}% — 쿠션 있음: 추세가 무너지기 전까지 홀딩" if cushion
+            else f"수익 {pnl:+.1f}% — 후발 종목: 변동성 장세라 손절 -{stop_pct:.0f}% · 목표 +{3 * stop_pct:.0f}%로 타이트하게")
     # 2) 익절(3R) · 끌고 가기
     ma5, ma50, ma20 = _f(m.get("ma5")), _f(m.get("ma50")), _f(m.get("ma20"))
     if r_now >= 3 and not h.get("half_taken"):
@@ -308,7 +330,7 @@ def judge(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> dict:
         out["actions"] = [f"원칙: 손절선 {stop_price:,.0f} 이탈 — 정리 검토", "예외를 두지 않는 게 원칙(리스크관리 > 멘탈관리)"]
     elif r_now >= 3 and not h.get("half_taken"):
         out.update(verdict="💰 3R 익절 구간", level="blue")
-        out["actions"] = ["원칙: 절반 익절 후 손절선을 본전으로", "나머지는 5일선이 50일선에 닿을 때까지"]
+        out["actions"] = ["원칙: 절반 익절 후 손절선을 본전 이상으로(사다리 설정 따라)", "나머지는 5일선이 50일선에 닿을 때까지"]
     elif any(c[1] == "5일선·50일선" for c in bad):
         out.update(verdict="📉 끌고 가기 종료 신호", level="red")
         out["actions"] = ["원칙: 5일선이 50일선에 닿음 — 나머지 정리 검토"]
@@ -349,6 +371,9 @@ def _deepen(out, h, m, bars, ctx, stop_pct, pnl, stop_price, target3r, ma_key, m
                           f"손절선 {stop_price:,.0f} 유지, 반등 시 비중 축소 검토"] + out["actions"]
     elif fund.get("ok") is False:
         out["actions"] = out["actions"] + ["펀더멘털 약화(영업이익 감소·적자 전망) — 비중을 늘리지 말고, 익절·축소 쪽으로 무게"]
+    elif fund.get("ok") is None and out["level"] in ("green", "yellow", "purple"):
+        out["actions"] = out["actions"] + ["넘버스(영업이익 증가)가 아직 확인 안 됨 — 내러티브만으로 오르는 종목이면 비중 축소 권장, "
+                                           "넘버스+내러티브가 같이 있는 종목이 우선"]
     elif pyr["ok"] and out["level"] in ("green", "yellow", "blue"):
         out.update(verdict="🔥 불타기 조건 충족", level="purple")
         out["actions"] = [f"오늘 새 돌파 + 거래량·장대양봉·주도섹터·RS·이익 증가 모두 충족 → 1유닛 추가 검토",
@@ -373,7 +398,9 @@ def _deepen(out, h, m, bars, ctx, stop_pct, pnl, stop_price, target3r, ma_key, m
     if any(x[1] == "깡토 · 시간 손절" for x in masters):
         plan.append(("⏱️ 시간", "목표에 못 닿고 옆으로 2~3주 — 현금이 필요하면 보유 기간 대비 수익이 낮은 순으로 정리"))
     if flow.get("smart5") is not None and (flow.get("smart5") or 0) < 0 and (flow.get("smart20") or 0) < 0:
-        plan.append(("🧭 수급", "외국인+기관이 5일·20일 모두 순매도 — 불타기 보류, 반등해도 비중 늘리지 않기"))
+        plan.append(("🧭 수급", "외국인+기관이 5일·20일 모두 순매도 — 수급은 보너스라 이것만으로 팔진 않되, 불타기는 추세·거래량이 확실할 때만"))
+    if out.get("tight"):
+        plan.append(("🌪️ 변동성", f"변동성 장세 후발 종목 — 손절 -{stop_pct:.0f}% · 목표 +{3 * stop_pct:.0f}%(손익비 1:3 유지), 쿠션이 생기면 원래 기준으로"))
     out["plan"] = plan
 
 
@@ -626,10 +653,15 @@ def pyramid_schedule(avg: float | None, stop_pct: float) -> list:
 
 
 def score_card(sections: dict) -> tuple[int, str]:
-    """펀더멘털 35 · 추세(가격) 25 · 수급 15 · 거래량 15 · 섹터·시장 10 — 가장 중요한 건 펀더멘털."""
-    w = {"펀더멘털": 35, "추세": 25, "수급": 15, "거래량": 15, "섹터·시장": 10}
+    """펀더멘털 35 · 추세(가격) 30 · 거래량 15 · 수급 10 · 섹터·시장 10 — 가장 중요한 건 펀더멘털.
+    깡토: 수급은 메인 팩터가 아니라 '보너스 알파' → 좋으면 더하고, 나빠도 깎지 않아요(보통 점수)."""
+    w = {"펀더멘털": 35, "추세": 30, "거래량": 15, "수급": 10, "섹터·시장": 10}
     pts = {"good": 1.0, "info": 0.6, "warn": 0.35, "bad": 0.0}
-    total = sum(w[k] * pts.get(sections.get(k, "info"), 0.6) for k in w)
+
+    def p(k):
+        v = pts.get(sections.get(k, "info"), 0.6)
+        return max(v, 0.6) if k == "수급" else v
+    total = sum(w[k] * p(k) for k in w)
     sc = int(round(total))
     grade = "A" if sc >= 80 else "B" if sc >= 65 else "C" if sc >= 50 else "D"
     return sc, grade

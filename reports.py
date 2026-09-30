@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-REPORTS_VERSION = "2026-09-28-reports"
+REPORTS_VERSION = "2026-09-30-sync"
 REPORTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_reports.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0"}
@@ -75,6 +75,20 @@ def save_github(store: dict, token: str, repo: str, branch: str | None = None,
         return False, f"GitHub 저장 실패({r.status_code}) {msg}".strip()
     except (requests.RequestException, ValueError) as exc:
         return False, f"GitHub 연결 실패: {exc.__class__.__name__}"
+
+
+def fetch_github_json(path: str, token: str, repo: str, branch: str | None = None):
+    """GitHub 저장소에 저장된 JSON 파일(user_holdings.json 등)을 받아와요. 없거나 실패하면 None.
+    앱이 켜질 때 가장 최근에 저장된 보유 종목·비밀번호·리포트를 쓰기 위해서예요."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}/contents/{path}",
+                         headers={**_gh_headers(token), "Accept": "application/vnd.github.raw+json"},
+                         params={"ref": branch} if branch else None, timeout=15)
+        if r.status_code != 200:
+            return None
+        return json.loads(r.content.decode("utf-8"))
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def new_report(title: str, broker: str, date: str, summary: str, stocks: list[dict], source: str) -> dict:
