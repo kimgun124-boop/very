@@ -721,6 +721,48 @@ def _bg_store() -> dict:
     return {"lock": threading.Lock(), "items": {}}
 
 
+MEM_SOFT = 650     # MB: 넘으면 뒤에서 새로 받기를 잠시 멈춰요
+MEM_HARD = 800     # MB: 넘으면 화면에 안 쓰는 기억을 비워요
+
+
+def rss_mb() -> float:
+    """지금 앱 서버가 쓰는 메모리(MB)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def mem_guard(keep: set | None = None):
+    """(메모리) 한도에 가까우면 차트·뉴스 기억, 작은 종목 기록, 화면 밖 일봉, 옛 데이터를 비워요."""
+    m = rss_mb()
+    if m < MEM_HARD:
+        return m
+    try:
+        load_chart_all.clear()
+        load_evidence.clear()
+    except Exception:
+        pass
+    S = _hist_store()
+    with S["lock"]:
+        S["light"].clear()
+        if keep is not None:
+            for c in [c for c in S["data"] if c not in keep]:
+                S["data"].pop(c, None)
+                S["t"].pop(c, None)
+    store = _bg_store()
+    with store["lock"]:
+        latest = {}
+        for k, v in store["items"].items():
+            if isinstance(k, tuple) and (k[0] not in latest or v["t"] > store["items"][latest[k[0]]]["t"]):
+                latest[k[0]] = k
+        for k in [k for k in store["items"] if isinstance(k, tuple) and latest.get(k[0]) != k and not store["items"][k]["busy"]]:
+            store["items"].pop(k, None)
+    gc.collect()
+    return rss_mb()
+
+
 def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = True, empty=None):
     """key의 데이터를 돌려줘요. ttl초가 지났으면 지난 값을 먼저 주고 뒤에서 loader()로 새로 받아요.
     first_wait=False면 처음에도 기다리지 않고 empty를 준 뒤 뒤에서 받아요(없어도 화면이 되는 데이터용)."""
@@ -735,6 +777,8 @@ def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = Tr
         has_value = item["value"] is not None
         need = (not has_value) or time.time() - item["t"] >= ttl
         start_bg = need and not item["busy"] and (has_value or not first_wait)
+        if start_bg and rss_mb() > MEM_SOFT:           # 메모리가 빠듯하면 새로 받기는 다음으로
+            start_bg = False
         if start_bg:
             item["busy"] = True
 
@@ -852,7 +896,7 @@ def get_light(codes) -> dict:
     now = time.time()
     born = S.setdefault("born", now)
     need = [c for c in codes if c not in S["light"] or now - S["light"][c][1] > LIGHT_TTL]
-    if need and now - born > 45:        # (메모리) 앱이 막 켜진 45초 동안은 주요 종목부터 — 작은 종목은 그 뒤에 천천히
+    if need and now - born > 45 and rss_mb() < MEM_SOFT:   # (메모리) 켜진 직후·메모리 빠듯할 땐 작은 종목은 나중에
         _light_bg(need)
     return {c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}
 
@@ -907,7 +951,7 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
         with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
             _hist_put(data.fetch_histories(missing, workers=8))
         missing = []
-    if stale or missing:
+    if (stale or missing) and rss_mb() < MEM_SOFT:
         _hist_bg(stale + missing)
     d = S["data"]
     return {c: d[c] for c in codes if c in d}
@@ -1183,12 +1227,12 @@ with st.sidebar:
         scope_all = False
         scope_core = False
         if market == "KR":
-            scope = st.segmented_control("종목 범위", ["주요 500", "전체", "내 보드"], default="주요 500", required=True,
-                                         key="sb_scope2", width="stretch",
-                                         format_func=lambda x: {"주요 500": "주요 500+신고가", "전체": "전체", "내 보드": "내 보드"}[x],
-                                         help="주요 500+신고가(기본·빠름): 시가총액 3,000억 이상 중 공부 자료 종목 우선 500개 + "
-                                              "시총이 작아도 최근 52주 신고가를 쓴 종목은 모두 보여줘요(작은 종목은 뒤에서 받아서 몇 분 안에 채워져요).\n"
-                                              "전체: 코스피·코스닥 상장 종목 모두(처음 켤 때 느려요). 내 보드: 공부 자료 종목만.")
+            scope = st.segmented_control("종목 범위", ["내 보드", "주요 500", "전체"], default="내 보드", required=True,
+                                         key="sb_scope3", width="stretch",
+                                         format_func=lambda x: {"주요 500": "주요500+신고가", "전체": "전체", "내 보드": "내 보드"}[x],
+                                         help="내 보드(기본·가벼움): 공부 자료 종목만.\n"
+                                              "주요500+신고가: 시가총액 3,000억 이상 500개 + 시총이 작아도 최근 신고가 종목(작은 종목은 뒤에서 채워요).\n"
+                                              "전체: 코스피·코스닥 모두 — 서버 메모리를 많이 써서 필요할 때만 켜세요.")
             scope_all = scope in ("주요 500", "전체")
             scope_core = scope == "주요 500"
     # 전체 범위: 보드에 없는 상장 종목을 '코스피 전체 / 코스닥 전체' 산업으로 붙여요(세부 분류 = 한국거래소 업종)
@@ -4229,6 +4273,9 @@ def render_buy(df: pd.DataFrame, quotes: dict):
 
 
 def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
+    mb = _GC.get("mb") or rss_mb()
+    if mb:
+        st.caption(f"🖥️ 서버 메모리 {mb:,.0f}MB" + (" · 빠듯해서 뒤쪽 새로 받기를 잠시 멈췄어요" if mb > MEM_SOFT else ""))
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
     cap_missing = int(df["cap_krw"].isna().sum())
@@ -4695,7 +4742,7 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
 
 _QUOTES: dict = {}
 VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
-_GC = {"n": 0}
+_GC = {"n": 0, "mb": 0.0}
 
 
 def render_board():
@@ -4735,6 +4782,7 @@ def render_board():
     _GC["n"] += 1
     if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
         gc.collect()
+    _GC["mb"] = mem_guard(set(view_kr + view_os) | set(KR_CODES))
     if core_info:
         bg = core_info["bg"]
         st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
