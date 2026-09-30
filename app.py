@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import gc
 import html
 import re
 import os
@@ -60,7 +61,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
-DATA_VERSION = "2026-09-30-mem"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-09-30-mem2"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -849,8 +850,9 @@ def _light_bg(codes):
 def get_light(codes) -> dict:
     S = _hist_store()
     now = time.time()
+    born = S.setdefault("born", now)
     need = [c for c in codes if c not in S["light"] or now - S["light"][c][1] > LIGHT_TTL]
-    if need:
+    if need and now - born > 45:        # (메모리) 앱이 막 켜진 45초 동안은 주요 종목부터 — 작은 종목은 그 뒤에 천천히
         _light_bg(need)
     return {c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}
 
@@ -903,7 +905,7 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
     stale = [c for c in codes if c in S["data"] and now - S["t"].get(c, 0) > HIST_TTL]
     if missing and wait:
         with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
-            _hist_put(data.fetch_histories(missing, workers=12))
+            _hist_put(data.fetch_histories(missing, workers=8))
         missing = []
     if stale or missing:
         _hist_bg(stale + missing)
@@ -3481,13 +3483,13 @@ def _buy_params() -> dict:
 # ─────────────────────────── 차기 주도섹터 · 섹터 안 급상승 엔진 ───────────────────────────
 def load_trends_all():
     """화면에 보이는 국내 종목의 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
-    codes = VIEW_CODES["kr"] or (KR_CODES + EXTRA_CODES)
+    codes = VIEW_CODES.get("heavy") or KR_CODES
     return swr(("trends_all", codes), 1800, lambda: data.fetch_stock_trends(codes, workers=6), first_wait=False)
 
 
 def load_fins_all():
     """화면에 보이는 국내 종목의 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
-    codes = VIEW_CODES["kr"] or (KR_CODES + EXTRA_CODES)
+    codes = VIEW_CODES.get("heavy") or KR_CODES
     return swr(("fins_all", codes), 43200, lambda: data.fetch_financials_many(codes, workers=12), first_wait=False)
 
 
@@ -4692,7 +4694,8 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 _QUOTES: dict = {}
-VIEW_CODES: dict = {"kr": (), "all": ()}
+VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
+_GC = {"n": 0}
 
 
 def render_board():
@@ -4701,8 +4704,10 @@ def render_board():
     _QUOTES.update(quotes)
     shares_store = load_shares()
     core_info = None
+    small_hi_set = set()
     if scope_core:
         core, small_hi, core_info = core_view(quotes, shares_store["data"])
+        small_hi_set = set(small_hi)
         keep = core | small_hi | set(OS_CODES)
         stocks_use = []
         for x in STOCKS_VIEW:
@@ -4721,11 +4726,15 @@ def render_board():
         _hist_drop(set(view_kr + view_os) | set(KR_CODES))
     VIEW_CODES["kr"], VIEW_CODES["all"] = view_kr, view_kr + view_os
     kr_board = tuple(c for c in view_kr if c in set(KR_CODES))
+    # (메모리) 역대 신고가용 월봉·수급·실적은 공부 자료 종목 + 작은 신고가 종목만(전체 1,000종목이면 서버 메모리 초과)
+    heavy = tuple(sorted(set(kr_board) | (small_hi_set if scope_core else set()))) + view_os
+    VIEW_CODES["heavy"] = tuple(c for c in heavy if data.is_kr(c))
     df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
-                          monthlies=load_monthlies(view_kr + view_os),
-                          official52={**load_official_52w_bg(tuple(c for c in view_kr if c not in set(KR_CODES))),
-                                      **load_official_52w(kr_board)})
+                          monthlies=load_monthlies(heavy), official52=load_official_52w(kr_board))
     df = mark_sector_first(df, histories)
+    _GC["n"] += 1
+    if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
+        gc.collect()
     if core_info:
         bg = core_info["bg"]
         st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
@@ -4829,7 +4838,7 @@ def render_list(df, histories, quote_error, shares_store, fins_all=None):
             c1, c2, c3 = st.columns([1.3, 1, 2])
             sort_by = c1.selectbox("정렬", ["신고가 가까운 순", "등락률 높은 순", "거래대금 많은 순", "평소 대비 거래 많은 순",
                                           "RS 높은 순", "시가총액 큰 순"], key="list_sort")
-            size = c2.selectbox("한 번에", [100, 300, 1000], index=1, key="list_size")
+            size = c2.selectbox("한 번에", [100, 200, 300], index=0, key="list_size")
             col, asc = {"신고가 가까운 순": ("to_high", True), "등락률 높은 순": ("change", False),
                         "거래대금 많은 순": ("tv_live", False), "평소 대비 거래 많은 순": ("tv_x", False),
                         "RS 높은 순": ("rs", False), "시가총액 큰 순": ("cap_krw", False)}[sort_by]

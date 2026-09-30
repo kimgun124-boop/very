@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-30-mem"
+DATA_VERSION = "2026-09-30-mem2"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -94,7 +94,18 @@ def rows_to_frame(rows) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "close", "high", "low"])
     df = df[df["close"] > 0]
-    return fix_bars(df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True))
+    df = fix_bars(df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True))
+    return slim(df)
+
+
+def slim(df: pd.DataFrame) -> pd.DataFrame:
+    """(메모리) 가격·거래량을 float32로 — 계산할 땐 float로 다시 바꿔 써서 결과는 같아요."""
+    if df is None or df.empty:
+        return df
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+    return df
 
 
 def fix_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -195,10 +206,13 @@ def parse_polling(text: str) -> dict[str, dict]:
 
 
 # ─────────────────────────── 네트워크 조회 ───────────────────────────
-def fetch_history(code: str, count: int = 520) -> tuple[str | None, pd.DataFrame, str | None]:
+HIST_COUNT = 340     # (메모리) 52주(250일) + 돌파 추적 90일이면 충분. 차트 탭은 따로 길게 받아요.
+
+
+def fetch_history(code: str, count: int = HIST_COUNT) -> tuple[str | None, pd.DataFrame, str | None]:
     """(네이버 종목명, 일봉, 오류메시지)"""
     if MOCK:
-        return None, mock_history(code, count), None
+        return None, slim(mock_history(code, count)), None
     error = None
     try:
         r = session.get(
@@ -262,7 +276,7 @@ def normalize_yf(hist: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def fetch_history_overseas(ticker: str, count: int = 520) -> tuple[str | None, pd.DataFrame, str | None]:
+def fetch_history_overseas(ticker: str, count: int = HIST_COUNT) -> tuple[str | None, pd.DataFrame, str | None]:
     """야후 파이낸스 일봉. (종목명은 확인하지 않으므로 None)"""
     if MOCK:
         return None, mock_history(ticker, count), None
