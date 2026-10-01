@@ -1,4962 +1,1879 @@
-"""밸류체인 신고가 보드.
+"""내 계좌 — 넣고, 고치고, 원칙대로 판단하기"""
+import hmac
+import io
+import json
+from datetime import date, datetime
+from html import escape
 
-실행: streamlit run app.py   (윈도우는 run.bat 더블클릭)
-"""
-from __future__ import annotations
-
-import gc
-import html
-import re
-import os
-
-import altair as alt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-import importlib
-import threading
-import time
+import core
 
-import data
-import holdings
-import reports
-import stocks as stock_list
-
-st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
-
-# 크롬 자동 번역이 화면 글자를 바꿔 끼우면 'removeChild' 오류로 앱이 멈춰요. 한국어 페이지로 알리고 번역을 막아요.
-_NO_TRANSLATE_JS = """<script>
-try { const d = (window.parent && window.parent.document) || document;
-  d.documentElement.setAttribute('lang', 'ko'); d.documentElement.setAttribute('translate', 'no');
-  d.documentElement.classList.add('notranslate'); d.body.classList.add('notranslate');
-  if (!d.querySelector('meta[name=google][content=notranslate]')) {
-    const m = d.createElement('meta'); m.name = 'google'; m.content = 'notranslate'; d.head.appendChild(m); }
-} catch (e) {}
-</script>"""
-try:        # 새 Streamlit: st.html로 바로 실행(components.html은 곧 없어져요)
-    with st.container(key="no_translate", height=1, border=False):
-        st.html(_NO_TRANSLATE_JS, unsafe_allow_javascript=True)
-except TypeError:
-    import streamlit.components.v1 as _components
-    _components.html(_NO_TRANSLATE_JS, height=0)
-
-# 카드·표의 종목 링크(?chart=코드)로 들어오면 그 종목 차트를 바로 보여줘요
-_qp_chart = st.query_params.get("chart")
-if _qp_chart:
-    st.session_state["chart_code"] = _qp_chart
-    st.session_state["detail_code"] = _qp_chart
-    st.session_state["main_tab_sel"] = "🕯️ 차트"       # 카드·신고가 후보에서 누르면 차트 탭으로 바로
-    del st.query_params["chart"]
-
-REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
-            "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
-            "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
-            "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
-            "fetch_financials", "fetch_financials_many", "earnings_trend",
-            "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs",
-            "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS",
-            "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
-            "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
-            "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
-            "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
-DATA_VERSION = "2026-09-30-mem2"   # data.py의 DATA_VERSION과 같아야 해요
-
-
-def _data_stale() -> bool:
-    return any(not hasattr(data, n) for n in REQUIRED) or getattr(data, "DATA_VERSION", None) != DATA_VERSION
-
-
-if _data_stale():
-    # GitHub에서 파일을 바꾼 직후, 서버가 예전 data.py를 기억하고 있는 경우가 있어 한 번 새로 읽어 봅니다.
-    data = importlib.reload(data)
-    stock_list = importlib.reload(stock_list)
-_missing = [n for n in REQUIRED if not hasattr(data, n)]
-if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
-    _missing.append(f"버전 {DATA_VERSION}")
-REPORTS_VERSION = "2026-09-30-sync"
-if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
-    reports = importlib.reload(reports)
-if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
-    _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-09-30-v2"
-if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
-    holdings = importlib.reload(holdings)
-if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
-    _missing.append("holdings.py 새 파일")
-if _missing:
-    st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
-             "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
-             f"(없는 기능: {', '.join(_missing)})")
+# app.py와 core.py 버전이 어긋나면(한쪽만 올렸거나, 서버가 옛 core를 기억하는 경우) 먼저 다시 불러오고,
+# 그래도 옛 core면 무엇을 해야 하는지 알려준다.
+NEED_CORE = 11
+if getattr(core, "STORE_VERSION", 0) < NEED_CORE:
+    import importlib
+    core = importlib.reload(core)
+if getattr(core, "STORE_VERSION", 0) < NEED_CORE:
+    st.error("core.py가 예전 버전이에요. GitHub에 app.py와 core.py를 **같이** 올린 뒤, "
+             "Streamlit 앱 메뉴(⋮) → Reboot app을 눌러 주세요.")
     st.stop()
 
-STOCKS = stock_list.STOCKS
-GROUP_ORDER = stock_list.GROUP_ORDER
-SECTOR_ORDER = stock_list.SECTOR_ORDER
-TAGS = getattr(stock_list, "TAGS", {})
-for _s in STOCKS:
-    _s.setdefault("tags", [])
-    _s.setdefault("notes", [])
+st.set_page_config(page_title="내 계좌", page_icon=":material/account_balance_wallet:",
+                   layout="wide", initial_sidebar_state="collapsed")
 
-
-@st.cache_data(ttl=3600, show_spinner="새로 추가된 종목의 코드를 네이버에서 찾는 중이에요.")
-def load_pending_codes(names: tuple[str, ...]):
-    return data.resolve_codes(names)
-
-
-# stocks.py에서 코드를 ""로 둔 종목은 네이버 검색으로 코드를 찾아 붙여요(1시간마다 다시 확인).
-PENDING_NAMES = tuple(r[2] for r in getattr(stock_list, "PENDING", []))
-PENDING_MISS: dict = {}
-if PENDING_NAMES and hasattr(stock_list, "attach"):
-    _resolved, PENDING_MISS = load_pending_codes(PENDING_NAMES)
-    STOCKS = STOCKS + stock_list.attach(_resolved)
-
-# 앱에서 직접 넣은 리포트(user_reports.json)의 종목을 보드에 합쳐요
-@st.cache_resource
-def _sync_from_github() -> str:
-    """(Hugging Face 등 다른 서버용) 앱이 켜질 때 한 번, GitHub에 저장된 보유 종목·비밀번호·리포트를 받아와요.
-    Streamlit 서버는 저장소를 그대로 받아 오지만, 다른 서버는 코드만 옮겨 오기 때문이에요."""
-    def sec(k, d=""):
-        try:
-            v = st.secrets.get(k)
-        except Exception:
-            v = None
-        return str(v or os.environ.get(k, d) or "")
-    token = sec("GITHUB_TOKEN")
-    if not token:
-        return "GitHub 토큰 없음(이 서버의 파일만 사용)"
-    repo, branch = sec("GITHUB_REPO", "kimgun124-boop/very"), sec("GITHUB_BRANCH") or None
-    got = []
-    base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("user_holdings.json", "user_settings.json", "user_reports.json"):
-        d = reports.fetch_github_json(name, token, repo, branch)
-        if d is not None:
-            try:
-                with open(os.path.join(base, name), "w", encoding="utf-8") as f:
-                    import json as _json
-                    _json.dump(d, f, ensure_ascii=False, indent=1)
-                got.append(name)
-            except OSError:
-                pass
-    return "GitHub에서 받음: " + (", ".join(got) or "없음")
-
-
-SYNC_STATUS = _sync_from_github()
-USER_STORE = reports.load_local()
-STOCKS, TAGS = reports.merge(STOCKS, TAGS, USER_STORE)
-for _s in STOCKS:
-    _s.setdefault("tags", [])
-    _s.setdefault("notes", [])
-if any(s["sector"] not in SECTOR_ORDER for s in STOCKS):
-    SECTOR_ORDER = SECTOR_ORDER + sorted({s["sector"] for s in STOCKS} - set(SECTOR_ORDER))
-if any(s["group"] not in GROUP_ORDER for s in STOCKS):
-    GROUP_ORDER = GROUP_ORDER + sorted({s["group"] for s in STOCKS} - set(GROUP_ORDER))
-
-
-def _secret(key: str, default: str = "") -> str:
-    try:
-        v = st.secrets.get(key)
-    except Exception:
-        v = None
-    return str(v or os.environ.get(key, default) or "")
-
-
-# ─────────────────────────── 🛡️ 보안: 차단 · 앱 전체 잠금 · 접속 기록 ───────────────────────────
-SEC_MAX_FAIL = 5            # 한 IP가 연속 5번 틀리면
-SEC_WAIT_SEC = 3600         # 1시간 못 들어와요
-SEC_AUTOBAN = 15            # 하루에 15번 넘게 틀리면 영구 차단 목록에 올려요
-
-
-@st.cache_resource
-def _sec_store() -> dict:
-    """모든 접속이 같이 쓰는 보안 기록(서버 메모리). 앱을 다시 켜면 비워져요(차단 목록은 파일에 저장)."""
-    return {"fails": {}, "log": [], "lock": threading.Lock()}
-
-
-def _client_ip() -> str:
-    try:
-        h = st.context.headers
-        xff = h.get("X-Forwarded-For") or h.get("x-forwarded-for")
-        if isinstance(xff, str) and xff:
-            return xff.split(",")[0].strip()
-    except Exception:
-        pass
-    try:
-        ip = st.context.ip_address
-        return ip if isinstance(ip, str) and ip else "알 수 없음"
-    except Exception:
-        return "알 수 없음"
-
-
-def _client_ua() -> str:
-    try:
-        ua = st.context.headers.get("User-Agent")
-        return ua[:160] if isinstance(ua, str) else ""
-    except Exception:
-        return ""
-
-
-def _sec_log(event: str, ip: str, ok: bool | None = None):
-    store = _sec_store()
-    with store["lock"]:
-        store["log"].append({"시각": data.now_kst().strftime("%m/%d %H:%M:%S"), "IP": ip, "일": event,
-                             "결과": "" if ok is None else ("성공" if ok else "실패"), "브라우저": _client_ua()})
-        del store["log"][:-400]
-
-
-def _blocked_ips(cfg: dict) -> set:
-    sec = {x.strip() for x in _secret("BLOCKED_IPS").split(",") if x.strip()}
-    return sec | {b.get("ip") for b in cfg.get("blocked_ips", []) if b.get("ip")}
-
-
-def _app_gate():
-    """모든 화면보다 먼저: 차단된 IP는 막고, '앱 전체 잠금'이 켜져 있으면 비밀번호 없이는 아무것도 안 보여요."""
-    ip = _client_ip()
-    cfg = holdings.load_settings()
-    if not st.session_state.get("_visit_logged"):
-        st.session_state["_visit_logged"] = True
-        _sec_log("접속", ip)
-    if ip in _blocked_ips(cfg):
-        st.error("접근이 차단된 주소예요.")
-        st.stop()
-    sec_lock = _secret("APP_LOCK").lower()
-    lock_on = (bool(cfg.get("app_lock")) or sec_lock in ("on", "true", "1", "yes")) and sec_lock != "off"
-    if not lock_on or not holdings.has_password(cfg) or st.session_state.get("app_unlocked"):
-        return
-    store = _sec_store()
-    now = time.time()
-    rec = store["fails"].setdefault(ip, {"n": 0, "day": 0, "until": 0.0, "t0": now})
-    if now - rec["t0"] > 86400:
-        rec.update(day=0, t0=now)
-    st.markdown('<div class="gate-wrap"><div class="gate-card"><div class="gate-logo">📈</div>'
-                '<div class="gate-title">밸류체인 신고가 보드</div>'
-                '<div class="gate-sub">비공개 앱이에요. 비밀번호를 넣어야 볼 수 있어요.</div></div></div>',
-                unsafe_allow_html=True)
-    c = st.columns([1, 1.2, 1])[1]
-    with c:
-        if rec["until"] > now:
-            st.error(f"너무 많이 틀려서 잠시 막혔어요. {int((rec['until'] - now) // 60) + 1}분 뒤에 다시 시도하세요.")
-            st.stop()
-        pw = st.text_input("비밀번호", type="password", key="gate_pw", label_visibility="collapsed", placeholder="비밀번호")
-        go = st.button("들어가기", type="primary", width="stretch", key="gate_go")
-        tried = go or (pw and pw != st.session_state.get("gate_last"))
-        if tried and pw:
-            st.session_state["gate_last"] = pw
-            if holdings.check_password(cfg, pw):
-                rec.update(n=0)
-                _sec_log("앱 잠금 해제", ip, True)
-                st.session_state.update(app_unlocked=True, hold_unlocked=True, hold_seen=now)
-                st.rerun()
-            rec["n"] += 1
-            rec["day"] += 1
-            _sec_log("앱 비밀번호", ip, False)
-            if rec["day"] >= SEC_AUTOBAN and ip != "알 수 없음":      # 괘씸한 시도: 영구 차단 목록으로
-                cfg.setdefault("blocked_ips", []).append({"ip": ip, "at": data.now_kst().strftime("%Y-%m-%d %H:%M"),
-                                                          "memo": f"하루 {rec['day']}번 비밀번호 틀림(자동 차단)"})
-                holdings.save_settings_local(cfg)
-                if _secret("GITHUB_TOKEN"):
-                    reports.save_github(cfg, _secret("GITHUB_TOKEN"), _secret("GITHUB_REPO", "kimgun124-boop/very"),
-                                        _secret("GITHUB_BRANCH") or None, path="user_settings.json")
-            if rec["n"] >= SEC_MAX_FAIL:
-                rec.update(n=0, until=now + SEC_WAIT_SEC)
-                st.error(f"{SEC_MAX_FAIL}번 틀려서 {SEC_WAIT_SEC // 60}분 동안 막았어요.")
-                st.stop()
-            st.error(f"비밀번호가 달라요. ({rec['n']}/{SEC_MAX_FAIL})")
-        lock = cfg.get("lock") or {}
-        if lock.get("hint"):
-            st.caption(f"💡 힌트: {lock['hint']}")
-        st.caption("비밀번호를 잊었으면(앱 주인만): Streamlit Secrets에 APP_LOCK = \"off\"를 넣고 들어가서 "
-                   "💼 내 보유 탭의 '비밀번호를 잊으셨나요?'로 다시 정한 뒤 APP_LOCK을 지우세요.")
-    st.stop()
-
-
-UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
-NEW_HIGH_BG = "#FFF1C9"                # 신고가 행 강조
-REFRESH = {"끄기": None, "30초": 30, "1분": 60, "5분": 300}
-ALL_CODES = tuple(sorted({s["code"] for s in STOCKS}))
-KR_CODES = tuple(c for c in ALL_CODES if data.is_kr(c))
-OS_CODES = tuple(c for c in ALL_CODES if not data.is_kr(c))
-UNIT = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "AUD": "호주달러", "HKD": "홍콩달러", "TWD": "대만달러", "GBp": "펜스",
-        "CNY": "위안", "CHF": "스위스프랑"}
-
-
-def fmt_price(value, currency: str) -> str:
-    """원화는 정수, 외화는 소수 둘째 자리까지."""
-    if value is None or pd.isna(value):
-        return "-"
-    return f"{value:,.0f}" if currency in ("KRW", "JPY") else f"{value:,.2f}"
-
-st.markdown(
-    """
+# ─────────────────────────── 스타일 ───────────────────────────
+st.markdown("""
 <style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
-.stApp, .stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stMarkdown {
-  font-family: 'Pretendard Variable', Pretendard, 'Malgun Gothic', sans-serif;
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;800&display=swap');
+:root{
+  --ink:#0f172a; --ink2:#334155; --muted:#64748b; --faint:#94a3b8;
+  --line:#e8ebf0; --surface:#f7f8fa; --bg:#ffffff; --accent:#2563eb;
+  --up:#e5484d; --down:#2f6fed;
+  --sell-bg:#fef1f1; --sell:#c42b2b; --take-bg:#ecfdf3; --take:#0f7b45;
+  --add-bg:#eef4ff; --add:#1d4ed8; --warn-bg:#fff7e6; --warn:#a15c00;
+  --hold-bg:#f1f3f6; --hold:#475569;
 }
-.stApp h1 { font-weight: 800; letter-spacing: -0.025em; }
-.status { color: #51616C; font-size: 0.88rem; margin: -0.4rem 0 0.9rem; }
-.radar { background: #17232E; border-radius: 14px; padding: 1.1rem 1.25rem 1.2rem; margin: 0 0 1.2rem; }
-.radar-title { color: #FFFFFF; font-size: 1.05rem; font-weight: 700; }
-.radar-rule { color: #9FB0BA; font-size: 0.84rem; margin: 0.15rem 0 0.85rem; }
-.chips { display: flex; flex-wrap: wrap; gap: 0.6rem; }
-.chip { background: #213241; border: 1px solid #304657; border-radius: 10px;
-        padding: 0.6rem 0.8rem; min-width: 11rem; max-width: 22rem; }
-.chip-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.8rem; }
-.chip-group { color: #FFFFFF; font-weight: 700; font-size: 0.95rem; }
-.chip-count { white-space: nowrap; flex-shrink: 0; color: #F2B134; font-weight: 800; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
-.chip-count small { font-size: 0.72rem; font-weight: 600; margin-left: 0.1rem; }
-.chip-names { color: #B9C7CF; font-size: 0.8rem; line-height: 1.45; margin-top: 0.2rem; }
-.radar-empty { color: #9FB0BA; font-size: 0.9rem; }
-/* ── 사이드바(보기 설정) ── */
-[data-testid="stSidebar"] { background: #F6F8F9; border-right: 1px solid #E3E8EB; }
-[data-testid="stSidebar"] .block-container, [data-testid="stSidebarUserContent"] { padding-top: 1.2rem; }
-.sb-title { font-size: 1.15rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em;
-            padding-bottom: 0.55rem; margin-bottom: 0.4rem; border-bottom: 2px solid #16212B; }
-[data-testid="stSidebar"] label p { font-size: 0.8rem !important; font-weight: 700 !important; color: #3A4852 !important; }
-[data-testid="stSidebar"] [data-testid="stButtonGroup"] button { border-radius: 8px; }
-[data-testid="stSidebar"] [role="radiogroup"]:has(> button[data-variant="segmented_control"]) {
-  display: flex !important; flex-wrap: nowrap !important; width: 100%; }
-[data-testid="stSidebar"] button[data-variant="segmented_control"] {
-  flex: 1 1 0 !important; min-width: 0 !important; padding: 0.35rem 0.2rem !important; }
-[data-testid="stSidebar"] [data-testid="stButtonGroup"] button[data-selected="true"] {
-  background: #16212B !important; border-color: #16212B !important; }
-[data-testid="stSidebar"] [data-testid="stButtonGroup"] button[data-selected="true"] p {
-  color: #FFFFFF !important; font-weight: 700; }
-[data-testid="stSidebar"] [data-testid="stExpander"] details { background: #FFFFFF; }
-[data-testid="stSidebar"] [class*="st-key-sb_box_"] { background: #FFFFFF; border-radius: 12px !important;
-  border: 1px solid #E3E8EB !important; padding: 0.75rem 0.75rem 0.8rem !important; gap: 0.45rem !important; }
-.sb-head { display: flex; justify-content: space-between; align-items: baseline;
-  padding-bottom: 0.35rem; border-bottom: 1px solid #EEF1F3; margin-bottom: 0.1rem; }
-.sb-head span { font-size: 0.86rem; font-weight: 800; color: #16212B; }
-.sb-head em { font-style: normal; font-size: 0.72rem; font-weight: 700; color: #7A8A94; }
-.sb-cat { font-size: 0.7rem; font-weight: 800; color: #7A8A94; letter-spacing: 0.02em; margin: 0.45rem 0 0;
-  display: flex; align-items: center; gap: 0.4rem; }
-.sb-cat::after { content: ""; flex: 1; height: 1px; background: #EEF1F3; }
-.sb-cat { line-height: 1.1rem; height: 1.1rem; }
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(.sb-cat),
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(.sb-head) { margin-bottom: 0 !important; overflow: visible !important; }
-[data-testid="stSidebar"] [data-testid="stElementContainer"]:has(.sb-cat) { height: auto !important; min-height: 1.4rem; overflow: visible !important; }
-[data-testid="stSidebarHeader"] { height: 2.2rem !important; min-height: 2.2rem !important; padding-top: 0.4rem !important; }
-[data-testid="stSidebar"] .st-key-sb_box_sector [data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
-[data-testid="stSidebar"] .st-key-sb_box_sector [data-testid="stColumn"] { min-width: 0 !important; }
-[data-testid="stSidebar"] .st-key-sb_box_sector button {
-  min-height: 2.05rem; height: 2.05rem; padding: 0 0.45rem !important; border-radius: 8px;
-  justify-content: flex-start; border: 1px solid #DCE3E7; background: #F6F8F9; }
-[data-testid="stSidebar"] .st-key-sb_box_sector button p {
-  font-size: 0.78rem !important; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-[data-testid="stSidebar"] .st-key-sb_box_sector button[kind="primary"] { background: #16212B; border-color: #16212B; }
-[data-testid="stSidebar"] .st-key-sb_box_sector button[kind="primary"] p { color: #FFFFFF !important; }
-[data-testid="stSidebar"] .st-key-sb_box_sector button:hover { border-color: #16212B; }
-[data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-weight: 700; color: #16212B; }
-/* ── 메인 탭: 기본 · 종목 시그널 · 섹터 흐름 3묶음으로 나눠 보이게 ── */
-.st-key-main_tabs [role="tablist"] { gap: 0.3rem; border-bottom: 2px solid #DCE3E7; padding-bottom: 0; }
-.st-key-main_tabs [role="tab"] {
-  position: relative; --gc: #51616C; --gt: #F1F4F6;
-  background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
-  border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
-.st-key-main_tabs [role="tab"]:nth-child(n+5):nth-child(-n+7) { --gc: #E0672B; --gt: #FDF3EC; }
-.st-key-main_tabs [role="tab"]:nth-child(n+8) { --gc: #1F66C9; --gt: #EEF4FC; }
-.st-key-main_tabs [role="tab"]:nth-child(5),
-.st-key-main_tabs [role="tab"]:nth-child(8) { margin-left: 0.9rem; }
-.st-key-main_tabs [role="tab"]::before {
-  position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
-  letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
-.st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
-.st-key-main_tabs [role="tab"]:nth-child(5)::before { content: "종목 시그널"; }
-.st-key-main_tabs [role="tab"]:nth-child(8)::before { content: "섹터 흐름"; }
-.st-key-main_tabs [role="tab"] p { color: #3A4852; font-size: 0.98rem !important; }
-.st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
-.st-key-main_tabs [role="tab"][aria-selected="true"] p,
-.st-key-main_tabs [role="tab"][aria-selected="true"]::before { color: #FFFFFF !important; }
-.st-key-main_tabs .react-aria-SelectionIndicator, .st-key-main_tabs [data-baseweb="tab-highlight"], .st-key-main_tabs [data-baseweb="tab-border"] { display: none; }
-.ch-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem 0.7rem; margin: 0.3rem 0 0.4rem; }
-.ch-head { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.8rem 1rem; margin: 0.6rem 0 0.7rem !important; }
-.ch-head b { font-size: 1.7rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em; }
-.ch-code { font-size: 0.95rem; color: #7A8A94; }
-.ch-px { font-size: 1.6rem; font-weight: 800; font-variant-numeric: tabular-nums; }
-.ch-px small { font-size: 1.05rem; font-weight: 700; margin-left: 0.25rem; }
-.ch-sub { font-size: 0.95rem; color: #51616C; flex-basis: 100%; }
-[class*="st-key-"][class*="chart_bar"], .st-key-chart_search {
-  background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.75rem 0.9rem 0.85rem; }
-[class*="st-key-"][class*="chart_bar"] label p, .st-key-chart_search label p {
-  font-size: 0.9rem !important; font-weight: 800 !important; color: #16212B !important; }
-[class*="st-key-"][class*="chart_bar"] button[data-variant="segmented_control"] {
-  min-height: 2.5rem; padding: 0.35rem 0.4rem !important; }
-[class*="st-key-"][class*="chart_bar"] button p { font-size: 0.98rem !important; font-weight: 700; }
-[class*="st-key-"][class*="chart_bar"] button[data-selected="true"] { background: #16212B !important; border-color: #16212B !important; }
-[class*="st-key-"][class*="chart_bar"] button[data-selected="true"] p { color: #FFFFFF !important; }
-.st-key-chart_search input { font-size: 1rem !important; min-height: 2.6rem; }
-.st-key-chart_search [data-baseweb="select"] div { font-size: 1rem; }
-.st-key-chart_search [data-testid="stButtonGroup"] button { min-height: 2.2rem; }
-.st-key-chart_search [data-testid="stButtonGroup"] button p { font-size: 0.95rem !important; }
-.st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] { background: #16212B !important; }
-.st-key-chart_search [data-testid="stButtonGroup"] button[data-selected="true"] p { color: #FFFFFF !important; }
-/* ── 코스피·코스닥 거래대금 ── */
-.tv-box { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: 0.9rem 1rem 0.8rem; margin: 0.2rem 0 1rem; }
-.tv-title { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; margin-bottom: 0.7rem; }
-.tv-title b { font-size: 1.08rem; font-weight: 800; color: #16212B; }
-.tv-title span { font-size: 0.8rem; color: #7A8A94; font-weight: 600; }
-.tv-chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.6rem; margin-bottom: 0.8rem; }
-.tv-chip { background: #F6F8F9; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.65rem 0.85rem; }
-.tv-chip.tot { background: #16212B; border-color: #16212B; }
-.tv-chip.tot .tv-chip-h, .tv-chip.tot .tv-chip-f { color: #9FB0BA; }
-.tv-chip.tot .tv-chip-v, .tv-chip.tot .tv-chip-s { color: #FFFFFF !important; }
-.tv-chip-h { font-size: 0.8rem; color: #6B7A84; font-weight: 700; }
-.tv-chip-v { font-size: 1.6rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; line-height: 1.25; }
-.tv-chip-v small { font-size: 0.9rem; margin-left: 0.1rem; }
-.tv-chip-s { font-size: 0.92rem; font-weight: 800; margin-top: 0.1rem; }
-.tv-chip-f { font-size: 0.76rem; color: #7A8A94; margin-top: 0.2rem; }
-.tv-wrap { overflow-x: auto; }
-.tv-tbl { width: 100%; border-collapse: collapse; font-size: 0.88rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tv-tbl th { font-size: 0.76rem; color: #6B7A84; font-weight: 700; text-align: right; padding: 0.45rem 0.55rem;
-  border-bottom: 2px solid #E3E8EB; background: #F6F8F9; }
-.tv-tbl td { text-align: right; padding: 0.5rem 0.55rem; border-bottom: 1px solid #EEF1F3; color: #16212B; }
-.tv-tbl .l { text-align: left; }
-.tv-tbl td.now { font-weight: 800; }
-.tv-tbl tbody tr:nth-child(2n) td { border-bottom: 2px solid #E3E8EB; }
-.tv-x { min-width: 11rem; }
-.tv-bar { position: relative; height: 6px; background: #EEF1F3; border-radius: 3px; margin-bottom: 0.2rem; }
-.tv-bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
-.tv-bar b { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1.5px; background: #16212B; }
-.tv-x span { font-size: 0.82rem; font-weight: 700; }
-.tv-note { font-size: 0.74rem; color: #7A8A94; margin-top: 0.55rem; line-height: 1.5; }
-.st-key-no_translate { display: none !important; }
-.rp-badges { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0 0 0.7rem; }
-.rp-badge { font-size: 0.82rem; border-radius: 999px; padding: 0.3rem 0.75rem; border: 1px solid #E3E8EB; background: #FFFFFF; color: #51616C; }
-.rp-badge b { margin-right: 0.25rem; }
-.rp-badge.on { border-color: #2E9D5B; color: #1E7A45; background: #EEF8F2; }
-.rp-badge.off { border-color: #E3C7A0; color: #9A6417; background: #FDF6EC; }
-[class*="st-key-rp_box_"] { background: #FFFFFF; border-radius: 12px !important; }
-/* 메인 탭 색칠이 탭 안쪽의 작은 탭(차트·실적·뉴스 등)에는 번지지 않게 */
-.st-key-main_tabs [role="tabpanel"] [role="tab"], .st-key-main_tabs [role="tabpanel"] [role="tab"]:nth-child(n) {
-  --gc: #16212B; --gt: transparent; background: transparent !important; border: none !important;
-  border-bottom: 2px solid transparent !important; border-radius: 0 !important; margin-left: 0 !important;
-  padding: 0.4rem 0.8rem !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"]::before { content: none !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] { background: transparent !important;
-  border-bottom: 2px solid #16212B !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] p { color: #16212B !important; font-weight: 800; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"] p { font-size: 0.9rem !important; }
-/* 잠금 화면 */
-.st-key-lock_box { background: #FFFFFF; border-radius: 14px !important; max-width: 560px; }
-.lk-title { font-size: 1.2rem; font-weight: 800; color: #16212B; }
-.lk-sub { font-size: 0.88rem; color: #51616C; margin: 0.2rem 0 0.6rem; }
-.lk-code { border: 2px dashed #16212B; border-radius: 12px; padding: 0.8rem 1rem; background: #FFFBEA; margin: 0.4rem 0; max-width: 560px; }
-.lk-code b { display: block; font-size: 0.9rem; }
-.lk-code span { display: block; font-size: 1.6rem; font-weight: 800; letter-spacing: 0.12em; font-family: ui-monospace, Consolas, monospace; margin: 0.2rem 0; }
-.lk-code em { font-style: normal; font-size: 0.82rem; color: #7A5A00; }
-/* 보유 종목 탭 · 한눈에 표 */
-.st-key-hold_tabs [role="tablist"] { flex-wrap: wrap; gap: 0.35rem !important; border-bottom: none !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"],
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"]:nth-child(n) {
-  border: 1px solid #DCE3E7 !important; border-radius: 999px !important; background: #FFFFFF !important;
-  padding: 0.35rem 0.85rem !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] {
-  background: #16212B !important; border-color: #16212B !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] p { color: #FFFFFF !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"] p { font-size: 0.92rem !important; font-weight: 700; }
-.ho-wrap { overflow-x: auto; background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: 0.3rem 0.5rem; }
-.ho-tbl { width: 100%; border-collapse: collapse; font-size: 0.9rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.ho-tbl th { font-size: 0.76rem; color: #6B7A84; text-align: right; padding: 0.55rem 0.6rem; border-bottom: 2px solid #E3E8EB; }
-.ho-tbl td { text-align: right; padding: 0.6rem; border-bottom: 1px solid #EEF1F3; color: #16212B; }
-.ho-tbl .l { text-align: left; }
-.ho-tbl tr:last-child td { border-bottom: none; }
-.ho-code { font-size: 0.75rem; color: #7A8A94; margin-left: 0.35rem; }
-.ho-badge { font-size: 0.8rem; font-weight: 800; padding: 0.2rem 0.6rem; border-radius: 999px; border: 1.5px solid; }
-.ho-sd { min-width: 8rem; } .ho-sd span { font-weight: 800; font-size: 0.85rem; }
-.ho-bar { height: 5px; background: #FDECEC; border-radius: 3px; margin-bottom: 0.2rem; }
-.ho-bar i { display: block; height: 100%; background: #2E9D5B; border-radius: 3px; }
-.ho-memo { color: #51616C; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; }
-/* 앱 전체 잠금 화면 */
-.gate-wrap { display: flex; justify-content: center; margin: 12vh 0 1rem; }
-.gate-card { text-align: center; }
-.gate-logo { font-size: 2.6rem; }
-.gate-title { font-size: 1.5rem; font-weight: 800; color: #16212B; margin-top: 0.3rem; }
-.gate-sub { font-size: 0.92rem; color: #51616C; margin-top: 0.3rem; }
-.cap-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.5rem; margin: 0.4rem 0; }
-.cap-row > div { background: #F6F8F9; border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.55rem 0.75rem; }
-.cap-row em { display: block; font-style: normal; font-size: 0.76rem; color: #6B7A84; font-weight: 700; }
-.cap-row b { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
-.cap-row span { display: block; font-size: 0.82rem; font-weight: 800; }
-.pr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0.6rem; }
-.pr-card { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.7rem 0.9rem; }
-.pr-card b { font-size: 0.95rem; color: #16212B; }
-.pr-card ul { margin: 0.3rem 0 0 1rem; padding: 0; font-size: 0.85rem; color: #33424C; }
-.ho-acct { font-size: 0.72rem; margin-left: 0.35rem; color: #51616C; }
-/* 깊은 분석 */
-.dp-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.5rem 0 0.4rem; }
-.dp-score { color: #FFFFFF; font-weight: 800; border-radius: 8px; padding: 0.25rem 0.6rem; font-size: 0.95rem; }
-.dp-chip { border: 1.5px solid; border-radius: 999px; padding: 0.15rem 0.55rem; font-size: 0.8rem; font-weight: 700; background: #FFFFFF; }
-.dp-head em { font-style: normal; font-size: 0.72rem; color: #7A8A94; margin-left: auto; }
-.dp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.5rem; margin-bottom: 0.5rem; }
-.dp-block { border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.55rem 0.7rem; background: #FFFFFF; }
-.dp-block > b { font-size: 0.88rem; }
-.dp-row { margin-top: 0.3rem; } .dp-row span { display: block; font-size: 0.82rem; font-weight: 800; }
-.dp-row em { font-style: normal; font-size: 0.8rem; color: #51616C; }
-.dp-row.bad span { color: #B3261E; } .dp-row.good span { color: #1E7A45; }
-.dp-pyr { border: 1px dashed #6B3FC4; border-radius: 10px; padding: 0.55rem 0.7rem; background: #FAF7FF; margin-bottom: 0.5rem; }
-.dp-pyr b { font-size: 0.88rem; color: #4B2A99; } .dp-pyr div { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.35rem; }
-.dp-cond { font-size: 0.78rem; border-radius: 6px; padding: 0.15rem 0.45rem; }
-.dp-cond.ok { background: #EEF8F2; color: #1E7A45; } .dp-cond.no { background: #F3F4F6; color: #7A8A94; }
-.dp-plan { border-left: 4px solid #2E6B6F; background: #F4F9F9; border-radius: 6px; padding: 0.55rem 0.8rem; margin-bottom: 0.5rem; }
-.dp-plan b { font-size: 0.88rem; } .dp-plan div { display: flex; gap: 0.6rem; margin-top: 0.3rem; font-size: 0.84rem; }
-.dp-plan span { min-width: 5.5rem; font-weight: 800; } .dp-plan em { font-style: normal; color: #33424C; }
-/* ── 💼 내 보유 ── */
-[class*="st-key-hold_card_"] { background: #FFFFFF; border-radius: 14px !important; }
-.hd-top { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
-.hd-name { font-size: 1.35rem; font-weight: 800; color: #16212B; }
-.hd-code { font-size: 0.85rem; color: #7A8A94; margin: 0 0.5rem 0 0.35rem; }
-.hd-px { font-size: 1.2rem; font-weight: 800; margin-right: 0.5rem; font-variant-numeric: tabular-nums; }
-.hd-pnl { font-size: 1.05rem; font-weight: 800; }
-.hd-verdict { font-size: 0.95rem; font-weight: 800; padding: 0.35rem 0.8rem; border-radius: 999px; border: 1.5px solid; }
-.hd-sub { font-size: 0.85rem; color: #51616C; margin: 0.3rem 0 0.6rem; }
-.hd-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.4rem; }
-.hd-chk { border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.45rem 0.65rem; background: #F9FAFB; }
-.hd-chk span { display: block; font-size: 0.84rem; font-weight: 800; color: #16212B; }
-.hd-chk em { font-style: normal; font-size: 0.8rem; color: #51616C; }
-.hd-chk.bad { border-color: #F2B8BB; background: #FDF3F3; }
-.hd-chk.warn { border-color: #EED9A8; background: #FFFAEE; }
-.hd-chk.good { border-color: #CBE7D5; background: #F4FBF6; }
-.hd-act { margin: 0.6rem 0 0.4rem; padding: 0.55rem 0.8rem; border-left: 4px solid #16212B; background: #F6F8F9; border-radius: 6px; }
-.hd-act b { font-size: 0.86rem; } .hd-act ul { margin: 0.2rem 0 0 1rem; padding: 0; font-size: 0.86rem; }
-.hd-news { display: flex; flex-direction: column; gap: 0.3rem; }
-.hd-news a { display: block; text-decoration: none; padding: 0.4rem 0.55rem; border: 1px solid #EEF1F3; border-radius: 8px; background: #FFFFFF; }
-.hd-news a:hover { border-color: #16212B; }
-.hd-news span { display: block; font-size: 0.88rem; color: #16212B; font-weight: 600; }
-.hd-news em { font-style: normal; font-size: 0.74rem; color: #7A8A94; }
-/* ── 공통 정리 ── */
-[data-testid="stCaptionContainer"] p { color: #7A8A94 !important; font-size: 0.78rem !important; }
-.stApp h4 { font-size: 1.05rem !important; font-weight: 800 !important; margin: 0.6rem 0 0.3rem !important; }
-[data-testid="stTabs"] [role="tablist"] { gap: 0.2rem; border-bottom: 1px solid #DCE3E7; }
-[data-testid="stTabs"] button[role="tab"] { padding: 0.45rem 0.8rem; border-radius: 8px 8px 0 0; }
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] { background: #FFFFFF; }
-[data-testid="stTabs"] button[role="tab"] p { font-weight: 700; }
-[data-testid="stExpander"] details { border: 1px solid #E3E8EB !important; border-radius: 10px !important; background: #FFFFFF; }
-[data-testid="stExpander"] summary p { font-size: 0.86rem; color: #51616C; }
-[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.55rem 0.8rem; }
-[data-testid="stMetricLabel"] p { font-size: 0.78rem !important; color: #6B7A84 !important; }
-[data-testid="stMetricValue"] { font-size: 1.45rem !important; font-weight: 800 !important; }
-[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
-.sec-h { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; margin: 0.2rem 0 0.5rem; }
-.sec-h b { font-size: 1.12rem; font-weight: 800; color: #16212B; }
-.sec-h span { font-size: 0.78rem; color: #7A8A94; }
-/* 돈의 방향 */
-.verdict { border-left: 6px solid var(--vc); background: #FFFFFF; border-radius: 12px; padding: 0.8rem 1rem;
-  box-shadow: 0 1px 2px rgba(0,0,0,.04); margin-bottom: 0.7rem; }
-.v-top { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.76rem; color: #7A8A94; }
-.v-lab { font-weight: 700; letter-spacing: .02em; }
-.v-title { font-size: 1.55rem; font-weight: 900; color: var(--vc); line-height: 1.25; margin-top: 0.1rem; }
-.v-act { font-size: 0.95rem; font-weight: 600; color: #26343E; margin-top: 0.15rem; }
-.tiles-wrap { display: grid; grid-template-columns: 2fr 1fr; gap: 0.8rem; margin-bottom: 0.8rem; }
-.tiles-h { font-size: 0.8rem; color: #51616C; margin-bottom: 0.3rem; font-weight: 600; }
-.tiles-h b { color: #16212B; } .tiles-h small { color: #8A979F; font-weight: 500; }
-.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; }
-.tiles.t2 { grid-template-columns: repeat(2, 1fr); }
-.tile { position: relative; background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.45rem 0.55rem; }
-.tile.ok { border-color: #9ED3B2; background: #F1FAF4; } .tile.no { border-color: #F0C2C4; background: #FDF4F4; }
-.t-ic { position: absolute; top: 0.35rem; right: 0.5rem; font-weight: 900; font-size: 0.85rem; }
-.tile.ok .t-ic { color: #1B8A4B; } .tile.no .t-ic { color: #C0262E; } .tile.na .t-ic { color: #8A979F; }
-.t-lb { font-size: 0.7rem; color: #6B7A84; } .t-v { font-size: 1.05rem; font-weight: 800; color: #16212B;
-  font-variant-numeric: tabular-nums; white-space: nowrap; }
-.lead-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.4rem; }
-.lc { font-size: 0.72rem; font-weight: 700; padding: 0.12rem 0.45rem; border-radius: 999px; }
-.lc.ok { background: #E3F4EA; color: #1B6B3E; } .lc.no { background: #FBE3E4; color: #A2343B; }
-.mv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.6rem; background: #FFFFFF;
-  border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.55rem 0.8rem; margin-bottom: 0.5rem; font-size: 0.88rem; }
-.mv { font-weight: 800; } .mv.out { color: #1F66C9; } .mv.in { color: #D6333B; }
-.mv-arrow { font-size: 1.1rem; color: #8A979F; font-weight: 800; }
-.mv-total { margin-left: auto; font-size: 0.78rem; color: #6B7A84; }
-.mini { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 10px; overflow: hidden; }
-.mini-row { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; padding: 0.45rem 0.7rem;
-  border-top: 1px solid #F0F3F5; font-size: 0.86rem; }
-.mini-row:first-child { border-top: none; }
-.mini-row small { display: block; color: #7A8A94; font-size: 0.72rem; margin-top: 0.05rem; }
-.mini-row span { white-space: nowrap; font-weight: 700; font-size: 0.8rem; color: #26343E; }
-@media (max-width: 640px) {
-  .tiles-wrap { grid-template-columns: 1fr; }
-  .tiles { grid-template-columns: repeat(2, 1fr); }
-  .v-title { font-size: 1.3rem; }
-  .v-top { flex-direction: column; gap: 0; }
-  [data-testid="stMetric"] { padding: 0.4rem 0.55rem; }
-  [data-testid="stMetricValue"] { font-size: 1.15rem !important; }
-  [data-testid="stTabs"] button[role="tab"] { padding: 0.35rem 0.5rem; }
-}
-.st-key-mobile_view { display: none; }
-.kcards { display: flex; flex-direction: column; gap: 0.45rem; }
-.stApp a.kcard { display: block; background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px;
-  padding: 0.65rem 0.8rem 0.6rem; text-decoration: none; color: #16212B; }
-.stApp a.kcard.hot { background: #FFF8E3; border-color: #EFD48A; }
-.k-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-.k-name { font-weight: 800; font-size: 1.02rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.k-crown { font-size: 0.68rem; font-weight: 800; background: #F2B134; color: #16212B; border-radius: 6px; padding: 0.05rem 0.35rem;
-  vertical-align: 2px; }
-.k-px { font-weight: 700; font-size: 0.95rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.k-chg { font-weight: 800; margin-left: 0.25rem; }
-.k-keys { display: grid; grid-template-columns: 1fr 1.45fr 0.6fr; gap: 0.35rem; margin: 0.5rem 0 0.4rem; }
-.k-keys div { background: #F2F5F7; border-radius: 8px; padding: 0.3rem 0.45rem; min-width: 0; }
-.k-keys small { display: block; font-size: 0.64rem; color: #6B7A84; line-height: 1.2; }
-.k-keys b { display: block; font-size: 0.92rem; font-weight: 800; color: #16212B; white-space: nowrap; overflow: hidden;
-  text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
-.k-keys b.hot { color: #D6333B; } .k-keys b.near { color: #C27C0E; }
-.k-keys b.first { color: #D6333B; } .k-keys b.brk { color: #B8452C; } .k-keys b.off { color: #6B7A84; font-weight: 700; }
-.k-keys b.rs { color: #D6333B; }
-.k-sub { font-size: 0.74rem; color: #51616C; line-height: 1.45; }
-.k-flow { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.72rem; color: #51616C; margin-top: 0.15rem;
-  font-variant-numeric: tabular-nums; }
-@media (max-width: 640px) {
-  [data-testid="stMainBlockContainer"] { padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
-  .st-key-mobile_view div[role="radiogroup"] { gap: 0.25rem 0.6rem; }
-  .st-key-mobile_view div[role="radiogroup"] label p { font-size: 0.8rem; }
-  [data-testid="stTabs"] button p { font-size: 0.85rem; }
+html, body, .stApp, [data-testid="stAppViewContainer"]{background:var(--bg)!important; color:var(--ink);}
+html, body, .stApp, .stApp p, .stApp div, .stApp label, .stApp input, .stApp textarea, .stApp button, .stApp li, .stApp h1, .stApp h2, .stApp h3{
+  font-family:"Pretendard Variable",Pretendard,"Noto Sans KR",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif!important;
+  letter-spacing:-0.01em; -webkit-font-smoothing:antialiased;}
+[data-testid="stHeader"]{background:transparent;}
+.block-container{padding-top:2.2rem; padding-bottom:4rem; max-width:1180px;}
+h1,h2,h3,h4{letter-spacing:-0.02em; color:var(--ink);}
+
+/* 탭 */
+.stTabs [data-baseweb="tab-list"]{gap:4px; border-bottom:1px solid var(--line);}
+.stTabs [data-baseweb="tab"]{padding:10px 14px; font-weight:600; color:var(--muted);}
+.stTabs [aria-selected="true"]{color:var(--ink)!important;}
+.stTabs [data-baseweb="tab-highlight"]{background:var(--ink)!important; height:2px;}
+.stTabs [data-baseweb="tab-border"]{display:none;}
+
+/* 입력 */
+[data-baseweb="input"], [data-baseweb="select"]>div, [data-baseweb="textarea"]{
+  background:#fff!important; border-radius:10px!important;}
+[data-testid="stForm"], [data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px;}
+.stButton>button, .stFormSubmitButton>button, .stDownloadButton>button, .stLinkButton>a{
+  border-radius:10px; font-weight:600;}
+
+/* 공통 컴포넌트 */
+.hd{display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:4px;}
+.hd .t{font-size:1.65rem; font-weight:800; letter-spacing:-0.03em; color:var(--ink);}
+.hd .s{font-size:.85rem; color:var(--muted);}
+.sec{font-size:1.05rem; font-weight:700; color:var(--ink); margin:18px 0 10px;}
+.sub{font-size:.82rem; color:var(--muted); margin:-6px 0 10px;}
+
+.chips{display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin:14px 0 6px;}
+.chip{border:1px solid var(--line); border-radius:12px; padding:10px 12px; background:#fff;}
+.chip .n{font-size:.75rem; color:var(--muted); font-weight:600; display:flex; align-items:center; gap:6px;}
+.chip .v{font-size:1.02rem; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums;}
+.chip .g{font-size:.75rem; margin-top:1px; font-variant-numeric:tabular-nums;}
+.dot{width:7px; height:7px; border-radius:50%; display:inline-block;}
+.on{background:#16a34a;} .off{background:#dc2626;}
+
+.kpis{display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:12px 0 4px;}
+.kpis.k3{grid-template-columns:repeat(3,1fr);} .kpis.k2{grid-template-columns:repeat(2,1fr); margin-top:0;}
+.kpi{background:var(--surface); border-radius:14px; padding:14px 16px;}
+.kpi .l{font-size:.78rem; color:var(--muted); font-weight:600;}
+.kpi .v{font-size:1.28rem; font-weight:800; margin-top:4px; letter-spacing:-0.02em; font-variant-numeric:tabular-nums;}
+.kpi .d{font-size:.78rem; margin-top:2px; color:var(--muted); font-variant-numeric:tabular-nums;}
+
+.up{color:var(--up)!important;} .down{color:var(--down)!important;} .mut{color:var(--muted);}
+
+.notice{border-radius:12px; padding:12px 16px; font-size:.9rem; line-height:1.6; margin:10px 0;}
+.notice.warn{background:var(--warn-bg); color:var(--warn);}
+.notice.info{background:var(--surface); color:var(--ink2);}
+
+.badge{display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+  font-size:.78rem; font-weight:700; white-space:nowrap;}
+.badge::before{content:""; width:6px; height:6px; border-radius:50%; background:currentColor;}
+.b-sell{background:var(--sell-bg); color:var(--sell);} .b-take{background:var(--take-bg); color:var(--take);}
+.b-add{background:var(--add-bg); color:var(--add);} .b-warn{background:var(--warn-bg); color:var(--warn);}
+.b-hold{background:var(--hold-bg); color:var(--hold);}
+
+.list{border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#fff; margin-top:8px;}
+.row{padding:14px 16px; border-top:1px solid var(--line);}
+.row:first-child{border-top:none;}
+.row .top{display:flex; justify-content:space-between; align-items:center; gap:10px;}
+.row .nm{font-weight:700; font-size:1rem; color:var(--ink);}
+.row .cd{font-size:.75rem; color:var(--faint); margin-left:6px; font-weight:500;}
+.row .nums{display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-top:10px;}
+.row .nums div{font-size:.72rem; color:var(--muted);}
+.row .nums b{display:block; font-size:.95rem; color:var(--ink); font-weight:700; margin-top:1px; font-variant-numeric:tabular-nums;}
+.row .why{font-size:.8rem; color:var(--muted); margin-top:8px;}
+
+.title2{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:6px;}
+.title2 .nm{font-size:1.45rem; font-weight:800; letter-spacing:-0.03em;}
+.meta{font-size:.8rem; color:var(--muted); margin:4px 0 6px;}
+
+.callout{border-radius:14px; padding:14px 16px; margin:14px 0; background:var(--surface);}
+.callout .h{font-size:.78rem; font-weight:700; color:var(--muted); margin-bottom:4px;}
+.callout .b{font-size:.93rem; color:var(--ink); line-height:1.55;}
+.callout ul{margin:4px 0 0 0; padding-left:18px;} .callout li{margin:2px 0;}
+
+.checks{border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+.ck{display:grid; grid-template-columns:28px 120px 1fr; align-items:center; padding:10px 14px; border-top:1px solid var(--line); font-size:.88rem;}
+.ck:first-child{border-top:none;}
+.ck .k{font-weight:600; color:var(--ink2);} .ck .t{color:var(--muted); font-variant-numeric:tabular-nums;}
+.mk{width:18px; height:18px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:800;}
+.mk.y{background:#dcfce7; color:#15803d;} .mk.n{background:#fee2e2; color:#b91c1c;} .mk.z{background:#f1f5f9; color:#94a3b8;}
+
+.info2{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:6px;}
+.box{border:1px solid var(--line); border-radius:14px; padding:12px 14px; font-size:.86rem; color:var(--ink2); line-height:1.6;}
+.box .h{font-size:.78rem; font-weight:700; color:var(--muted); margin-bottom:4px;}
+
+/* 계좌 히어로 */
+.hero{display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px 28px; margin:16px 0 4px;}
+.hero .big{font-size:2.1rem; font-weight:800; letter-spacing:-0.035em; font-variant-numeric:tabular-nums; line-height:1.1;}
+.hero .lab{font-size:.8rem; color:var(--muted); font-weight:600; margin-bottom:4px;}
+.hero .ret{font-size:1.25rem; font-weight:800; font-variant-numeric:tabular-nums;}
+.hero .sm{font-size:.85rem; color:var(--muted); font-variant-numeric:tabular-nums;}
+
+/* 판단 보드 */
+.row{border-left:4px solid transparent;}
+.row.l-sell{border-left-color:var(--sell); background:linear-gradient(90deg,#fff6f6,#fff 40%);}
+.row.l-take{border-left-color:var(--take); background:linear-gradient(90deg,#f3fdf7,#fff 40%);}
+.row.l-add{border-left-color:var(--add);} .row.l-warn{border-left-color:#f5a524;} .row.l-hold{border-left-color:#e2e8f0;}
+.row .rule{margin-top:10px; padding:10px 12px; border-radius:10px; background:#fff; border:1px solid var(--line); font-size:.82rem; color:var(--ink2); line-height:1.55;}
+.row .rule b{color:var(--ink);}
+.badge.lg{font-size:.9rem; padding:6px 14px;}
+.pill.need{background:#fff4e5; color:#b45309; box-shadow:inset 0 0 0 1px #fcd9a6;}
+.pill{display:inline-block; font-size:.72rem; font-weight:700; color:var(--ink2); background:var(--surface); border-radius:6px; padding:2px 7px; margin-left:6px; vertical-align:2px;}
+
+/* 판정 배너 */
+.verdict{border-radius:18px; padding:20px 22px; margin:10px 0 14px; display:flex; gap:18px; align-items:center;}
+.verdict .word{font-size:2rem; font-weight:900; letter-spacing:-0.04em; white-space:nowrap;}
+.verdict .one{font-size:.95rem; line-height:1.55;}
+.verdict .one .nm{font-weight:800; font-size:1.05rem;}
+.v-sell{background:var(--sell-bg); color:var(--sell);} .v-take{background:var(--take-bg); color:var(--take);}
+.v-add{background:var(--add-bg); color:var(--add);} .v-warn{background:var(--warn-bg); color:var(--warn);}
+.v-hold{background:var(--hold-bg); color:var(--hold);}
+.verdict .one > span{color:var(--ink2);}
+.verdict .one .act{color:#fff;}
+
+.rules{display:flex; flex-direction:column; gap:10px; margin-top:6px;}
+.rc{border:1px solid var(--line); border-radius:14px; padding:14px 16px; background:#fff; border-left:4px solid var(--line);}
+.rc.l-sell{border-left-color:var(--sell);} .rc.l-take{border-left-color:var(--take);} .rc.l-add{border-left-color:var(--add);}
+.rc.l-warn{border-left-color:#f5a524;} .rc.l-hold{border-left-color:#cbd5e1;}
+.rc .t{font-weight:800; font-size:.95rem; color:var(--ink);}
+.rc .p{margin-top:6px; font-size:.86rem; color:var(--muted); line-height:1.6; padding-left:10px; border-left:2px solid var(--line);}
+.rc .f{margin-top:8px; font-size:.9rem; color:var(--ink); line-height:1.55;}
+.rc .f::before{content:"지금 "; font-weight:700; color:var(--muted); font-size:.78rem;}
+.acts{margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;}
+.act{background:var(--ink); color:#fff; border-radius:8px; padding:6px 10px; font-size:.82rem; font-weight:600;}
+
+/* 판단 보드 카드 */
+.cards{display:flex; flex-direction:column; gap:12px; margin-top:8px;}
+.card{background:#fff; border:1px solid var(--line); border-radius:16px; padding:18px 20px; border-left:5px solid #e2e8f0;}
+.card.l-sell{border-left-color:#e5484d;} .card.l-take{border-left-color:#16a34a;} .card.l-add{border-left-color:#2563eb;}
+.card.l-warn{border-left-color:#f59e0b;} .card.l-hold{border-left-color:#cbd5e1;}
+.c-head{display:flex; justify-content:space-between; align-items:flex-start; gap:12px;}
+.c-head .nm{font-size:1.15rem; font-weight:800; color:var(--ink); letter-spacing:-0.02em;}
+.c-head .cd{font-size:.78rem; color:var(--faint); margin-left:8px; font-weight:500;}
+.c-tags{margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;}
+.tag{font-size:.75rem; font-weight:700; padding:3px 9px; border-radius:7px; background:#f1f5f9; color:#475569;}
+.tag.ok{background:#f0fdf4; color:#15803d;} .tag.need{background:#fff7ed; color:#c2410c;}
+.sigbig{font-size:1rem; font-weight:800; padding:7px 16px; border-radius:999px; white-space:nowrap;}
+.c-grid{display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:16px;}
+.c-grid label{display:block; font-size:.75rem; color:var(--muted); font-weight:600; margin-bottom:3px;}
+.c-grid b{display:block; font-size:1.12rem; font-weight:800; color:var(--ink); font-variant-numeric:tabular-nums; letter-spacing:-0.02em;}
+.c-grid small{display:block; font-size:.75rem; color:var(--muted); margin-top:1px; font-variant-numeric:tabular-nums;}
+.rng{position:relative; height:34px; margin:16px 4px 2px;}
+.rng .bar{position:absolute; top:13px; left:0; right:0; height:6px; border-radius:6px;
+  background:linear-gradient(90deg,#fecaca 0%,#e2e8f0 var(--avg),#bbf7d0 100%);}
+.rng .tk{position:absolute; top:24px; transform:translateX(-50%); font-size:.68rem; color:var(--muted); white-space:nowrap;}
+.rng .tk.l{transform:none;} .rng .tk.r{transform:translateX(-100%);}
+.rng .now{position:absolute; top:7px; width:18px; height:18px; border-radius:50%; background:var(--ink); border:3px solid #fff;
+  box-shadow:0 0 0 1px var(--ink); transform:translateX(-50%);}
+.rng .avg{position:absolute; top:9px; width:2px; height:14px; background:#64748b; transform:translateX(-50%);}
+.c-why{margin-top:16px; padding:12px 14px; border-radius:12px; background:#f8fafc; font-size:.88rem; line-height:1.6; color:var(--ink2);}
+.c-why .t{font-weight:800; color:var(--ink);}
+.c-why .f{display:block; color:var(--muted); font-size:.82rem; margin-top:2px;}
+@media (max-width:640px){
+  .card{padding:16px;} .c-grid{grid-template-columns:repeat(2,1fr); gap:12px;}
+  .c-head .nm{font-size:1.05rem;} .sigbig{font-size:.92rem; padding:6px 13px;}
 }
 
-.m-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.4rem; margin: 0 0 0.8rem; }
-.m-kpis div { background: #E7EDEF; border-radius: 10px; padding: 0.5rem 0.3rem; text-align: center; }
-.m-kpis span { display: block; font-size: 0.68rem; color: #51616C; line-height: 1.25; }
-.m-kpis b { font-size: 1.15rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
-.cards { display: flex; flex-direction: column; gap: 0.5rem; }
-.stApp a.card { display: block; background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px;
-  padding: 0.7rem 0.85rem; text-decoration: none; color: #16212B; }
-.stApp a.card.hot { background: #FFF6DA; border-color: #EFD48A; }
-.c-top, .c-mid, .c-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 0.6rem; }
-.c-name, .c-price { font-weight: 700; font-size: 1.02rem; }
-.c-price, .c-chg, .c-meta { font-variant-numeric: tabular-nums; }
-.c-mid { font-size: 0.78rem; color: #51616C; margin-top: 0.1rem; }
-.c-chg { font-weight: 700; }
-.c-bar { height: 5px; background: #E3E9EC; border-radius: 3px; margin: 0.5rem 0 0.35rem; overflow: hidden; }
-.c-bar i { display: block; height: 100%; background: #2E6B6F; border-radius: 3px; }
-.c-meta { font-size: 0.78rem; color: #51616C; }
-.c-meta b { color: #16212B; }
-.c-desc { font-size: 0.76rem; color: #6B7A84; margin-top: 0.3rem; line-height: 1.4;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.c-tag { display: inline-block; font-size: 0.66rem; font-weight: 700; padding: 0.05rem 0.4rem;
-  border-radius: 6px; margin-left: 0.35rem; vertical-align: 2px; }
-.c-tag.new { background: #F2B134; color: #16212B; }
-.c-tag.al { background: #D9E8E6; color: #2E6B6F; }
-@media (max-width: 640px) {
-  .st-key-desk_kpis, .st-key-desk_table { display: none !important; }
-  .st-key-mobile_view { display: flex !important; }
-  .stApp h1 { font-size: 1.6rem !important; }
-  .radar { padding: 0.85rem 0.9rem; }
-  .chip { flex: 1 1 calc(50% - 0.3rem); max-width: none; min-width: 0; padding: 0.5rem 0.6rem; }
-  .chip-group { font-size: 0.85rem; }
-  .chip-count { font-size: 1.1rem; }
-  .chip-names { font-size: 0.72rem; }
-  [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
-  [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
+/* 압축 판단 보드 (한 종목 한 줄) */
+.board{border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#fff; margin-top:8px;}
+.brow{display:grid; grid-template-columns:4px 146px 84px 88px 108px minmax(150px,1fr) 186px 136px; column-gap:10px;
+  align-items:center; gap:10px; padding:9px 14px 9px 0; border-top:1px solid var(--line); font-size:.88rem;}
+.brow:first-child{border-top:none;}
+.brow.bhead{font-size:.72rem; color:var(--muted); font-weight:700; background:#f8fafc; padding-top:7px; padding-bottom:7px;}
+.brow .bar{align-self:stretch; margin:-9px 0; background:#e2e8f0;}
+.brow.l-sell .bar{background:#e5484d;} .brow.l-take .bar{background:#16a34a;} .brow.l-add .bar{background:#2563eb;}
+.brow.l-warn .bar{background:#f59e0b;}
+.brow.l-sell{background:#fffafa;}
+.bn b{font-weight:800; color:var(--ink); font-size:.95rem;}
+.bn small{display:block; color:var(--faint); font-size:.7rem; margin-top:-1px;}
+.bsig{justify-self:center; width:84px; text-align:center; box-sizing:border-box; font-size:.8rem; font-weight:800;
+  padding:5px 6px; border-radius:999px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.bv{font-weight:700; color:var(--ink); font-variant-numeric:tabular-nums; white-space:nowrap;}
+.bv small{display:block; font-size:.7rem; font-weight:600; color:var(--muted);}
+.bv.up, .bv.down{color:inherit;} .bv.up{color:var(--up);} .bv.down{color:var(--down);}
+.bv i{font-style:normal; color:#c2410c; margin-left:3px;}
+.bchips{display:flex; flex-wrap:nowrap; gap:3px;}
+.bchips.ma{display:grid; grid-template-columns:42px 40px 46px 52px; gap:2px;}
+.bchips.fl{display:grid; grid-template-columns:1fr 1fr; gap:4px;}
+.bchips .mchip, .bchips .fchip{text-align:center; display:block;}
+.mslot{display:block;}
+.bmeta{display:contents;}
+.mchip, .fchip{font-size:.68rem; font-weight:700; padding:2px 5px; border-radius:6px; white-space:nowrap; font-variant-numeric:tabular-nums;}
+.mchip.ok{background:#ecfdf3; color:#15803d;} .mchip.no{background:#fef2f2; color:#b91c1c;}
+.mchip.strong{background:#15803d; color:#fff;}
+.fchip{background:#f1f5f9; color:var(--ink2);} .fchip.up{background:#fef2f2; color:#c42b2b;} .fchip.down{background:#eff6ff; color:#1d4ed8;}
+.mini{display:inline-block; white-space:nowrap; font-size:.66rem; font-weight:800; padding:1px 6px; border-radius:5px; margin-top:3px;}
+.mini.ok{background:#f0fdf4; color:#15803d;}
+.mini.r3{background:#16a34a; color:#fff;} .mini.r3past{background:#ecfdf3; color:#15803d;}
+.brow.r3row{background:linear-gradient(90deg,#f0fdf4,#fff 60%);} .brow.r3row .bar{background:#16a34a;}
+.rr-bot small.r3txt{color:#15803d; font-weight:800;}
+.mini.scout{background:#f5f3ff; color:#6d28d9;} .mini.full{background:#eef2ff; color:#3730a3;}
+.bn .tags{display:flex; flex-wrap:wrap; gap:3px; margin-top:3px;} .bn .tags .mini{margin-top:0;}
+.bn{min-width:0;} .bn b{display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.mini.need{background:#fff7ed; color:#c2410c;}
+.bnote{grid-column:2 / -1; font-size:.78rem; color:var(--ink2); margin-top:-2px;}
+@media (min-width:761px) and (max-width:1120px){
+  .brow{grid-template-columns:4px 140px 78px 82px 102px minmax(140px,1fr) 92px 84px;}
+  .bchips.ma{grid-template-columns:44px 46px; row-gap:3px;}
+  .bchips.fl{grid-template-columns:1fr; row-gap:3px;}
 }
-.idx-row { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0.6rem; margin: 0 0 0.5rem; }
-.idx-badge.neutral { background: #E7EDEF; color: #51616C; }
-.idx-row .idx-val { font-size: 1.15rem; }
-.idx-row .idx-chg { display: block; margin-left: 0; }
-.flow { background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px; padding: 0.7rem 0.9rem; margin: 0 0 0.5rem; }
-.flow-title { font-size: 0.85rem; color: #51616C; margin-bottom: 0.35rem; }
-.flow table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.flow th { font-size: 0.78rem; color: #8A979F; font-weight: 600; text-align: right; padding: 0.15rem 0.3rem; }
-.flow th:first-child, .flow td:first-child { text-align: left; }
-.flow td { font-size: 0.92rem; font-weight: 700; text-align: right; padding: 0.25rem 0.3rem; border-top: 1px solid #EEF2F4; }
-.flow td small { display: block; font-size: 0.7rem; font-weight: 500; color: #8A979F; }
-.idx { background: #FFFFFF; border: 1px solid #DCE3E7; border-radius: 12px; padding: 0.7rem 0.9rem; }
-.idx-name { font-size: 0.85rem; color: #51616C; }
-.idx-name small { margin-left: 0.3rem; color: #8A979F; }
-.idx-val { font-size: 1.35rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
-.idx-chg { font-size: 0.85rem; font-weight: 700; margin-left: 0.35rem; font-variant-numeric: tabular-nums; }
-.idx-badge { display: inline-block; font-size: 0.72rem; font-weight: 700; padding: 0.1rem 0.45rem;
-  border-radius: 6px; margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
-.idx-badge.on { background: #D9E8E6; color: #2E6B6F; }
-.idx-badge.off { background: #F4E1E2; color: #A2343B; }
-.idx-err { font-size: 0.85rem; color: #8A979F; margin-top: 0.3rem; }
-@media (max-width: 640px) {
-  .idx-row { gap: 0.35rem; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .flow { padding: 0.55rem 0.6rem; }
-  .flow td { font-size: 0.8rem; }
-  .idx { padding: 0.5rem 0.55rem; }
-  .idx-name { font-size: 0.74rem; }
-  .idx-name small { display: none; }
-  .idx-val { font-size: 1.0rem; }
-  .idx-chg { display: block; margin-left: 0; font-size: 0.76rem; }
-  .idx-badge { font-size: 0.62rem; padding: 0.05rem 0.3rem; }
+@media (max-width:760px){
+  .brow.bhead{display:none;}
+  .brow{grid-template-columns:4px 1fr auto; row-gap:6px; padding:10px 12px 10px 0;}
+  .brow .bar{grid-row:1 / span 4;}
+  .brow .bn{grid-column:2;} .brow .bsig{grid-column:3; justify-self:end;}
+  .brow .bv{grid-column:auto; display:inline-block;}
+  .brow > .bv{display:none;}
+  .brow .bnote{grid-column:2 / 4;} .brow .nf{display:none;}
+  .bmeta{display:grid; grid-template-columns:1fr; gap:6px; grid-column:2 / 4;}
+  .bchips.ma{grid-template-columns:44px 42px 46px 52px;} .bchips.fl{grid-template-columns:1fr 1fr; max-width:240px;}
+  .mrow{grid-column:2 / 4; display:grid; grid-template-columns:1fr 1fr; gap:8px 10px;}
+  .mrow .rr{grid-column:1 / 3;}
+  .mrow .rr-top b:first-child::before{content:"−1R 손절 "; font-size:.68rem; color:var(--muted); font-weight:700;}
+  .mrow .rr-top b:last-child::before{content:"3R 익절 "; font-size:.68rem; color:var(--muted); font-weight:700;}
+  .brow > .rr{display:none;}
 }
-.sig { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.7rem 0.9rem;
-       margin-bottom: 0.6rem; display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.6rem 1.2rem; }
-.sig-mk { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.9rem; }
-.sig-name { font-weight: 800; font-size: 1rem; color: #16212B; min-width: 3.2rem; }
-.sig-item { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: #51616C; }
-.tl { display: inline-flex; gap: 3px; background: #1C2530; border-radius: 999px; padding: 3px 6px; }
-.tl i { width: 15px; height: 15px; border-radius: 50%; background: #D9DEE2; font-style: normal; font-size: 0.6rem;
-        font-weight: 800; color: #FFFFFF; display: inline-flex; align-items: center; justify-content: center; }
-.tl i.G { background: #1FA75A; } .tl i.Y { background: #F2B134; color: #3A2A00; } .tl i.R { background: #D6333B; }
-.sig-txt.G { color: #1B8A4B; font-weight: 700; } .sig-txt.Y { color: #A87400; font-weight: 700; }
-.sig-txt.R { color: #C0262E; font-weight: 700; }
-.sig-rs { font-size: 0.8rem; color: #51616C; } .sig-rs b { color: #16212B; font-size: 0.92rem; }
-@media (max-width: 640px) { .sig { grid-template-columns: 1fr; } }
-.mk-row { display: grid; grid-template-columns: 1fr 1fr 1.05fr; gap: 0; background: #FFFFFF;
-  border: 1px solid #E3E8EB; border-radius: 14px; overflow: hidden; margin: 0 0 0.6rem; }
-.mk { padding: 0.95rem 1.2rem 0.85rem; border-right: 1px solid #EEF1F3; }
-.mk-name { font-size: 0.98rem; font-weight: 700; color: #16212B; display: flex; justify-content: space-between; align-items: center; }
-.mk-name small { font-size: 0.72rem; font-weight: 500; color: #8A979F; }
-.mk-val { font-size: 1.55rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
-.mk-chg { font-size: 0.95rem; font-weight: 700; margin-left: 0.45rem; font-variant-numeric: tabular-nums; }
-.mk-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; margin: 0.65rem 0 0.35rem; background: #E3E9EC; }
-.mk-bar i { display: block; height: 100%; }
-.mk-cnt { display: flex; justify-content: space-between; font-size: 0.8rem; font-variant-numeric: tabular-nums; color: #6B7A84; }
-.mk-cnt .u { color: #D6333B; } .mk-cnt .d { color: #1F66C9; }
-.mk-sub { display: flex; justify-content: space-between; gap: 0.4rem; margin-top: 0.45rem; font-size: 0.74rem; color: #8A979F;
-  font-variant-numeric: tabular-nums; }
-.mk-sub b { font-weight: 700; }
-.mood { background: #FFF6EC; padding: 0.9rem 1.1rem 0.8rem; }
-.mood-top { display: flex; justify-content: space-between; align-items: center; font-weight: 700; color: #16212B; font-size: 0.95rem; }
-.mood-top .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #F29A18; margin-right: 0.35rem; }
-.mood-top .lbl { color: #E0781A; font-weight: 800; }
-.mood-gauge { position: relative; height: 4px; border-radius: 2px; margin: 0.6rem 0 0.7rem;
-  background: linear-gradient(90deg, #1F66C9, #B9C4CC 50%, #D6333B); }
-.mood-gauge i { position: absolute; top: -4px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%;
-  background: #FFFFFF; border: 2px solid #F29A18; }
-.mood-row { display: grid; grid-template-columns: 3.2rem 1fr 5.4rem; align-items: center; gap: 0.5rem;
-  font-size: 0.8rem; color: #51616C; margin-top: 0.3rem; }
-.mood-row .bar { position: relative; height: 5px; background: #ECE4DA; border-radius: 3px; }
-.mood-row .bar i { position: absolute; top: 0; height: 100%; border-radius: 3px; }
-.mood-row b { text-align: right; font-variant-numeric: tabular-nums; }
-.mood-note { font-size: 0.68rem; color: #9A8F84; margin-top: 0.45rem; }
-.inst { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 0.85rem; }
-.inst th { color: #8A979F; font-weight: 600; text-align: right; padding: 0.2rem 0.35rem; font-size: 0.76rem; white-space: nowrap; }
-.inst td { text-align: right; padding: 0.25rem 0.35rem; border-top: 1px solid #EEF2F4; font-weight: 600; white-space: nowrap; }
-.inst th:first-child, .inst td:first-child { text-align: left; }
-.c-flow { font-size: 0.74rem; color: #51616C; margin-top: 0.2rem; font-variant-numeric: tabular-nums; }
-.notes { margin: 0.2rem 0 0; padding-left: 1.2rem; font-size: 0.88rem; line-height: 1.55; color: #26343E; }
-.notes li { margin: 0.12rem 0; }
-@media (max-width: 640px) {
-  .mk-row { grid-template-columns: 1fr 1fr; }
-  .mood { grid-column: 1 / -1; border-top: 1px solid #F1E6D8; }
-  .mk { padding: 0.7rem 0.75rem 0.65rem; }
-  .mk-val { font-size: 1.2rem; }
-  .mk-chg { display: block; margin-left: 0; font-size: 0.8rem; }
-  .mk-sub { flex-direction: column; gap: 0.05rem; }
+.mrow{display:none;}
+/* −1R ↔ 3R 칸 */
+.rr{display:block; min-width:0;}
+.rr-top, .rr-bot{display:flex; justify-content:space-between; gap:8px; font-variant-numeric:tabular-nums;}
+.rr-top b{font-weight:800; color:var(--ink); font-size:.92rem;}
+.rr-bot small{font-size:.7rem; font-weight:700; white-space:nowrap;}
+.rr-bot small.down{color:var(--down);} .rr-bot small.up{color:var(--up);}
+.rr-bot i{font-style:normal; color:#c2410c; margin-left:2px;}
+.rr-bot b.lock{margin-left:4px; font-size:.68rem; font-weight:800; color:#15803d; background:#ecfdf3; padding:0 5px; border-radius:4px;}
+.rr-bar{position:relative; display:block; height:6px; margin:5px 0 4px; border-radius:6px;
+  background:linear-gradient(90deg,#bfdbfe,#e2e8f0 45%,#fecaca);}
+.rr-bar i{position:absolute; top:50%; width:12px; height:12px; border-radius:50%; background:var(--ink);
+  border:2px solid #fff; box-shadow:0 0 0 1px var(--ink); transform:translate(-50%,-50%);}
+.rr-bar em{position:absolute; top:-3px; width:2px; height:12px; background:#64748b; transform:translateX(-50%);}
+.rrh{display:flex; justify-content:space-between; gap:6px; white-space:nowrap;}
+.bv small b{font-weight:800;} .bv small b.up{color:var(--up);} .bv small b.down{color:var(--down);}
+@media (max-width:760px){ .mrow{display:grid;} }
+.mrow .bv{font-size:.85rem;} .mrow .bv::before{content:attr(data-l); display:block; font-size:.66rem; color:var(--muted); font-weight:600;}
+
+.upmark{font-style:normal; color:#c42b2b!important; font-weight:800;}
+.qt-pv{display:flex; flex-wrap:wrap; gap:8px 22px; padding:12px 14px; margin:6px 0 8px; border-radius:12px; background:#f8fafc;
+  font-size:.9rem; font-variant-numeric:tabular-nums; color:var(--ink2);}
+.qt-pv label{display:block; font-size:.7rem; color:var(--muted); font-weight:700;}
+.qt-pv b{color:var(--ink);} .qt-pv b.up{color:var(--up);} .qt-pv b.down{color:var(--down);}
+
+/* 매매 미리보기 */
+.pv{border:1px solid var(--line); border-radius:14px; padding:14px 16px; margin:8px 0 10px; background:#fff;}
+.pv-h{font-size:.8rem; font-weight:700; color:var(--muted); margin-bottom:6px;}
+.pv table{width:100%; border-collapse:collapse; font-size:.9rem; font-variant-numeric:tabular-nums;}
+.pv table, .pv th, .pv td{border:none!important;}
+.pv th, .pv td{padding:7px 4px; border-top:1px solid var(--line)!important; text-align:right; background:none!important;}
+.pv tr:first-child th{border-top:none; color:var(--muted); font-size:.78rem;}
+.pv th:first-child{text-align:left; color:var(--ink2); font-weight:600;}
+
+/* 사진 끌어다 놓기 칸 크게 */
+.dropnote{font-size:.85rem; color:var(--ink2); margin:2px 0 8px;}
+[data-testid="stFileUploaderDropzone"]{min-height:150px; border:2px dashed #cbd5e1!important; border-radius:14px!important;
+  background:#f8fafc!important; display:flex; align-items:center; justify-content:center;}
+[data-testid="stFileUploaderDropzone"]:hover{border-color:#2563eb!important; background:#eff6ff!important;}
+
+.login{max-width:380px; margin:12vh auto 0;}
+.login .t{font-size:1.6rem; font-weight:800; letter-spacing:-0.03em;}
+.login .s{color:var(--muted); font-size:.9rem; margin:4px 0 18px;}
+
+@media (max-width:640px){
+  .block-container{padding-left:1rem; padding-right:1rem; padding-top:1.4rem;}
+  .chips{grid-template-columns:repeat(2,1fr);} .kpis{grid-template-columns:repeat(2,1fr);}
+  .row .nums{grid-template-columns:repeat(2,1fr);} .info2{grid-template-columns:1fr;}
+  .ck{grid-template-columns:26px 100px 1fr;}
+  .kpis.k3 .kpi{padding:12px;} .kpis.k3 .v{font-size:1.05rem;}
+  .hd .t{font-size:1.4rem;}
+  .hero .big{font-size:1.7rem;}
+  .verdict{flex-direction:column; align-items:flex-start; gap:6px; padding:16px;}
+  .verdict .word{font-size:1.6rem;}
 }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-_app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
-
-
-# ─────────────────────────── 데이터 기억(속도) ───────────────────────────
-# 예전에는 기억 시간(30분·5분·2분…)이 지나면 그 순간 화면이 멈추고 수백 종목을 다시 받았어요.
-# 이제는 처음 한 번만 기다리고, 그 뒤로는 지난 데이터를 바로 보여주면서 뒤에서 새로 받아 바꿔 끼워요.
-# (여러 사람이 봐도 한 번만 받고, 복사 없이 같은 데이터를 같이 써서 메모리도 덜 써요.)
-@st.cache_resource
-def _bg_store() -> dict:
-    return {"lock": threading.Lock(), "items": {}}
+LEVEL_ORDER = {"sell": 0, "take": 1, "warn": 2, "add": 3, "hold": 4}
+INDEX_SYMBOL = {"KOSPI": ("KR", "KOSPI"), "KOSDAQ": ("KR", "KOSDAQ"),
+                "S&P500": ("US", "^GSPC"), "NASDAQ": ("US", "^IXIC")}
 
 
-# Streamlit 무료 서버는 앱마다 메모리를 690MB~2.7GB 사이로 그때그때 나눠 줘요 → 가장 적을 때(690MB)에 맞춰요
-IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
-MEM_SOFT = int(os.environ.get("MEM_SOFT_MB", "380" if IS_STREAMLIT_CLOUD else "650"))   # 넘으면 뒤쪽 새로 받기 멈춤
-MEM_HARD = int(os.environ.get("MEM_HARD_MB", "480" if IS_STREAMLIT_CLOUD else "800"))   # 넘으면 기억 비우기
-BIG_SERVER = MEM_SOFT >= 2000                           # Hugging Face(16GB) 같은 넉넉한 서버
+def html(s: str):
+    st.markdown(s, unsafe_allow_html=True)
 
 
-def _mem_log(n_rows: int):
-    """(원인 찾기) 5분마다 서버 로그에 메모리와 기억 창고 크기를 한 줄씩 남겨요 — Manage app → 로그에서 보여요."""
-    now = time.time()
-    if now - _GC.get("logt", 0) < 300:
+def badge(level: str, text: str) -> str:
+    return f"<span class='badge b-{level}'>{escape(text)}</span>"
+
+
+def sign_cls(v) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)) or v == 0:
+        return ""
+    return "up" if v > 0 else "down"
+
+
+# ─────────────────────────── 잠금 ───────────────────────────
+def device_key(pw: str) -> str:
+    """비밀번호에서 만든 기기 열쇠. 비밀번호를 바꾸면 예전 열쇠는 자동으로 무효."""
+    import hashlib
+    return hashlib.sha256(("portfolio-device|" + pw).encode()).hexdigest()[:24]
+
+
+def gate():
+    pw = st.secrets.get("APP_PASSWORD", "")
+    if not pw:
+        st.error("Streamlit Secrets에 APP_PASSWORD가 없어요. 앱 Settings → Secrets에 넣어 주세요.")
+        st.stop()
+    if st.session_state.get("authed"):
         return
-    _GC["logt"] = now
+    # 휴대폰 홈 화면용: 주소에 기기 열쇠(?k=)가 있으면 비밀번호 없이 바로 열기
+    k = st.query_params.get("k", "")
+    if k and hmac.compare_digest(k, device_key(str(pw))):
+        st.session_state.authed = True
+        return
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        html("<div class='login'><div class='t'>내 계좌</div><div class='s'>보유 종목을 원칙대로 판단합니다</div></div>")
+        if st.session_state.get("tries", 0) >= 5:
+            st.error("비밀번호를 5번 틀렸어요. 잠시 뒤 새로 열어 주세요.")
+            st.stop()
+        with st.form("login", border=False):
+            typed = st.text_input("비밀번호", type="password", label_visibility="collapsed",
+                                  placeholder="비밀번호")
+            remember = st.checkbox("이 기기에서 바로 열기 (홈 화면 바로가기용)", value=True)
+            if st.form_submit_button("열기", type="primary", width="stretch"):
+                if hmac.compare_digest(typed.encode(), str(pw).encode()):
+                    st.session_state.authed = True
+                    if remember:
+                        st.query_params["k"] = device_key(str(pw))
+                    st.rerun()
+                st.session_state.tries = st.session_state.get("tries", 0) + 1
+                st.error("비밀번호가 달라요.")
+    st.stop()
+
+
+gate()
+
+
+# ─────────────────────────── 저장소 ───────────────────────────
+# 저장소 객체는 접속(세션)마다 만들고, core.py가 바뀌면 새로 만든다.
+# (예전엔 cache_resource로 서버 전체에 한 번만 만들어서, 코드를 고쳐 올려도 옛 저장 코드가 계속 돌았음)
+if st.session_state.get("store_v") != core.STORE_VERSION:
+    gh = dict(st.secrets["github"]) if "github" in st.secrets else None
+    st.session_state.store = core.Store(gh)
+    st.session_state.store_v = core.STORE_VERSION
+    for k in ("save_err", "store_status"):
+        st.session_state.pop(k, None)
+store = st.session_state.store
+AI = {"anthropic_key": st.secrets.get("ANTHROPIC_API_KEY", ""), "gemini_key": st.secrets.get("GEMINI_API_KEY", ""),
+      "model": st.secrets.get("AI_MODEL", "")}
+if "book" not in st.session_state:
     try:
-        S = _hist_store()
-        from streamlit.runtime import get_instance
-        rt = get_instance()
-        n_sess = len(rt._session_mgr.list_active_sessions()) if hasattr(rt, "_session_mgr") else -1
+        st.session_state.book = store.load()
+    except Exception as e:
+        st.error(f"저장된 데이터를 못 불러왔어요: {e}")
+        st.stop()
+book = st.session_state.book
+S = book["settings"]
+
+if "store_status" not in st.session_state:
+    st.session_state.store_status = store.check()
+STORE_OK, STORE_MSG = st.session_state.store_status
+
+
+def save(msg: str, allow_empty: bool = False):
+    try:
+        store.save(book, msg, allow_empty=allow_empty)
+        st.session_state.pop("save_err", None)
+        if store.info.get("verified") is False:
+            st.session_state.save_err = "저장은 했는데 다시 읽어 보니 종목 수가 달라요. 설정 탭 '저장 상태'를 확인해 주세요."
+        st.toast("저장했어요", icon=":material/check_circle:")
+    except Exception as e:
+        st.session_state.save_err = f"{e}"   # 새로고침(rerun) 뒤에도 보이도록 남겨 둠
+
+
+# ─────────────────────────── 데이터 (캐시) ───────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def hist(code: str, market: str):
+    try:
+        return core.fetch_kr(code) if market == "KR" else core.fetch_us(code)
     except Exception:
-        S, n_sess = {"data": {}, "light": {}}, -1
-    print(f"[MEM] {time.strftime('%m/%d %H:%M:%S')} rss={rss_mb():.0f}MB sessions={n_sess} "
-          f"hist={len(S['data'])} light={len(S['light'])} swr={len(_bg_store()['items'])} rows={n_rows} "
-          f"threads={threading.active_count()}", flush=True)
+        return pd.DataFrame(), ""
 
 
-def rss_mb() -> float:
-    """지금 앱 서버가 쓰는 메모리(MB)."""
-    try:
-        with open("/proc/self/statm") as f:
-            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
-    except (OSError, ValueError, IndexError):
-        return 0.0
-
-
-def mem_guard(keep: set | None = None):
-    """(메모리) 한도에 가까우면 차트·뉴스 기억, 작은 종목 기록, 화면 밖 일봉, 옛 데이터를 비워요."""
-    m = rss_mb()
-    if m < MEM_HARD:
-        return m
-    try:
-        load_chart_all.clear()
-        load_evidence.clear()
-    except Exception:
-        pass
-    S = _hist_store()
-    with S["lock"]:
-        S["light"].clear()
-        if keep is not None:
-            for c in [c for c in S["data"] if c not in keep]:
-                S["data"].pop(c, None)
-                S["t"].pop(c, None)
-    store = _bg_store()
-    with store["lock"]:
-        latest = {}
-        for k, v in store["items"].items():
-            if isinstance(k, tuple) and (k[0] not in latest or v["t"] > store["items"][latest[k[0]]]["t"]):
-                latest[k[0]] = k
-        for k in [k for k in store["items"] if isinstance(k, tuple) and latest.get(k[0]) != k and not store["items"][k]["busy"]]:
-            store["items"].pop(k, None)
-    gc.collect()
-    return rss_mb()
-
-
-def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = True, empty=None):
-    """key의 데이터를 돌려줘요. ttl초가 지났으면 지난 값을 먼저 주고 뒤에서 loader()로 새로 받아요.
-    first_wait=False면 처음에도 기다리지 않고 empty를 준 뒤 뒤에서 받아요(없어도 화면이 되는 데이터용)."""
-    store = _bg_store()
-    with store["lock"]:
-        if key not in store["items"] and isinstance(key, tuple):
-            # (메모리) 종목 구성이 바뀔 때마다 새 키가 생겨 옛 데이터가 쌓였어요 → 같은 종류는 최근 2개만 남겨요
-            same = [k for k, v in store["items"].items() if isinstance(k, tuple) and k[0] == key[0] and not v["busy"]]
-            for k in sorted(same, key=lambda k: store["items"][k]["t"])[:-1]:
-                store["items"].pop(k, None)
-        item = store["items"].setdefault(key, {"value": None, "t": 0.0, "busy": False})
-        has_value = item["value"] is not None
-        need = (not has_value) or time.time() - item["t"] >= ttl
-        start_bg = need and not item["busy"] and (has_value or not first_wait)
-        if start_bg and rss_mb() > MEM_SOFT:           # 메모리가 빠듯하면 새로 받기는 다음으로
-            start_bg = False
-        if start_bg:
-            item["busy"] = True
-
-    def work():
-        try:
-            item.update(value=loader(), t=time.time())
-        except Exception:   # 네트워크 오류: 지난 값을 두고 1분 뒤 다시
-            item["t"] = time.time() - ttl + 60
-        finally:
-            item["busy"] = False
-
-    if start_bg:
-        threading.Thread(target=work, daemon=True).start()
-    if has_value:
-        return item["value"]
-    if not first_wait:
-        return empty
-    with st.spinner(spinner or "데이터를 불러오는 중이에요."):
-        with store["lock"]:
-            mine = not item["busy"]
-            if mine:
-                item["busy"] = True
-        if mine:
-            try:
-                item.update(value=loader(), t=time.time())
-            finally:
-                item["busy"] = False
-        else:                       # 다른 사람이 이미 받는 중이면 끝날 때까지 기다려요
-            while item["busy"] and item["value"] is None:
-                time.sleep(0.3)
-            if item["value"] is None:
-                item.update(value=loader(), t=time.time())
-    return item["value"]
-
-
-def swr_clear(*prefixes: str):
-    store = _bg_store()
-    with store["lock"]:
-        for k in [k for k in store["items"] if isinstance(k, tuple) and k[0] in prefixes]:
-            store["items"].pop(k, None)
-
-
-CORE_CAP = 3000e8          # 처음 화면: 시가총액 3,000억 이상
-CORE_N = 500               # 최대 500종목(공부 자료 종목 먼저)
-HIST_TTL = 1800
-
-
-@st.cache_resource
-def _hist_store() -> dict:
-    """(속도) 일봉을 종목마다 따로 기억해요. 종목 구성이 바뀌어도 새로 들어온 종목만 받아요."""
-    return {"data": {}, "t": {}, "light": {}, "lock": threading.Lock(),
-            "bg": {"running": False, "queue": set(), "total": 0, "done": 0},
-            "lbg": {"running": False, "queue": set(), "total": 0, "done": 0}}
-
-
-def _hist_put(got: dict):
-    S = _hist_store()
-    now = time.time()
-    with S["lock"]:
-        for c, res in got.items():
-            ok = res is not None and res[1] is not None and not res[1].empty
-            if ok or c not in S["data"]:
-                S["data"][c] = res
-            S["t"][c] = now if ok else now - HIST_TTL + 120      # 못 받았으면 2분 뒤 다시
-
-
-LIGHT_TTL = 3600
-
-
-def _light_put(got: dict):
-    """(메모리) 화면에 안 나오는 작은 종목은 일봉 표 대신 최근 260일 고가·종가만 가볍게 기억해요."""
-    S = _hist_store()
-    now = time.time()
-    with S["lock"]:
-        for c, res in got.items():
-            df = res[1] if res else None
-            if df is not None and not df.empty:
-                S["light"][c] = (pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype="float32")[-260:], now)
-            elif c not in S["light"]:
-                S["light"][c] = (None, now - LIGHT_TTL + 300)
-
-
-def _light_bg(codes):
-    S = _hist_store()
-    with S["lock"]:
-        new = set(codes) - S["lbg"]["queue"]
-        S["lbg"]["queue"].update(new)
-        S["lbg"]["total"] += len(new)
-        if S["lbg"]["running"] or not S["lbg"]["queue"]:
-            return
-        S["lbg"]["running"] = True
-
-    def run():
-        try:
-            while True:
-                with S["lock"]:
-                    batch = list(S["lbg"]["queue"])[:100]
-                    S["lbg"]["queue"].difference_update(batch)
-                if not batch:
-                    break
-                _light_put(data.fetch_histories(batch, workers=4))
-                with S["lock"]:
-                    S["lbg"]["done"] += len(batch)
-                time.sleep(0.5)
-        finally:
-            with S["lock"]:
-                S["lbg"]["running"] = False
-                if not S["lbg"]["queue"]:
-                    S["lbg"].update(total=0, done=0)
-    threading.Thread(target=run, daemon=True).start()
-
-
-def get_light(codes) -> dict:
-    S = _hist_store()
-    now = time.time()
-    born = S.setdefault("born", now)
-    need = [c for c in codes if c not in S["light"] or now - S["light"][c][1] > LIGHT_TTL]
-    if need and now - born > 45 and rss_mb() < MEM_SOFT:   # (메모리) 켜진 직후·메모리 빠듯할 땐 작은 종목은 나중에
-        _light_bg(need)
-    return {c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}
-
-
-def _hist_drop(keep: set):
-    """(메모리) 화면에서 빠진 종목의 일봉 표는 비워요(다시 보이면 새로 받아요)."""
-    S = _hist_store()
-    with S["lock"]:
-        for c in [c for c in S["data"] if c not in keep]:
-            S["data"].pop(c, None)
-            S["t"].pop(c, None)
-
-
-def _hist_bg(codes):
-    """뒤에서 천천히 받기(화면을 막지 않아요). 한 번에 하나의 작업만 돌아요."""
-    S = _hist_store()
-    with S["lock"]:
-        new = set(codes) - S["bg"]["queue"]
-        S["bg"]["queue"].update(new)
-        S["bg"]["total"] += len(new)
-        if S["bg"]["running"] or not S["bg"]["queue"]:
-            return
-        S["bg"]["running"] = True
-
-    def run():
-        try:
-            while True:
-                with S["lock"]:
-                    batch = list(S["bg"]["queue"])[:150]
-                    S["bg"]["queue"].difference_update(batch)
-                if not batch:
-                    break
-                _hist_put(data.fetch_histories(batch, workers=6))
-                with S["lock"]:
-                    S["bg"]["done"] += len(batch)
-                time.sleep(0.3)
-        finally:
-            with S["lock"]:
-                S["bg"]["running"] = False
-                if not S["bg"]["queue"]:
-                    S["bg"].update(total=0, done=0)
-    threading.Thread(target=run, daemon=True).start()
-
-
-def get_histories(codes, wait: bool = True, label: str = "") -> dict:
-    """codes의 일봉. 처음 보는 종목은 wait=True면 받아서 보여주고, 오래된 종목은 뒤에서 새로 받아요."""
-    S = _hist_store()
-    now = time.time()
-    missing = [c for c in codes if c not in S["data"]]
-    stale = [c for c in codes if c in S["data"] and now - S["t"].get(c, 0) > HIST_TTL]
-    if missing and wait:
-        with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
-            _hist_put(data.fetch_histories(missing, workers=8))
-        missing = []
-    if (stale or missing) and rss_mb() < MEM_SOFT:
-        _hist_bg(stale + missing)
-    d = S["data"]
-    return {c: d[c] for c in codes if c in d}
-
-
-def _recent_high(hist, quote, days: int) -> bool:
-    """최근 days거래일 안에 52주 신고가를 썼는지(오늘 실시간 고가 포함). hist = 일봉 표 또는 고가 배열."""
-    if hist is None or len(hist) < 60:
-        return False
-    h = (np.asarray(hist, dtype=float) if isinstance(hist, np.ndarray)
-         else pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float))[-250:]
-    hi52 = np.nanmax(h)
-    qh = max(float((quote or {}).get("high") or 0), float((quote or {}).get("price") or 0))
-    if qh and qh >= hi52 * 0.999:
-        return True
-    last = len(h) - 1 - int(np.nanargmax(h[::-1]))
-    return (len(h) - 1 - last) <= days
-
-
-def _first_high_ago(hist, lookback: int = 20) -> int | None:
-    """최근 lookback거래일 안에서 52주 신고가를 '처음' 쓴 날이 며칠 전인지(없으면 None)."""
-    if hist is None or len(hist) < 260:
+@st.cache_data(ttl=300, show_spinner=False)
+def regime(index_name: str):
+    mkt, sym = INDEX_SYMBOL[index_name]
+    df, _ = hist(sym, mkt)
+    if df.empty or len(df) < 61:
         return None
-    h = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)
-    prior = pd.Series(h).shift(1).rolling(250, min_periods=200).max().to_numpy()
-    tail = np.arange(len(h) - lookback, len(h))
-    hits = [i for i in tail if prior[i] == prior[i] and h[i] > prior[i]]
-    return (len(h) - 1 - hits[0]) if hits else None
-
-
-def mark_sector_first(df: pd.DataFrame, histories: dict) -> pd.DataFrame:
-    """깡토: 변동성 장에선 섹터에서 '가장 먼저' 신고가를 쓴 종목을 우선 본다 → sector_first 표시."""
-    if df.empty or "days_since_high" not in df:
-        return df
-    recent = df[pd.to_numeric(df["days_since_high"], errors="coerce") <= 20]
-    ago = {}
-    for c in recent["code"]:
-        res = histories.get(c)
-        if res and res[1] is not None:
-            a = _first_high_ago(res[1])
-            if a is not None:
-                ago[c] = a
-    df = df.assign(nh_first_ago=df["code"].map(ago), sector_first=False)
-    sub = df[df["nh_first_ago"].notna()]
-    for _, g in sub.groupby("group"):
-        if len(g) >= 2:
-            df.loc[g["nh_first_ago"].idxmax(), "sector_first"] = True
-    return df
-
-
-def core_view(quotes: dict, shares: dict) -> tuple[set, set, dict]:
-    """주요 500(시총 3,000억↑, 공부 자료 종목 먼저) + 시총이 작아도 최근 신고가 종목."""
-    board_kr = [x["code"] for x in STOCKS if data.is_kr(x["code"])]
-    all_kr = board_kr + list(EXTRA_CODES)
-
-    def cap(c):
-        q, n = quotes.get(c) or {}, shares.get(c)
-        return (q.get("price") or 0) * (n or 0)
-    caps = {c: cap(c) for c in all_kr}
-    known = sum(1 for v in caps.values() if v)
-    if known < 100:                                   # 시가총액을 아직 못 받았으면 공부 자료 종목으로
-        core = set(board_kr)
-    else:
-        b = sorted([c for c in board_kr if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
-        e = sorted([c for c in EXTRA_CODES if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
-        core = set((b + e)[:CORE_N])
-    rest = [c for c in all_kr if c not in core]
-    light = get_light(rest)                           # 작은 종목은 뒤에서, 고가만 가볍게
-    small_hi = {c for c, hs in light.items() if _recent_high(hs, quotes.get(c), max(5, recent_days))}
-    S = _hist_store()["lbg"]
-    return core, small_hi, {"rest": len(rest), "loaded": len(light), "bg": dict(S)}
-
-
-def load_histories(codes: tuple[str, ...]):
-    return swr(("hist_kr", codes), 1800, lambda: data.fetch_histories(codes),
-               "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
-
-
-_UNI_RETRY = {"t": 0.0}
-
-
-def load_universe() -> list[dict]:
-    """전체 종목 목록(하루 기억). 못 받았으면(빈 목록) 하루 동안 비워 두지 않고 2분마다 다시 시도해요."""
-    val = swr(("krx_universe", "v2"), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
-    if not val and time.time() - _UNI_RETRY["t"] > 120:
-        _UNI_RETRY["t"] = time.time()
-        swr_clear("krx_universe")
-    return val or []
-
-
-def load_industry_map(codes: tuple[str, ...]) -> tuple[dict, dict]:
-    """전 종목 공식 업종(하루 기억). 목록과 따로 받아서, 목록을 예전에 받아 뒀어도 업종은 새로 채워져요."""
-    got = swr(("industry_map", "v2"), 86400, lambda: data.fetch_industry_map(codes),
-              "전 종목의 업종(네이버 업종 · WICS)을 확인하는 중이에요. 처음 한 번 10~30초 걸려요.")
-    if not got or not got[0]:
-        if time.time() - _UNI_RETRY.get("ind", 0) > 180:          # 못 받았으면 3분 뒤 다시
-            _UNI_RETRY["ind"] = time.time()
-            swr_clear("industry_map")
-        return {}, (got[1] if got else {})
-    return got
-
-
-def load_themes() -> dict:
-    """네이버 테마(하루 기억, 기다리지 않음 — 받는 동안은 테마 태그만 잠깐 비어 있어요)."""
-    return swr(("naver_themes",), 86400, data.fetch_theme_map, first_wait=False, empty={}) or {}
-
-
-def load_histories_extra(codes: tuple[str, ...]):
-    """보드 밖 코스피·코스닥 종목 일봉(따로 기억해서 보드 종목은 다시 받지 않아요)."""
-    return swr(("hist_all", codes), 1800, lambda: data.fetch_histories(codes, workers=16),
-               f"코스피·코스닥 전체 {len(codes):,}종목의 일봉을 받는 중이에요. 처음 한 번은 1~3분 걸려요.")
-
-
-def load_histories_overseas(codes: tuple[str, ...]):
-    return swr(("hist_os", codes), 900, lambda: data.fetch_histories(codes), "해외 종목 일봉을 불러오는 중이에요.")
-
-
-def load_official_52w(codes: tuple[str, ...]) -> dict:
-    """네이버 공식 52주 최고·최저(10분마다). 일봉으로 계산한 값과 대조해서 다르면 공식값으로 고쳐요."""
-    return swr(("h52", codes), 600, lambda: data.fetch_official_52w(codes),
-               "네이버 공식 52주 최고·최저가와 대조하는 중이에요. 처음 한 번만 몇 초 걸려요.")
-
-
-def load_monthlies(codes: tuple[str, ...]):
-    """역대 최고가 계산용 월봉. 처음에도 기다리지 않아요(받는 동안은 '역대 신고가'만 잠깐 비어 있어요)."""
-    return swr(("monthly", codes), 21600, lambda: data.fetch_monthlies(codes), first_wait=False, empty={})
-
-
-@st.cache_resource
-def _shares_store():
-    return {"t": 0.0, "t_retry": 0.0, "data": {}, "kr": {}, "os": {}, "fails": {}}
-
-
-def load_shares() -> dict:
-    """상장주식수: 12시간마다 전체를 다시 받고, 빠진 종목은 10분마다 그것만 다시 시도해요(종목당 3번까지)."""
-    store = _shares_store()
-    store.setdefault("fails", {})
-    store.setdefault("t_retry", 0.0)
-    now = time.time()
-    full = now - store["t"] >= 43200
-    missing = [c for c in ALL_CODES + EXTRA_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
-    big_new = len(missing) > 200 and now - store.get("t_big", 0.0) >= 120     # 전체 종목을 막 켰을 때는 바로 받기
-    if not full and not (missing and (now - store["t_retry"] >= 600 or big_new)):
-        return store
-    if big_new:
-        store["t_big"] = now
-    kr_t = KR_CODES + EXTRA_CODES if full else tuple(c for c in missing if data.is_kr(c))
-    os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
-    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요."):
-        kr, kr_diag = data.fetch_kr_shares(kr_t) if kr_t else ({}, {})
-        os_, os_diag = data.fetch_overseas_shares(os_t) if os_t else ({}, {})
-    got = {**kr, **os_}
-    if full:
-        store["fails"] = {}
-    for c in kr_t + os_t:
-        if c not in got:
-            store["fails"][c] = store["fails"].get(c, 0) + 1
-    store["data"] = {**store["data"], **got}
-    if kr_t:
-        store["kr"] = kr_diag
-    if os_t:
-        store["os"] = os_diag
-    store["t_retry"] = now
-    if full:
-        store["t"] = now if len(kr) >= 0.8 * max(1, len(kr_t)) else now - 43200 + 600
-    return store
-
-
-def load_fx():
-    return swr(("fx",), 3600, data.fetch_fx, "환율을 불러오는 중이에요.")
-
-
-def load_indexes():
-    return swr(("indexes",), 120, data.fetch_index_histories, "지수·환율·유가를 불러오는 중이에요.")
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def load_overview():
-    return data.fetch_market_overview()
-
-
-def load_flows():
-    overview = load_overview()
-    return swr(("flows",), 300, lambda: data.fetch_investor_flows(overview), "투자자별 순매수를 불러오는 중이에요.")
-
-
-def load_trends(codes: tuple[str, ...]) -> dict:
-    """종목별 수급. data 쪽에서 종목마다 10분씩 기억해서 자동 새로고침 때는 거의 바로 나와요."""
-    with st.spinner("종목별 개인·외국인·기관 수급을 불러오는 중이에요."):
-        return data.fetch_stock_trends(codes)
-
-
-def price_chart(chart: pd.DataFrame, colors: list[str], height: int = 260):
-    """y축을 0부터 시작하지 않는 선 차트(주가·지수용)."""
-    d = chart.copy()
-    d.index.name = "날짜"
-    long = d.reset_index().melt("날짜", var_name="구분", value_name="값").dropna()
-    c = (
-        alt.Chart(long)
-        .mark_line(strokeWidth=1.7)
-        .encode(
-            x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, grid=False)),
-            y=alt.Y("값:Q", title=None, scale=alt.Scale(zero=False)),
-            color=alt.Color("구분:N", scale=alt.Scale(domain=list(chart.columns), range=colors),
-                            legend=alt.Legend(orient="bottom", title=None)),
-            tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), alt.Tooltip("구분:N"),
-                     alt.Tooltip("값:Q", format=",.2f")],
-        )
-        .properties(height=height, width="container")
-    )
-    st.altair_chart(c)
-
-
-@st.cache_data(ttl=10, show_spinner=False, max_entries=20)
-def load_quotes(codes: tuple[str, ...]):
-    return data.fetch_quotes(codes)
-
-
-NH_FILTERS = {
-    "전체": None,
-    "일봉 52주 신고가(오늘)": "nh52_d", "주봉 52주 신고가(이번 주)": "nh52_w", "월봉 52주 신고가(이번 달)": "nh52_m",
-    "일봉 역대 신고가(오늘)": "ath_d", "주봉 역대 신고가(이번 주)": "ath_w", "월봉 역대 신고가(이번 달)": "ath_m",
-}
-
-# ─────────────────────────── 사이드바 ───────────────────────────
-MARKETS = {"한국": "KR", "미국": "US", "기타": "OTHER"}
-# 산업을 큰 묶음으로 나눠 칸으로 보여줘요. 여기 없는 산업은 '기타'로 가요.
-SECTOR_CATS = [
-    ("반도체 · IT", ["반도체", "글로벌 반도체", "AI·IT", "AI 인프라(해외)", "AI 소프트웨어(해외)", "OLED", "디스플레이",
-                    "IT하드웨어", "소프트웨어·인터넷", "통신", "미디어·엔터·게임", "데이터센터 전력", "우주 데이터센터"]),
-    ("에너지 · 산업재", ["2차전지", "전력·에너지", "풍력", "전기·전자장비", "에너지·유틸리티", "조선", "방산·우주항공",
-                      "기계", "건설", "산업재", "자동차", "화학", "철강·금속", "종이·포장", "전략광물", "운송·물류", "상업서비스"]),
-    ("소비 · 바이오 · 금융", ["화장품", "음식료", "소비재", "소비자 서비스", "유통·무역", "바이오·헬스케어", "금융·지주",
-                           "부동산"]),
-    ("기타", ["기타", "기타(리포트 스크린)", "해외 기타", "기타 업종"]),
-]
-SECTOR_SHORT = {"소프트웨어·인터넷": "SW·인터넷", "미디어·엔터·게임": "엔터·게임", "에너지·유틸리티": "에너지·유틸",
-                "전기·전자장비": "전기장비", "방산·우주항공": "방산·우주", "소비자 서비스": "레저·교육",
-                "바이오·헬스케어": "바이오·헬스", "기타(리포트 스크린)": "리포트", "AI 인프라(해외)": "AI 인프라", "AI 소프트웨어(해외)": "AI SW",
-                "글로벌 반도체": "반도체", "해외 기타": "기타",
-                "바이오·헬스케어": "바이오·헬스", "데이터센터 전력": "DC 전력", "우주 데이터센터": "우주 DC"}
-
-
-def _mkt(code: str) -> str:
-    m = data.market_of(code)[0]
-    return m if m in ("KR", "US") else "OTHER"
-
-
-def _sb_head(text: str, right: str = ""):
-    st.markdown(f'<div class="sb-head"><span>{text}</span><em>{right}</em></div>', unsafe_allow_html=True)
-
-
-def _toggle_sector(key: str, sec: str | None):
-    cur = list(st.session_state.get(key, []))
-    if sec is None:
-        cur = []
-    elif sec in cur:
-        cur.remove(sec)
-    else:
-        cur.append(sec)
-    st.session_state[key] = cur
-
-
-with st.sidebar:
-    st.markdown('<div class="sb-title">보기 설정</div>', unsafe_allow_html=True)
-
-    # ① 시장
-    with st.container(border=True, key="sb_box_market"):
-        _sb_head("시장")
-        market_label = st.segmented_control("시장", list(MARKETS), default="한국", required=True,
-                                            key="sb_market2", width="stretch", label_visibility="collapsed") or "한국"
-        market = MARKETS[market_label]
-        scope_all = False
-        scope_core = False
-        if market == "KR":
-            scope = st.segmented_control("종목 범위", ["내 보드", "주요 500"] if IS_STREAMLIT_CLOUD else ["내 보드", "주요 500", "전체"],
-                                         default="주요 500" if BIG_SERVER else "내 보드", required=True,
-                                         key="sb_scope3", width="stretch",
-                                         format_func=lambda x: {"주요 500": "주요500+신고가", "전체": "전체", "내 보드": "내 보드"}[x],
-                                         help="내 보드(기본·가벼움): 공부 자료 종목만.\n"
-                                              "주요500+신고가: 시가총액 3,000억 이상 500개 + 시총이 작아도 최근 신고가 종목(작은 종목은 뒤에서 채워요).\n"
-                                              "전체: 코스피·코스닥 모두 — 서버 메모리를 많이 써서 필요할 때만 켜세요.")
-            scope_all = scope in ("주요 500", "전체")
-            scope_core = scope == "주요 500"
-    # 전체 범위: 보드에 없는 상장 종목을 '코스피 전체 / 코스닥 전체' 산업으로 붙여요(세부 분류 = 한국거래소 업종)
-    EXTRA_STOCKS = []
-    IND_MAP, IND_DIAG = {}, {}
-    if scope_all:
-        _have = {x["code"] for x in STOCKS}
-        _uni = load_universe()
-        IND_MAP, IND_DIAG = load_industry_map(tuple(sorted(u["code"] for u in _uni if u["code"] not in _have)))
-        for u in _uni:
-            if u["code"] not in _have:
-                ind = (u.get("industry") or IND_MAP.get(u["code"]) or "").strip()
-                EXTRA_STOCKS.append({
-                    "sector": data.classify_industry(ind) if ind else "기타 업종",
-                    "group": ind or f"{u['market']} 업종 확인 중",
-                    "name": u["name"], "code": u["code"],
-                    "desc": u.get("product") or (f"{ind} 업종" if ind else ""),
-                    "src": f"분류 근거: 공식 업종 '{ind}' (네이버 증권 업종 분류 · 없으면 한국거래소 업종)" if ind else
-                           "분류 근거: 업종 정보를 아직 못 받았어요",
-                    "tags": [], "notes": []})
-    STOCKS_VIEW = STOCKS + EXTRA_STOCKS
-    # 네이버 테마(2차전지·원전·방산 등 업종으로 안 나뉘는 흐름)를 '🏷️ 테마' 태그로 붙여요 — 원본 목록은 건드리지 않고 복사본에
-    THEMES = load_themes() if scope_all else {}
-    TAGS_VIEW = dict(TAGS)
-    if THEMES:
-        by_code: dict[str, list[str]] = {}
-        for tname, codes in THEMES.items():
-            tag = f"🏷️ {tname}"
-            TAGS_VIEW[tag] = codes
-            for c in codes:
-                by_code.setdefault(c, []).append(tag)
-        STOCKS_VIEW = [dict(x, tags=list(x.get("tags") or []) + by_code[x["code"]]) if x["code"] in by_code else x
-                       for x in STOCKS_VIEW]
-    EXTRA_CODES = tuple(sorted(x["code"] for x in EXTRA_STOCKS))
-    for _x in EXTRA_STOCKS:
-        if _x["sector"] not in SECTOR_ORDER:
-            SECTOR_ORDER = SECTOR_ORDER + [_x["sector"]]
-        if _x["group"] not in GROUP_ORDER:
-            GROUP_ORDER = GROUP_ORDER + [_x["group"]]
-    with st.sidebar:
-        if scope_all and EXTRA_STOCKS:
-            n_ind = sum(1 for x in EXTRA_STOCKS if x["sector"] != "기타 업종")
-            st.caption(f"보드 {len(STOCKS):,} + 상장 종목 {len(EXTRA_STOCKS):,}개 = {len(STOCKS_VIEW):,}개 · "
-                       f"업종 분류 {n_ind:,}/{len(EXTRA_STOCKS):,}"
-                       + (" (" + ", ".join(f"{k} {v:,}" for k, v in IND_DIAG.items() if v) + ")" if IND_DIAG else ""))
-            if n_ind < len(EXTRA_STOCKS) * 0.5 and st.button("업종 다시 확인하기", key="ind_retry", width="stretch"):
-                swr_clear("industry_map")
-                st.rerun()
-        elif scope_all:
-            diag = " · ".join(f"{k} {v}" for k, v in getattr(data, "UNIVERSE_DIAG", {}).items()) or "응답 없음"
-            st.warning(f"코스피·코스닥 전체 목록을 아직 못 받았어요({diag}). 지금은 내 보드 종목만 보여요. "
-                       "2분마다 자동으로 다시 시도해요.")
-            if st.button("전체 목록 다시 받기", key="uni_retry", width="stretch"):
-                _UNI_RETRY["t"] = 0.0
-                swr_clear("krx_universe")
-                st.rerun()
-    mkt_stocks = [x for x in STOCKS_VIEW if _mkt(x["code"]) == market]
-
-    # ② 산업 — 묶음별 2칸 격자. 아무것도 안 고르면 그 시장 전체
-    sector_choices = [sec for sec in SECTOR_ORDER if any(x["sector"] == sec for x in mkt_stocks)]
-    sector_choices += sorted({x["sector"] for x in mkt_stocks} - set(sector_choices))
-    sec_count = {sec: sum(x["sector"] == sec for x in mkt_stocks) for sec in sector_choices}
-    sel_key = f"sb_sel_{market}"
-    st.session_state.setdefault(sel_key, [])
-    sectors = [x for x in st.session_state[sel_key] if x in sector_choices]
-    with st.container(border=True, key="sb_box_sector"):
-        _sb_head("산업", f"{len(sectors)}개 선택" if sectors else "전체")
-        st.button(f"전체  {len(mkt_stocks)}", key=f"sb_all_{market}", width="stretch",
-                  type="primary" if not sectors else "secondary",
-                  on_click=_toggle_sector, args=(sel_key, None))
-        placed = set()
-        cats = [(nm, [x for x in secs if x in sec_count]) for nm, secs in SECTOR_CATS]
-        rest = [x for x in sector_choices if not any(x in secs for _, secs in cats)]
-        if rest:
-            cats[-1] = (cats[-1][0], cats[-1][1] + rest)
-        for cat, secs in cats:
-            if not secs:
-                continue
-            st.markdown(f'<div class="sb-cat">{cat}</div>', unsafe_allow_html=True)
-            for i in range(0, len(secs), 2):
-                cols = st.columns(2, gap="small")
-                for col, sec in zip(cols, secs[i:i + 2]):
-                    col.button(f"{SECTOR_SHORT.get(sec, sec)}  {sec_count[sec]}", key=f"sb_sec_{market}_{sec}",
-                               width="stretch", type="primary" if sec in sectors else "secondary",
-                               on_click=_toggle_sector, args=(sel_key, sec))
-    active_sectors = sectors or sector_choices
-
-    # ③ 종목 찾기 — 세부 분류 · 리포트 태그 · 검색
-    with st.container(border=True, key="sb_box_find"):
-        _sb_head("종목 찾기")
-        group_choices = [g for g in GROUP_ORDER
-                         if any(x["group"] == g and x["sector"] in active_sectors for x in mkt_stocks)]
-        group_pick = st.selectbox("세부 분류", ["전체", *group_choices], key=f"sb_group_{market}")
-        groups = [] if group_pick == "전체" else [group_pick]
-        _have_tags = {t for x in mkt_stocks for t in (x.get("tags") or [])}
-        tag_choices = [t for t in TAGS_VIEW if t in _have_tags]
-        tags = st.multiselect("리포트 · 테마 태그", tag_choices, placeholder="선택 안 함 (예: 2차전지, 원자력)", key=f"sb_tags_{market}",
-                              help="📥·리포트 태그 = 공부 자료, 🏷️ = 네이버 테마. 고르면 위의 산업·분류와 관계없이 그 태그 종목만 보여줘요.")
-        query = st.text_input("종목 검색", placeholder="이름이나 코드", key="sb_query")
-
-    # ④ 조건 필터 — 평소엔 접어 둬요
-    with st.expander("📐 조건 필터", expanded=False):
-        max_drop = st.slider("52주 최고가에서 몇 % 이내만 볼까요", 0, 90, 90, step=5,
-                             help="10으로 두면 최고가 대비 -10% 이내 종목만 보여줘요. 90이면 전체.")
-        min_rs = st.slider("종합 RS 이상", 0, 99, 0, step=5, help="0이면 전체. 70으로 두면 RS 70 이상만")
-        nh_filter = st.selectbox("신고가 봉 필터", list(NH_FILTERS), index=0,
-                                 help="지금 봉(오늘 일봉·이번 주 주봉·이번 달 월봉)의 고가가 52주 또는 역대(상장 이후) 최고가를 넘은 종목만")
-        show_halted = st.toggle("거래정지 종목도 보기", value=False,
-                                help="최근 5거래일 동안 거래가 한 주도 없는 종목(거래정지·상장폐지 절차 등)은 가격이 멈춰 있어서 "
-                                     "'신고가까지 0%'처럼 보여요. 기본으로 빼 두고, 켜면 '⛔ 거래정지'로 표시해서 보여줘요.")
-        only_aligned = st.toggle("정배열 종목만", help="현재가 > 20일선 > 60일선 > 120일선")
-        only_holding = st.toggle("신고가 돌파 유지 종목만",
-                                 help="직전 52주 최고가를 종가로 돌파한 뒤 한 번도 그 아래에서 마감하지 않은 종목만")
-        only_earn = st.toggle("영업이익·EPS 정배열만",
-                              help="최근 실적 연도부터 컨센서스(E)까지 영업이익과 EPS가 해마다 모두 증가한 국내 종목만. "
-                                   "전망(E)이 없는 종목·적자 종목·해외 종목은 빠져요. 처음 켤 때 종목 수에 따라 30초~1분 걸려요.")
-        earn_years = st.radio("실적 정배열 판정: 최근 실적 몇 년부터", [2, 3], index=1, horizontal=True,
-                              format_func=lambda n: f"{n}년 + 전망(E)")
-        show_flow = st.toggle("종목별 수급 열 보기", value=True, disabled=(market != "KR"),
-                              help="국내 종목의 최근 거래일 개인·외국인·기관 순매수(억원, 종가로 환산한 추정치)와 5일 누적을 표에 붙여요. "
-                                   "보고 있는 종목 중 앞쪽 150개까지만 불러와요.")
-        show_flow = show_flow and market == "KR"   # 해외는 수급 자료가 없어서 열을 숨겨요
-
-    with st.expander("🧭 주도섹터 기준", expanded=False):
-        recent_days = st.slider("신고가로 인정할 기간(거래일)", 1, 20, 5)
-        min_count = st.slider("분류 안 신고가 종목 수", 2, 5, 2)
-
-    bo_mode = "line"   # 돌파선 = 돌파한 날 넘어선 직전 52주 최고가
-
-    st.divider()
-    refresh_label = st.segmented_control("자동 새로고침", list(REFRESH), default="1분", required=True,
-                                         key="sb_refresh", width="stretch") or "1분"
-    b1, b2 = st.columns(2)
-    if b1.button("시세 새로고침", width="stretch"):
-        load_quotes.clear()
-    if b2.button("일봉 다시 받기", width="stretch", help="52주 최고가가 이상해 보일 때 눌러요."):
-        swr_clear("hist_kr", "hist_os", "monthly")
-        _shares_store().update(t=0.0, ok=False)
-        load_quotes.clear()
-
-
-# ─────────────────────────── 화면 조각 ───────────────────────────
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    df = df[df["code"].map(_mkt) == market]
-    if "halted" in df and not show_halted:
-        df = df[df["halted"] != True]  # noqa: E712
-    if tags:
-        f = df[df["tags"].apply(lambda ts: any(t in ts for t in tags))]
-    else:
-        f = df[df["sector"].isin(active_sectors)]
-        if groups:
-            f = f[f["group"].isin(groups)]
-    if query.strip():
-        q = query.strip().lower()
-        f = f[f["name"].str.lower().str.contains(q, regex=False) | f["code"].str.contains(q, regex=False)]
-    if max_drop < 90:
-        f = f[f["gap"].notna() & (f["gap"] >= -max_drop)]
-    if only_aligned:
-        f = f[f["aligned"] == True]  # noqa: E712
-    if only_holding:
-        f = f[f["bo_status"] == "유지"]
-    if NH_FILTERS[nh_filter]:
-        f = f[f[NH_FILTERS[nh_filter]] == True]  # noqa: E712
-    if min_rs > 0:
-        f = f[f["rs"].notna() & (f["rs"] >= min_rs)]
-    return f.sort_values("gap", ascending=False, na_position="last")
-
-
-def _sign_color(v) -> str:
-    if v is None or pd.isna(v) or v == 0:
-        return "#51616C"
-    return UP if v > 0 else DOWN
-
-
-def _flow_cell(v, digits: int = 0) -> str:
-    if v is None or pd.isna(v):
+    return core.market_regime(df, index_name)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fund(code: str, market: str):
+    return core.fundamentals_kr(code) if market == "KR" else core.fundamentals_us(code)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def flows(code: str, market: str):
+    return core.flows_kr(code) if market == "KR" else None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def auto_sector(code: str, market: str):
+    if market != "KR":
+        return "미국 주식"
+    return core.sector_kr(code)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def reports(code: str):
+    return core.reports_kr(code)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def news(code: str):
+    return core.news_kr(code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fx_rate():
+    return core.fetch_fx()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def search(q: str):
+    return core.search_kr(q)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def equity_curve_cached(book_json: str, fx: float):
+    b = json.loads(book_json)
+    try:
+        return core.equity_curve(b, hist, fx)
+    except Exception:
+        return None
+
+
+def fmt(v, market="KR"):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
         return "-"
-    return f'<span style="color:{_sign_color(v)}">{v:+,.{digits}f}</span>'
+    return f"{v:,.0f}" if market == "KR" else f"{v:,.2f}"
 
 
-def _eok(v) -> str:
-    """억원 값 → '+5,473억' / '-1.2조'."""
-    if v is None or pd.isna(v):
-        return "-"
-    return f"{v / 1e4:+,.2f}조" if abs(v) >= 1e4 else f"{v:+,.0f}억"
+def won(v):
+    return f"{v:,.0f}원"
 
 
-def _market_card(name: str, sm: dict | None, hist_sm: dict | None) -> str:
-    """네이버 증권 첫 화면처럼: 지수, 등락률·전일대비, 상승/보합/하락 막대, 투자자별 순매수."""
-    sm = sm or {}
-    last = sm.get("last") if sm.get("last") is not None else (hist_sm or {}).get("last")
-    if last is None:
-        return f'<div class="mk"><div class="mk-name">{name}</div><div class="idx-err">불러오지 못했어요</div></div>'
-    rate = sm.get("rate") if sm.get("rate") is not None else (hist_sm or {}).get("change")
-    diff = sm.get("diff")
-    if diff is None and hist_sm and hist_sm.get("change") is not None:
-        diff = last - last / (1 + hist_sm["change"] / 100)
-    color = _sign_color(rate)
-    arrow = "▲" if (diff or 0) > 0 else ("▼" if (diff or 0) < 0 else "")
-    chg = (f'<span class="mk-chg" style="color:{color}">{rate:+.2f}% '
-           f'<span style="font-weight:600">{arrow}{abs(diff):,.2f}</span></span>') if rate is not None and diff is not None else ""
-    badge = ""
-    if hist_sm and hist_sm.get("above60") is not None:
-        cls, word = ("on", "위") if hist_sm["above60"] else ("off", "아래")
-        badge = f'<small><span class="idx-badge {cls}" style="margin:0">60일선 {word} {hist_sm["dist60"]:+.1f}%</span></small>'
-    html_ = f'<div class="mk"><div class="mk-name">{name}{badge}</div><span class="mk-val">{last:,.2f}</span>{chg}'
-    b = sm.get("breadth")
-    if b:
-        up = (b.get("상승") or 0) + (b.get("상한") or 0)
-        flat = b.get("보합") or 0
-        down = (b.get("하락") or 0) + (b.get("하한") or 0)
-        tot = max(1.0, up + flat + down)
-        html_ += (f'<div class="mk-bar"><i style="width:{up / tot * 100:.1f}%;background:#EF7A80"></i>'
-                  f'<i style="width:{flat / tot * 100:.1f}%;background:#C9D1D6"></i>'
-                  f'<i style="width:{down / tot * 100:.1f}%;background:#6FA0E6"></i></div>'
-                  f'<div class="mk-cnt"><span class="u">↗{up:,.0f}</span><span>{flat:,.0f}</span>'
-                  f'<span class="d">↘{down:,.0f}</span></div>')
-    d = sm.get("deal")
-    if d:
-        cells = "".join(f'<span>{k} <b style="color:{_sign_color(d.get(k))}">{_eok(d.get(k))}</b></span>'
-                        for k in ("외국인", "기관", "개인"))
-        html_ += f'<div class="mk-sub">{cells}</div>'
-    return html_ + "</div>"
-
-
-def _mood_card(overview: dict) -> str:
-    mood = data.market_mood(overview)
-    label, ratio = mood if mood else ("-", 0.5)
-    tot = {k: 0.0 for k in data.INVESTORS}
-    got = False
-    for sm in overview.values():
-        d = (sm or {}).get("deal") or {}
-        for k in data.INVESTORS:
-            if d.get(k) is not None:
-                tot[k] += d[k]
-                got = True
-    rows = ""
-    if got:
-        mx = max(1.0, max(abs(v) for v in tot.values()))
-        for k in ("외국인", "기관", "개인"):
-            v = tot[k]
-            w = abs(v) / mx * 50
-            pos = f"left:50%;width:{w:.1f}%" if v >= 0 else f"left:{50 - w:.1f}%;width:{w:.1f}%"
-            rows += (f'<div class="mood-row"><span>{k}</span><span class="bar"><i style="{pos};background:{_sign_color(v)}"></i></span>'
-                     f'<b style="color:{_sign_color(v)}">{_eok(v)}</b></div>')
-    else:
-        rows = '<div class="mood-note">투자자별 순매수를 불러오지 못했어요.</div>'
-    return (f'<div class="mood"><div class="mood-top"><span><span class="dot"></span>오늘의 시장</span>'
-            f'<span class="lbl">{label}</span></div>'
-            f'<div class="mood-gauge"><i style="left:{ratio * 100:.0f}%"></i></div>{rows}'
-            f'<div class="mood-note">분위기는 코스피·코스닥 상승 종목 비율({ratio * 100:.0f}%) 기준, 순매수는 두 시장 합계예요.</div></div>')
-
-
-def render_flows():
-    """시장별 개인·외국인·기관 순매수(억원) + 기관 세부(연기금·투신 등)와 20일 추이."""
-    flows = load_flows()
-    latest = [df["date"].iloc[-1] for df in flows.values() if not df.empty]
-    if not latest:
-        st.caption("시장 전체 투자자별 일별 추이를 불러오지 못했어요. 잠시 뒤 자동으로 다시 시도해요.")
-        return
-    with st.expander(f"💰 투자자별 순매수 · 연기금·투신 ({max(latest):%m/%d}, 억원)"):
-        cols = data.INVESTORS + data.INST_DETAIL
-        head = "".join(f"<th>{c}</th>" for c in cols)
-        body = ""
-        for market, df in flows.items():
-            if df.empty:
-                continue
-            last = df.iloc[-1]
-            cum5 = df.tail(5)[cols].sum(min_count=1)
-            body += f"<tr><td>{market} <small>{last['date']:%m/%d}</small></td>" + "".join(
-                f"<td>{_flow_cell(last[c])}</td>" for c in cols) + "</tr>"
-            body += f"<tr><td style='color:#8A979F'>{market} 5일</td>" + "".join(
-                f"<td>{_flow_cell(cum5[c])}</td>" for c in cols) + "</tr>"
-        st.markdown(f'<div style="overflow-x:auto"><table class="inst"><tr><th></th>{head}</tr>{body}</table></div>',
-                    unsafe_allow_html=True)
-        tabs = st.tabs(list(flows))
-        for tab, (market, df) in zip(tabs, flows.items()):
-            with tab:
-                if df.empty:
-                    st.caption("데이터를 불러오지 못했어요.")
-                    continue
-                pick = st.radio("보기", ["개인·외국인·기관", "기관 세부"], horizontal=True, key=f"flowpick_{market}",
-                                label_visibility="collapsed")
-                series = data.INVESTORS if pick == "개인·외국인·기관" else data.INST_DETAIL
-                sub = df.tail(20).dropna(axis=1, how="all")
-                series = [c for c in series if c in sub.columns]
-                if not series:
-                    st.caption("기관 세부는 새 네이버 API에서만 받아와요. 지금은 불러오지 못했어요.")
-                    continue
-                long = sub.melt("date", value_vars=series, var_name="투자자", value_name="순매수")
-                palette = ["#9AA9B3", "#2E6B6F", "#F2B134"] if len(series) == 3 else \
-                    ["#2E6B6F", "#7FA7A3", "#F2B134", "#9AA9B3", "#C77D4B", "#D6333B", "#51616C"]
-                chart = (
-                    alt.Chart(long).mark_bar()
-                    .encode(
-                        x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False)),
-                        xOffset=alt.XOffset("투자자:N", sort=series),
-                        y=alt.Y("순매수:Q", title="억원"),
-                        color=alt.Color("투자자:N", sort=series, scale=alt.Scale(domain=series, range=palette[:len(series)]),
-                                        legend=alt.Legend(orient="bottom", title=None)),
-                        tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "투자자:N", alt.Tooltip("순매수:Q", format="+,.0f")],
-                    )
-                    .properties(height=240, width="container")
-                )
-                st.altair_chart(chart)
-        st.caption("네이버 증권 투자자별 매매동향 기준. 기관 = 금융투자+보험+투신(사모)+은행+기타금융+연기금이고, "
-                   "기타법인은 기관에 넣지 않아요. 장중 값은 잠정치예요.")
-
-
-def _light(sig: dict | None) -> str:
-    """G·Y·R 세 칸 신호등. 켜진 칸에만 색과 글자."""
-    on = sig["code"] if sig else None
-    return '<span class="tl">' + "".join(
-        f'<i class="{c}">{c}</i>' if c == on else "<i></i>" for c in ("G", "Y", "R")) + "</span>"
-
-
-def _sig_item(label: str, sig: dict | None, n: int) -> str:
-    if not sig:
-        return f'<span class="sig-item">{label} {_light(None)} <span>-</span></span>'
-    slope = "상승" if sig["rising"] else "하락"
-    return (f'<span class="sig-item" title="{n}일선 {sig["ma"]:,.2f}, {n}일선 기울기 {slope}">{label} {_light(sig)} '
-            f'<span class="sig-txt {sig["code"]}">{sig["text"]}</span>'
-            f'<span>{n}일선 {sig["dist"]:+.1f}%</span></span>')
-
-
-def _signal_panel(hist: dict, board: pd.DataFrame | None) -> str:
-    """시장신호: 코스피·코스닥 단기(20일선)·장기(60일선) 신호등 + 지수 RS."""
-    cells = ""
-    for name, sym in data.MARKETS.items():
-        df = hist.get(sym, (data.empty_frame(), None))[0]
-        s20, s60 = data.ma_signal(df, 20), data.ma_signal(df, 60)
-        rs = data.index_rs(df, board) if board is not None else {}
-        n = lambda v: "-" if v is None else f"{v:.0f}"  # noqa: E731
-        cells += (f'<div class="sig-mk"><span class="sig-name">{name}</span>'
-                  f'{_sig_item("단기", s20, 20)}{_sig_item("장기", s60, 60)}'
-                  f'<span class="sig-rs">RS <b>{n(rs.get("rs"))}</b> · 1M {n(rs.get("rs_1m"))} · '
-                  f'3M {n(rs.get("rs_3m"))} · 6M {n(rs.get("rs_6m"))}</span></div>')
-    return f'<div class="sig">{cells}</div>'
-
-
-def load_turnover_hist() -> dict:
-    return swr(("turnover",), 1800, data.fetch_market_turnover_hist, first_wait=False, empty={})
-
-
-def _shares_txt(v) -> str:
-    if v is None or pd.isna(v):
-        return "-"
-    return f"{v / 1e8:,.2f}억주" if v >= 1e8 else f"{v / 1e4:,.0f}만주"
-
-
-def _money_txt(v) -> str:
-    return "-" if v is None or pd.isna(v) else data.format_krw(v)
-
-
-def _ratio_cell(x) -> str:
-    if x is None or pd.isna(x):
-        return '<td class="tv-x">-</td>'
-    pct = (x - 1) * 100
-    col = UP if pct >= 10 else (DOWN if pct <= -10 else "#51616C")
-    word = "많음" if pct >= 10 else ("적음" if pct <= -10 else "비슷")
-    w = max(4, min(100, x / 2 * 100))
-    return (f'<td class="tv-x"><div class="tv-bar"><i style="width:{w:.0f}%;background:{col}"></i><b></b></div>'
-            f'<span style="color:{col}">{x:.2f}배 · {pct:+.0f}% {word}</span></td>')
-
-
-def _pct_cell(v) -> str:
-    if v is None or pd.isna(v):
-        return "<td>-</td>"
-    col = UP if v >= 10 else (DOWN if v <= -10 else "#51616C")
-    return f'<td style="color:{col};font-weight:700">{v:+.0f}%</td>'
-
-
-def render_turnover(overview: dict):
-    """코스피·코스닥 오늘 거래대금·거래량(실시간)과 평소(5·20·60일 평균) 대비."""
-    hist = load_turnover_hist()
-    if not hist:
-        st.caption("코스피·코스닥 거래대금 평균을 불러오는 중이에요. 잠시 뒤 새로고침하면 나와요.")
-        return
-    res = {m: data.market_turnover(hist.get(m), overview.get(m)) for m in data.MARKETS}
-    res = {m: r for m, r in res.items() if r}
-    if not res:
-        st.caption("코스피·코스닥 거래대금 자료를 받지 못했어요.")
-        return
-    any_r = next(iter(res.values()))
-    frac, is_open = any_r["frac"], any_r["open"]
-    when = f"장 진행 {frac * 100:.0f}% · 실시간" if is_open else "장 마감 기준(오늘 또는 마지막 거래일)"
-
-    # 요약 카드: 시장별 오늘 거래대금
-    chips = []
-    for m, r in res.items():
-        v = r["val"]
-        x = v["x_now"]
-        col = UP if (x or 1) >= 1.1 else (DOWN if (x or 1) <= 0.9 else "#51616C")
-        chips.append(
-            f'<div class="tv-chip"><div class="tv-chip-h">{m} 거래대금</div>'
-            f'<div class="tv-chip-v">{_money_txt(v["now"])}<small>원</small></div>'
-            f'<div class="tv-chip-s" style="color:{col}">{"이 시각 평소" if is_open else "20일 평균"}의 '
-            f'{(x if is_open else (v["now"] / v["a20"] if v["now"] else float("nan"))):.2f}배</div>'
-            f'<div class="tv-chip-f">마감 예상 {_money_txt(v["proj"])} · 20일 평균 {_money_txt(v["a20"])}</div></div>')
-    tot_now = sum((r["val"]["now"] or 0) for r in res.values())
-    tot_same = sum(r["val"]["same_time"] for r in res.values())
-    chips.append(
-        f'<div class="tv-chip tot"><div class="tv-chip-h">두 시장 합계</div>'
-        f'<div class="tv-chip-v">{_money_txt(tot_now)}<small>원</small></div>'
-        f'<div class="tv-chip-s">{"이 시각 평소" if is_open else "20일 평균"}의 {tot_now / tot_same if tot_same else float("nan"):.2f}배</div>'
-        f'<div class="tv-chip-f">{when}</div></div>')
-
-    rows = []
-    for m, r in res.items():
-        for key, lab, fmt in (("val", "거래대금", _money_txt), ("vol", "거래량", _shares_txt)):
-            v = r[key]
-            rows.append(
-                f'<tr><td class="l"><b>{m}</b></td><td class="l">{lab}</td>'
-                f'<td class="now">{fmt(v["now"])}</td><td>{fmt(v["same_time"]) if is_open else "-"}</td>'
-                f'{_ratio_cell(v["x_now"] if is_open else (v["now"] / v["a20"] if v["now"] else None))}'
-                f'<td>{fmt(v["proj"]) if is_open else fmt(v["now"])}</td>'
-                f'<td>{fmt(v["a5"])}</td><td>{fmt(v["a20"])}</td><td>{fmt(v["a60"])}</td>'
-                f'{_pct_cell(v["vs5"])}{_pct_cell(v["vs20"])}{_pct_cell(v["vs60"])}</tr>')
-    head = ("<tr><th class='l'>시장</th><th class='l'>항목</th><th>오늘 지금까지</th><th>같은 시각 평소</th>"
-            "<th>평소 대비</th><th>마감 예상</th><th>5일 평균</th><th>20일 평균</th><th>60일 평균</th>"
-            "<th>예상 vs 5일</th><th>예상 vs 20일</th><th>예상 vs 60일</th></tr>")
-    st.markdown(
-        f'<div class="tv-box"><div class="tv-title"><b>💵 코스피 · 코스닥 거래대금 · 거래량</b><span>{when}</span></div>'
-        f'<div class="tv-chips">{"".join(chips)}</div>'
-        f'<div class="tv-wrap"><table class="tv-tbl"><thead>{head}</thead><tbody>{"".join(rows)}</tbody></table></div>'
-        f'<div class="tv-note">같은 시각 평소 = 20일 평균 × 장 진행 비율 · 마감 예상 = 지금 속도 그대로 15:30까지 갔을 때 · '
-        f'장 초반·막판은 거래가 몰려서 예상이 크게 나올 수 있어요 · 평균은 30분마다, 오늘 값은 새로고침마다 갱신</div></div>',
-        unsafe_allow_html=True)
-
-
-def render_market(board: pd.DataFrame | None = None):
-    """맨 위 시장 요약: 시장신호(신호등·지수 RS) → 코스피·코스닥 카드 + 오늘의 시장 → 해외 지수·환율·유가."""
-    overview = load_overview()
-    hist = load_indexes()
-    st.markdown(_signal_panel(hist, board), unsafe_allow_html=True)
-    hist_sm = {idx["name"]: data.index_summary(hist.get(idx["symbol"], (data.empty_frame(), None))[0])
-               for idx in data.INDEXES}
-    cards = "".join(_market_card(name, overview.get(name), hist_sm.get(name)) for name in data.MARKETS)
-    st.markdown(f'<div class="mk-row">{cards}{_mood_card(overview)}</div>', unsafe_allow_html=True)
-    render_turnover(overview)
-
-    chips = []
-    for idx in data.INDEXES:
-        if idx["name"] in data.MARKETS:
-            continue
-        sm = hist_sm.get(idx["name"])
-        if not sm:
-            chips.append(f'<div class="idx"><div class="idx-name">{idx["name"]}</div>'
-                         f'<div class="idx-err">불러오지 못했어요</div></div>')
-            continue
-        color = _sign_color(sm["change"])
-        if idx.get("kind", "index") == "index":
-            if sm["above60"] is None:
-                badge = ""
-            elif sm["above60"]:
-                badge = f'<span class="idx-badge on">60일선 위 {sm["dist60"]:+.1f}%</span>'
-            else:
-                badge = f'<span class="idx-badge off">60일선 아래 {sm["dist60"]:+.1f}%</span>'
-        else:
-            badge = (f'<span class="idx-badge neutral">20일 {sm["chg20"]:+.1f}%</span>'
-                     if sm.get("chg20") is not None else "")
-        chips.append(
-            f'<div class="idx"><div class="idx-name">{idx["name"]}<small>{sm["date"]:%m/%d}</small></div>'
-            f'<span class="idx-val">{idx.get("unit", "")}{sm["last"]:,.2f}</span>'
-            f'<span class="idx-chg" style="color:{color}">{sm["change"]:+.2f}%</span><br>{badge}</div>'
-        )
-    with st.expander("🌐 해외 지수 · 환율 · 유가 · 차트"):
-        st.markdown('<div class="idx-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
-        tabs = st.tabs([i["name"] for i in data.INDEXES])
-        for tab, idx in zip(tabs, data.INDEXES):
-            with tab:
-                df, _err = hist.get(idx["symbol"], (data.empty_frame(), None))
-                if df.empty:
-                    st.caption("지수 데이터를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
-                    continue
-                h = df.set_index("date")["close"].astype(float)
-                chart = pd.DataFrame({idx["name"]: h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
-                price_chart(chart, ["#16212B", "#2E6B6F", "#F2B134"], height=240)
-        st.caption("시장신호: 단기 20일선 · 장기 60일선 — 🟢 선 위 + 선 상승 · 🟡 하나만 · 🔴 선 아래 + 선 하락. "
-                   "지수 RS = 보드 종목과 같은 잣대의 1~99. 해외는 야후(15분 지연), 유가는 근월물.")
-    render_flows()
-
-
-def _chip_leader(df: pd.DataFrame, group: str) -> str:
-    top = df[(df["group"] == group) & (df["lead_rank"] == 1) & (df["lead_ok"] == True)]  # noqa: E712
-    if top.empty:
-        return ""
-    return f'<b style="color:#F2B134">👑 대장 {html.escape(top["name"].iloc[0])}</b><br>'
-
-
-def render_radar(df: pd.DataFrame):
-    leaders = data.leading_groups(df, recent_days, min_count)
-    if leaders:
-        body = "".join(
-            f'<div class="chip"><div class="chip-top">'
-            f'<span class="chip-group">{html.escape(g)}</span>'
-            f'<span class="chip-count">{len(sub)}<small>종목</small></span></div>'
-            f'<div class="chip-names">{_chip_leader(df, g)}{html.escape(", ".join(sub["name"]))}</div></div>'
-            for g, sub in leaders
-        )
-    else:
-        body = ('<div class="radar-empty">지금은 조건에 맞는 분류가 없어요. '
-                '왼쪽에서 신고가 인정 기간을 늘리거나 종목 수 기준을 낮춰 보세요.</div>')
-    st.markdown(
-        f'<div class="radar"><div class="radar-title">주도섹터 레이더</div>'
-        f'<div class="radar-rule">최근 {recent_days}거래일 52주 신고가 {min_count}종목 이상</div>'
-        f'<div class="chips">{body}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def fmt_vol(v) -> str:
-    """거래량 → '449만' / '3.5만' / '1.2억' / '8,512'."""
-    if v is None or pd.isna(v):
-        return "-"
-    if v >= 1e8:
-        return f"{v / 1e8:,.1f}억"
-    if v >= 1e5:
-        return f"{v / 1e4:,.0f}만"
-    if v >= 1e4:
-        return f"{v / 1e4:,.1f}만"
-    return f"{v:,.0f}"
-
-
-def _x_color(v) -> str:
-    if v is None or pd.isna(v):
-        return ""
-    if v >= 2:
-        return f"color: {UP}; font-weight: 800"
-    if v >= 1.3:
-        return f"color: {UP}; font-weight: 600"
-    if v < 0.7:
-        return f"color: {DOWN}"
-    return ""
-
-
-def _eok_num(v) -> str:
-    """억원 값: 10억 미만은 소수 첫째 자리까지."""
-    if v is None or pd.isna(v):
-        return "-"
-    return f"{v:+,.1f}" if abs(v) < 10 else f"{v:+,.0f}"
-
-
-FLOW_HELP = ("네이버 종목별 투자자 매매동향의 순매수 수량 × 그날 종가로 환산한 추정 금액(억원). "
-             "최근 거래일 값이고, 장중에는 전 거래일 값일 수 있어요. 5일은 최근 5거래일 합계예요.")
-
-
-RS_HELP = ("종합 RS(1~99). 오닐 방식 가중 수익률(3개월 40% + 6·9·12개월 각 20%)을 보드 안 국내 종목끼리 순위 매긴 백분위. "
-           "해외 종목은 해외 종목끼리. 전 종목 기준 사이트 RS와는 숫자가 다를 수 있어요")
-
-
-def _bo_text(r) -> str | None:
-    if r.get("bo_status") in ("유지", "이탈"):
-        return f"{r['bo_status']} {int(r['bo_days'])}일"
-    return None
-
-
-def _bo_full(r) -> str:
-    """돌파 상태 한 줄: '⭐ 첫 돌파 3일째' / '2번째 돌파 5일째' / '미돌파 · 이탈 4일'."""
-    get = r.get if isinstance(r, dict) else (lambda k, d=None: getattr(r, k, d))
-    st_, days, nth = get("bo_status"), get("bo_days"), get("bo_nth")
-    if days is None or pd.isna(days):
-        return "-"
-    if st_ == "유지":
-        if nth is not None and not pd.isna(nth) and int(nth) > 1:
-            return f"{int(nth)}번째 돌파 {int(days)}일째"
-        return f"⭐ 첫 돌파 {int(days)}일째"
-    if st_ == "이탈":
-        return f"미돌파 · 이탈 {int(days)}일"
-    return "-"
-
-
-BO_FULL_HELP = ("⭐ 첫 돌파 N일째 = 최근 52주 안에서 처음으로 종가가 직전 52주 최고가를 넘은 뒤 N거래일째(돌파일 = 1일째), "
-                "그 뒤 한 번도 그 가격 아래에서 마감하지 않음. 2번째 돌파 = 52주 안에 한 번 돌파했다가 밀린 뒤 다시 돌파. "
-                "미돌파 · 이탈 N일 = 지금의 52주 최고가 아래에서 마감한 지 N거래일")
-
-
-def _bo_color(v):
-    if not isinstance(v, str):
-        return ""
-    if v.startswith("⭐"):
-        return f"color: {UP}; font-weight: 800"
-    if "번째 돌파" in v:
-        return f"color: {UP}; font-weight: 600"
-    if v.startswith("미돌파"):
-        return "color: #6B7A84"
-    return ""
-
-
-def _to_high_color(v):
-    """신고가까지 남은 %: 3% 이내 진하게, 10% 이내 주황."""
-    if v is None or pd.isna(v):
-        return ""
-    if v <= 3:
-        return f"color: {UP}; font-weight: 800"
-    if v <= 10:
-        return "color: #C27C0E; font-weight: 700"
-    return ""
-
-
-def _nh_text(r, kind: str) -> str | None:
-    """지금 봉이 신고가인 봉만 모아서 '일·주·월'처럼. 아무것도 아니면 None."""
-    hit = [lab for k, lab in (("d", "일"), ("w", "주"), ("m", "월")) if r.get(f"{kind}_{k}") == True]  # noqa: E712
-    return "·".join(hit) if hit else None
-
-
-def _rs_color(v):
-    if pd.isna(v):
-        return ""
-    if v >= 80:
-        return f"color: {UP}; font-weight: 600"
-    if v < 40:
-        return f"color: {DOWN}"
-    return ""
-
-
-def render_table(f: pd.DataFrame):
-    view = pd.DataFrame({
-        "종목": [("⛔ " if h is True else "") + ("🥇 " if sf is True else "") + n
-               for n, h, sf in zip(f["name"], f["halted"] if "halted" in f else [None] * len(f),
-                                   f["sector_first"] if "sector_first" in f else [None] * len(f))],
-        "코드": f["code"],
-        "시장": f["market"],
-        "분류": f["group"],
-        "통화": f["currency"].map(lambda c: UNIT.get(c, c)),
-        "현재가": f["price"],
-        "시가총액(원)": f["cap_krw"],
-        "등락률": f["change"],
-        "거래량": f.get("vol_live"),
-        "거래대금": f.get("tv_live"),
-        "평소 대비": f.get("tv_x"),
-        **({"외국인(억원)": f["flow_외국인"], "기관(억원)": f["flow_기관"], "개인(억원)": f["flow_개인"],
-            "외국인 5일(억원)": f["flow5_외국인"], "기관 5일(억원)": f["flow5_기관"],
-            "개인 5일(억원)": f["flow5_개인"]} if show_flow else {}),
-        "52주 최고": f["high52"],
-        "괴리율": f["gap"],
-        "신고가까지": f["to_high"],
-        "52주 위치": f["pos"],
-        "신고가 후": f["days_since_high"],
-        "돌파": f.apply(_bo_full, axis=1),
-        "52주 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "nh52"), axis=1),
-        "역대 신고가(일·주·월)": f.apply(lambda r: _nh_text(r, "ath"), axis=1),
-        "섹터 순위": f.apply(lambda r: "-" if pd.isna(r["lead_rank"]) else
-                         (f"👑 1/{int(r['lead_n'])}" if r["lead_rank"] == 1 and r["lead_ok"] else f"{int(r['lead_rank'])}/{int(r['lead_n'])}"), axis=1),
-        "RS": f["rs"],
-        "RS(1M)": f["rs_1m"],
-        "RS(3M)": f["rs_3m"],
-        "RS(6M)": f["rs_6m"],
-        "ATR%(20일)": f["atr_pct"],
-        "정배열": f["aligned"],
-        "설명": f["desc"],
-    })
-
-    simple = st.toggle("간단히 보기", key="tbl_simple", help="꼭 볼 열만: 신고가까지 · 돌파 · RS · 섹터 순위 · 5일 수급")
-    if simple:
-        keep = ["종목", "현재가", "등락률", "거래량", "평소 대비", "신고가까지", "돌파", "RS", "섹터 순위", "분류", "시가총액(원)",
-                "외국인 5일(억원)", "기관 5일(억원)", "52주 위치"]
-        view = view[[c for c in keep if c in view.columns]]
-    hot_mask = (pd.to_numeric(f["days_since_high"], errors="coerce") <= recent_days).values
-    whole_rows = view.index[f["currency"].isin(["KRW", "JPY"]).values]
-    flow_cols = [c for c in view.columns if c.endswith("(억원)")]
-    for c in flow_cols:
-        view[c] = pd.to_numeric(view[c], errors="coerce")
-
-    def color_sign(v):
-        if pd.isna(v) or v == 0:
-            return ""
-        return f"color: {UP}; font-weight: 600" if v > 0 else f"color: {DOWN}; font-weight: 600"
-
-    pos_of = {ix: i for i, ix in enumerate(view.index)}
-
-    def mark_new_high(row):
-        hit = bool(hot_mask[pos_of[row.name]])
-        return [f"background-color: {NEW_HIGH_BG}" if hit else ""] * len(row)
-
-    _fmt = {
-            "현재가": "{:,.2f}", "52주 최고": "{:,.2f}",
-            "등락률": "{:+.2f}%", "괴리율": "{:.1f}%", "신고가까지": "{:+.1f}%",
-            "시가총액(원)": data.format_krw,
-            "신고가 후": "{:.0f}일", "52주 위치": "{:.0f}",
-            "RS": "{:.0f}", "RS(1M)": "{:.0f}", "RS(3M)": "{:.0f}", "RS(6M)": "{:.0f}",
-            "ATR%(20일)": "{:.1f}%",
-            "거래량": fmt_vol, "거래대금": data.format_krw, "평소 대비": "{:.1f}배",
-        }
-    styled = (
-        view.style
-        .format({k: v for k, v in _fmt.items() if k in view.columns}, na_rep="-")
-        .format("{:,.0f}", subset=pd.IndexSlice[whole_rows, [c for c in ("현재가", "52주 최고") if c in view.columns]], na_rep="-")
-        .format(_eok_num, subset=flow_cols, na_rep="-")
-        .map(color_sign, subset=["등락률"] + flow_cols)
-        .map(lambda _: "font-weight: 600", subset=["종목", "RS"])
-        .map(_rs_color, subset=[c for c in ("RS", "RS(1M)", "RS(3M)", "RS(6M)") if c in view.columns])
-        .map(_bo_color, subset=["돌파"])
-        .map(_to_high_color, subset=["신고가까지"])
-        .map(_x_color, subset=[c for c in ("평소 대비",) if c in view.columns])
-        .map(lambda v: f"color: {UP}; font-weight: 700" if isinstance(v, str) else "",
-             subset=[c for c in ("52주 신고가(일·주·월)", "역대 신고가(일·주·월)") if c in view.columns])
-        .apply(mark_new_high, axis=1)
-    )
-    codes_in_view = list(f["code"])
-
-    def _pick_row():
-        """한 번 누르면 아래 자세히 보기, 같은 종목을 한 번 더 누르면 🕯️ 차트 탭으로."""
-        sel = st.session_state.get("list_table")
-        rows = getattr(getattr(sel, "selection", None), "rows", None) or (sel or {}).get("selection", {}).get("rows", [])
-        now = time.time()
-        last = st.session_state.get("_list_last")
-        code = codes_in_view[rows[0]] if rows and rows[0] < len(codes_in_view) else None
-        # 선택된 줄을 한 번 더 누르면 선택이 풀리면서 여기로 와요 → 그게 '두 번 누르기'. (앱이 계산 중이면 늦게 올 수 있어서 넉넉히 30초)
-        again = last is not None and now - last[1] < 30 and (code is None or code == last[0])
-        if again:
-            st.session_state["chart_code"] = last[0]
-            st.session_state["main_tab_sel"] = "🕯️ 차트"
-            st.session_state.pop("_list_last", None)
-            return
-        if code:
-            st.session_state["detail_code"] = code
-            st.session_state["chart_code"] = code
-            st.session_state["_list_last"] = (code, now)
-
-    st.caption("👆 종목 줄을 한 번 누르면 아래 '종목 자세히 보기', 같은 줄을 한 번 더 누르면 🕯️ 차트 탭으로 넘어가요. "
-               "🥇 = 섹터에서 가장 먼저 신고가")
-    st.dataframe(
-        styled,
-        hide_index=True,
-        key="list_table", on_select=_pick_row, selection_mode="single-row",
-        height=min(720, 36 * (len(view) + 1) + 4),
-        column_config={
-            "52주 위치": st.column_config.ProgressColumn(
-                "52주 위치", min_value=0, max_value=100, format="%.0f",
-                help="52주 최저가를 0, 최고가를 100으로 봤을 때 현재가 위치"),
-            "괴리율": st.column_config.Column(help="현재가가 52주 최고가보다 몇 % 낮은지"),
-            "신고가까지": st.column_config.Column(help="52주 최고가를 넘으려면 필요한 상승률"),
-            "신고가 후": st.column_config.Column(help="52주 최고가를 찍은 뒤 지난 거래일 수. 0이면 오늘"),
-            "시가총액(원)": st.column_config.Column(help="상장주식수 × 현재가, 원화 기준(조·억). 해외 종목은 환율로 환산. "
-                                                           "상장주식수를 못 받은 종목은 '-'이고, 10분마다 다시 시도해요."),
-            "통화": st.column_config.Column(help="현재가·52주 최고가의 단위. 국내는 원, 해외는 각 시장 통화"),
-            "현재가": st.column_config.Column(help="통화 열의 단위예요"),
-            "정배열": st.column_config.CheckboxColumn(help="현재가 > 20일선 > 60일선 > 120일선"),
-            "종목": st.column_config.Column(pinned=True),
-            "돌파": st.column_config.Column(help=BO_FULL_HELP),
-            "52주 신고가(일·주·월)": st.column_config.Column(
-                help="오늘 일봉·이번 주 주봉·이번 달 월봉 중 고가가 그 봉 직전 52주 최고가를 넘은 봉"),
-            "역대 신고가(일·주·월)": st.column_config.Column(
-                help="오늘 일봉·이번 주 주봉·이번 달 월봉 중 고가가 상장 이후 전체 최고가(월봉 기준)를 넘은 봉"),
-            "RS": st.column_config.Column(help=RS_HELP),
-            "RS(1M)": st.column_config.Column(help="단기 RS. 최근 1개월(21거래일) 수익률 순위(1~99)"),
-            "RS(3M)": st.column_config.Column(help="최근 3개월(63거래일) 수익률 순위(1~99)"),
-            "RS(6M)": st.column_config.Column(help="최근 6개월(126거래일) 수익률 순위(1~99)"),
-            "ATR%(20일)": st.column_config.Column(help="최근 20거래일 평균 진폭 ÷ 현재가. 손절폭 잡을 때 참고(8%보다 크면 ATR로 확대)"),
-            "설명": st.column_config.TextColumn(width="large"),
-            **{c: st.column_config.Column(help=FLOW_HELP) for c in flow_cols},
-        },
-    )
-
-
-def _n(v) -> str:
-    return "-" if pd.isna(v) else f"{v:.0f}"
-
-
-def _pct(v) -> str:
-    return "-" if pd.isna(v) else f"{v:.1f}%"
-
-
-CARD_STEP = 60   # 휴대폰 카드는 한 번에 60장씩(수백 장을 30초마다 다시 그리면 휴대폰이 버벅여요)
-
-
-def _more_cards(limit: int):
-    st.session_state["card_limit"] = limit + CARD_STEP
-
-
-M_SORTS = ["신고가 가까운 순", "첫 돌파 우선", "RS 높은 순", "등락률 순"]
-
-
-def _m_sorted(f: pd.DataFrame, how: str) -> pd.DataFrame:
-    if how == "첫 돌파 우선":
-        k = f.assign(_a=(f["bo_status"] != "유지").astype(int),
-                     _b=pd.to_numeric(f.get("bo_nth"), errors="coerce").fillna(99),
-                     _c=pd.to_numeric(f["bo_days"], errors="coerce").fillna(999))
-        return k.sort_values(["_a", "_b", "_c", "to_high"]).drop(columns=["_a", "_b", "_c"])
-    if how == "RS 높은 순":
-        return f.sort_values("rs", ascending=False, na_position="last")
-    if how == "등락률 순":
-        return f.sort_values("change", ascending=False, na_position="last")
-    return f.sort_values("to_high", ascending=True, na_position="last")
-
-
-def _kflow(v) -> str:
-    if v is None or pd.isna(v):
-        return "-"
-    color = UP if v > 0 else (DOWN if v < 0 else "#51616C")
-    return f'<b style="color:{color}">{_eok_num(v)}</b>'
-
-
-def render_cards(f: pd.DataFrame, n_hot: int, n_near: int, n_aligned: int, fins=None):
-    """휴대폰 화면용 체크 리스트. 한 장에 꼭 볼 것만: 신고가까지 · 돌파 상태 · RS를 같은 자리에 크게."""
-    kpis = (
-        f'<div class="m-kpis"><div><span>종목</span><b>{len(f)}</b></div>'
-        f'<div><span>최근 {recent_days}일 신고가</span><b>{n_hot}</b></div>'
-        f'<div><span>10% 이내</span><b>{n_near}</b></div>'
-        f'<div><span>돌파 유지</span><b>{int((f["bo_status"] == "유지").sum())}</b></div></div>'
-    )
-    st.markdown(kpis, unsafe_allow_html=True)
-    how = st.radio("정렬", M_SORTS, horizontal=True, key="m_sort", label_visibility="collapsed")
-    shown = _m_sorted(f[f["price"].notna()], how)
-    limit = st.session_state.get("card_limit", CARD_STEP)
-    total = len(shown)
-    yr = data.now_kst().year
-    cards = []
-    for r in shown.head(limit).itertuples():
-        hot = pd.notna(r.days_since_high) and r.days_since_high <= recent_days
-        if pd.isna(r.change) or r.change == 0:
-            chg = f'<span class="k-chg">{"-" if pd.isna(r.change) else "0.00%"}</span>'
-        else:
-            chg = f'<span class="k-chg" style="color:{UP if r.change > 0 else DOWN}">{r.change:+.2f}%</span>'
-        th = r.to_high
-        th_cls = "" if pd.isna(th) else ("hot" if th <= 3 else ("near" if th <= 10 else ""))
-        bo = _bo_full(r)
-        bo_cls = "first" if bo.startswith("⭐") else ("brk" if "번째 돌파" in bo else "off")
-        bo_show = bo.replace("미돌파 · ", "") if bo != "-" else "돌파 전"
-        crown = ' <span class="k-crown">👑 대장</span>' if (r.lead_rank == 1 and r.lead_ok) else ""
-        sub = [html.escape(r.group)]
-        if pd.notna(r.cap_krw):
-            sub.append(f"{data.format_krw(r.cap_krw)}원")
-        if pd.notna(r.lead_rank):
-            sub.append(f"섹터 {int(r.lead_rank)}/{int(r.lead_n)}")
-        if fins is not None and data.is_kr(r.code):
-            og = data.op_growth(fins.get(r.code), yr)
-            color = UP if og["op_up"] else ("#6B7A84" if og["op_up"] is None else DOWN)
-            sub.append(f'<b style="color:{color}">{og["op_txt"]}</b>')
-        if r.aligned:
-            sub.append("정배열")
-        ath = _nh_text(r._asdict(), "ath")
-        if ath:
-            sub.append(f'<b style="color:{UP}">역대 신고가 {ath}</b>')
-        flow = ""
-        if show_flow and pd.notna(getattr(r, "flow_date", None)):
-            flow = (f'<div class="k-flow">외 {_kflow(r.flow_외국인)} · 기 {_kflow(r.flow_기관)}'
-                    f'<span>5일 외 {_kflow(r.flow5_외국인)} · 기 {_kflow(r.flow5_기관)}</span></div>')
-        cards.append(
-            f'<a class="kcard{" hot" if hot else ""}" target="_self" href="?chart={r.code}">'
-            f'<div class="k-top"><span class="k-name">{html.escape(r.name)}{crown}</span>'
-            f'<span class="k-px">{fmt_price(r.price, r.currency)}{"" if r.currency == "KRW" else " " + r.currency} {chg}</span></div>'
-            f'<div class="k-keys">'
-            f'<div><small>신고가까지</small><b class="{th_cls}">{"-" if pd.isna(th) else f"{th:+.1f}%"}</b></div>'
-            f'<div><small>돌파</small><b class="{bo_cls}">{html.escape(bo_show)}</b></div>'
-            f'<div><small>RS</small><b class="{"rs" if pd.notna(r.rs) and r.rs >= 80 else ""}">{_n(r.rs)}</b></div>'
-            f'</div>'
-            f'<div class="k-sub">{" · ".join(sub)}</div>{flow}</a>'
-        )
-    st.markdown('<div class="kcards">' + "".join(cards) + "</div>", unsafe_allow_html=True)
-    if total > limit:
-        st.button(f"카드 더 보기 ({limit}/{total})", key="card_more", on_click=_more_cards, args=(limit,))
-    st.caption("노란 카드 = 최근 신고가. 신고가까지: 빨강 3% 이내 · 주황 10% 이내. "
-               "⭐ 첫 돌파 = 52주 안 첫 돌파(며칠째인지 함께). 카드를 누르면 종목 화면이 열려요. 수급은 억원.")
-
-
-def render_stock_flow(code: str, trends: dict):
-    """종목 자세히 보기의 수급 탭: 최근 20거래일 개인·외국인·기관 순매수(억원 추정)와 외국인 보유율."""
-    if not data.is_kr(code):
-        st.caption("해외 종목은 투자자별 매매동향을 제공하지 않아요.")
-        return
-    tr = trends.get(code)
-    if tr is None:
-        tr = data.fetch_stock_trend(code)
-    if tr is None or tr.empty:
-        st.caption("이 종목의 투자자별 매매동향을 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
-        return
-    sm = data.trend_summary(tr)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"외국인 ({sm['flow_date']:%m/%d})", _eok(sm["flow_외국인"]), f"5일 {_eok(sm['flow5_외국인'])}", delta_color="off")
-    c2.metric(f"기관 ({sm['flow_date']:%m/%d})", _eok(sm["flow_기관"]), f"5일 {_eok(sm['flow5_기관'])}", delta_color="off")
-    c3.metric(f"개인 ({sm['flow_date']:%m/%d})", _eok(sm["flow_개인"]), f"5일 {_eok(sm['flow5_개인'])}", delta_color="off")
-    streak = []
-    for k in ("외국인", "기관"):
-        n = sm.get(f"streak_{k}") or 0
-        if n:
-            streak.append(f"{k} {abs(n)}일 연속 순{'매수' if n > 0 else '매도'}")
-    hold = tr["외국인보유율"].dropna()
-    c4.metric("외국인 보유율", f"{hold.iloc[-1]:.2f}%" if not hold.empty else "-",
-              " · ".join(streak) if streak else None, delta_color="off")
-
-    long = tr.melt("date", value_vars=[f"{k}금액" for k in data.INVESTORS], var_name="투자자", value_name="순매수")
-    long["투자자"] = long["투자자"].str.replace("금액", "", regex=False)
-    chart = (
-        alt.Chart(long.dropna()).mark_bar()
-        .encode(
-            x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False)),
-            xOffset=alt.XOffset("투자자:N", sort=data.INVESTORS),
-            y=alt.Y("순매수:Q", title="억원(추정)"),
-            color=alt.Color("투자자:N", sort=data.INVESTORS,
-                            scale=alt.Scale(domain=data.INVESTORS, range=["#9AA9B3", "#2E6B6F", "#F2B134"]),
-                            legend=alt.Legend(orient="bottom", title=None)),
-            tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "투자자:N", alt.Tooltip("순매수:Q", format="+,.1f")],
-        )
-        .properties(height=240, width="container")
-    )
-    st.altair_chart(chart)
-    table = tr.sort_values("date", ascending=False).head(10)
-    view = pd.DataFrame({
-        "날짜": table["date"].dt.strftime("%m/%d"),
-        "종가": table["close"],
-        "외국인(주)": table["외국인"], "기관(주)": table["기관"], "개인(주)": table["개인"],
-        "외국인(억)": table["외국인금액"], "기관(억)": table["기관금액"], "개인(억)": table["개인금액"],
-        "외국인 보유율": table["외국인보유율"],
-    })
-    num = [c for c in view.columns if c not in ("날짜",)]
-    for c in num:
-        view[c] = pd.to_numeric(view[c], errors="coerce")
-    sign_cols = ["외국인(주)", "기관(주)", "개인(주)", "외국인(억)", "기관(억)", "개인(억)"]
-    st.dataframe(
-        view.style.format({"종가": "{:,.0f}", "외국인 보유율": "{:.2f}%", **{c: "{:+,.0f}" for c in sign_cols[:3]},
-                           **{c: "{:+,.1f}" for c in sign_cols[3:]}}, na_rep="-")
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}", subset=sign_cols),
-        hide_index=True,
-    )
-    st.caption("네이버 증권 종목별 투자자 매매동향 기준. 금액은 순매수 수량 × 그날 종가로 환산한 추정치예요. "
-               "연기금·투신 같은 기관 세부는 종목별로는 네이버가 주지 않고(한국거래소는 로그인 필요), "
-               "시장 전체 기준으로 위쪽 '투자자별 순매수 자세히'에 보여줘요.")
-
-
-@st.cache_data(ttl=300, show_spinner=False, max_entries=40)
-def load_chart_all(code: str) -> dict:
-    """(속도) 일·주·월봉을 한 번에 동시에 받아 둬요. 봉 종류를 바꿔도 다시 기다리지 않아요."""
+def prefetch(open_h):
+    """시세·실적·수급·지수를 종목별로 동시에 받아 캐시에 채워 둔다 (한 종목씩 받던 것보다 몇 배 빠름)."""
     from concurrent.futures import ThreadPoolExecutor
-    tfs = list(data.CHART_TF)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        return dict(zip(tfs, pool.map(lambda tf: data.fetch_chart(code, tf), tfs)))
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    ctx = get_script_run_ctx()
+    jobs = [(fx_rate,)] + [(regime, n) for n in ("KOSPI", "KOSDAQ", "S&P500", "NASDAQ")]
+    for h in open_h:
+        jobs += [(hist, h["code"], h["market"]), (fund, h["code"], h["market"]), (flows, h["code"], h["market"])]
+
+    def run(job):
+        add_script_run_ctx(threading.current_thread(), ctx)
+        try:
+            job[0](*job[1:])
+        except Exception:
+            pass
+    import threading
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(run, jobs))
 
 
-def load_chart(code: str, tf: str) -> pd.DataFrame:
-    return load_chart_all(code).get(tf, data.empty_frame())
+def analyze():
+    open_h = [h for h in book["holdings"] if core.position(h).qty > 0]
+    if not st.session_state.get("_prefetched_at") or \
+            (datetime.now() - st.session_state["_prefetched_at"]).seconds > 50:
+        prefetch(open_h)
+        st.session_state["_prefetched_at"] = datetime.now()
+    FX = fx_rate() or S["fx"]
+    realized_all = sum(core.position(h).realized * (FX if h["market"] == "US" else 1.0) for h in book["holdings"])
+    pre = []
+    unreal = 0.0
+    for h in open_h:
+        pos = core.position(h)
+        df, _ = hist(h["code"], h["market"])
+        fxm = FX if h["market"] == "US" else 1.0
+        if not df.empty and len(df) >= 30:
+            unreal += (float(df["Close"].iloc[-1]) - pos.avg) * pos.qty * fxm
+        pre.append((h, pos, df, fxm))
+    account = float(S["equity"]) + realized_all + unreal
+    rows = []
+    be_hits = []
+    for h, pos, df, fxm in pre:
+        if df.empty or len(df) < 30:
+            rows.append({"h": h, "pos": pos, "ind": None, "j": None, "fx": fxm, "df": df})
+            continue
+        ind = core.indicators(df)
+        hit3 = core.check_3r(h, df, S)               # 3R 익절가에 처음 닿은 날 기록
+        if hit3:
+            be_hits.append(f"🎯 {h['name']} {S['target_r']:g}R 달성 ({hit3[5:].replace('-', '.')})")
+        be = core.check_breakeven(h, df, S)          # +2R 닿으면 손절가 → 본절 (자동, 한 번만)
+        if be:
+            be_hits.append(f"{h['name']} +{be['hit_r']}R 도달 · 손절가 {fmt(be['from'], h['market'])} → "
+                           f"{be['label']} {fmt(be['to'], h['market'])}")
+        reg = regime(h.get("index", "KOSPI"))
+        f = fund(h["code"], h["market"])
+        fund_ok = h["fund_override"] if h.get("fund_override") is not None else f.get("ok")
+        fl = flows(h["code"], h["market"])
+        j = core.judge(h, pos, ind, S, reg, fund_ok, fl, len(open_h), account)
+        rows.append({"h": h, "pos": pos, "ind": ind, "j": j, "fx": fxm, "df": df,
+                     "fund": f, "flows": fl, "reg": reg})
+    if be_hits:
+        save("breakeven: " + ", ".join(be_hits))
+        st.session_state["flash"] = "자동 반영 — " + " · ".join(be_hits)
+    return rows, FX, {"account": account, "realized": realized_all, "unreal": unreal}
 
 
-MA_SET = {"일봉": ((5, "5일"), (20, "20일"), (60, "60일"), (120, "120일")),
-          "주봉": ((5, "5주"), (10, "10주"), (30, "30주"), (52, "52주")),
-          "월봉": ((3, "3개월"), (6, "6개월"), (12, "12개월"), (24, "24개월"))}
-MA_COLORS = ("#E0672B", "#2E9D5B", "#7A4FD1", "#8A96A0")
-PERIODS = {"일봉": {"1개월": 21, "3개월": 63, "6개월": 126, "1년": 250, "2년": 500, "전체": None},
-           "주봉": {"1년": 52, "2년": 104, "5년": 260, "전체": None},
-           "월봉": {"5년": 60, "10년": 120, "전체": None}}
-
-
-def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol: bool, line: float | None = None,
-               currency: str = "KRW", show_tv: bool = False):
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    b = b.copy().reset_index(drop=True)
-    for k, _ in MA_SET[tf]:
-        b[f"ma{k}"] = b["close"].rolling(k).mean()
-    if n:
-        b = b.tail(n)
-    x = pd.to_datetime(b["date"]).dt.strftime("%Y-%m" if tf == "월봉" else "%Y-%m-%d")
-    panels = ["price"] + (["vol"] if show_vol else []) + (["tv"] if show_tv else [])
-    heights = {1: [1.0], 2: [0.78, 0.22], 3: [0.68, 0.16, 0.16]}[len(panels)]
-    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.025, row_heights=heights)
-    up_mask = [c >= o for o, c in zip(b["open"], b["close"])]
-    fmt = ",.0f" if currency in ("KRW", "JPY") else ",.2f"
-    fig.add_trace(go.Candlestick(
-        x=x, open=b["open"], high=b["high"], low=b["low"], close=b["close"], name="봉", showlegend=False,
-        increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
-        decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
-        hoverlabel=dict(namelength=0)), row=1, col=1)
-    if show_ma:
-        for (k, lab), c in zip(MA_SET[tf], MA_COLORS):
-            fig.add_trace(go.Scatter(x=x, y=b[f"ma{k}"], name=lab, mode="lines", line=dict(color=c, width=1.3),
-                                     hovertemplate=f"{lab} %{{y:{fmt}}}<extra></extra>"), row=1, col=1)
-    if line and tf != "월봉":
-        fig.add_hline(y=line, line=dict(color="#F2B134", width=1.4, dash="dash"), row=1, col=1,
-                      annotation_text=f"52주 최고 {line:{fmt}}", annotation_position="top left",
-                      annotation_font=dict(size=11, color="#B7861D"))
-    colors = [UP if u else DOWN for u in up_mask]
-    fig.update_yaxes(side="right", gridcolor="#EEF1F3", zeroline=False, tickfont=dict(size=12))
-    fig.update_yaxes(tickformat=fmt, row=1, col=1)
-    if show_vol:
-        r = panels.index("vol") + 1
-        fig.add_trace(go.Bar(x=x, y=b["volume"], marker_color=colors, opacity=0.55, name="거래량", showlegend=False,
-                             hovertemplate="거래량 %{y:,.0f}<extra></extra>"), row=r, col=1)
-        fig.update_yaxes(title_text="거래량", title_font=dict(size=12, color="#7A8A94"), tickformat="~s", row=r, col=1)
-    if show_tv:
-        r = panels.index("tv") + 1
-        # 거래대금 ≈ 평균가((고+저+종)/3) × 거래량. 국내는 억원, 해외는 백만(현지 통화)
-        typ = (b["high"] + b["low"] + b["close"]) / 3
-        krw = currency == "KRW"
-        tv = typ * b["volume"] / (1e8 if krw else 1e6)
-        unit = "억" if krw else f"M {UNIT.get(currency, currency)}"
-        fig.add_trace(go.Bar(x=x, y=tv, marker_color=colors, opacity=0.75, name="거래대금", showlegend=False,
-                             hovertemplate=f"거래대금 %{{y:,.0f}}{unit}<extra></extra>"), row=r, col=1)
-        fig.update_yaxes(title_text=f"거래대금({unit})", title_font=dict(size=12, color="#7A8A94"), tickformat=",.0f",
-                         row=r, col=1)
-    fig.update_xaxes(type="category", nticks=8, showgrid=False, rangeslider_visible=False, tickangle=0,
-                     tickfont=dict(size=12), showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
-    fig.update_layout(height={1: 640, 2: 780, 3: 900}[len(panels)], margin=dict(l=4, r=4, t=36, b=6),
-                      hovermode="x unified", dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                      hoverlabel=dict(font_size=13),
-                      legend=dict(orientation="h", y=1.05, x=0, font=dict(size=13)),
-                      font=dict(family="Pretendard, Malgun Gothic, sans-serif", size=13))
+def curve_chart(cv: pd.DataFrame, bench: pd.Series | None):
+    fig = go.Figure()
+    x, y = cv.index, cv["ret"]
+    pos_y, neg_y = y.clip(lower=0), y.clip(upper=0)
+    fig.add_trace(go.Scatter(x=x, y=pos_y, fill="tozeroy", mode="none", fillcolor="rgba(229,72,77,0.10)",
+                             hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=neg_y, fill="tozeroy", mode="none", fillcolor="rgba(47,111,237,0.10)",
+                             hoverinfo="skip", showlegend=False))
+    if bench is not None and len(bench):
+        fig.add_trace(go.Scatter(x=bench.index, y=bench, mode="lines", name="KOSPI",
+                                 line=dict(color="#94a3b8", width=1.5, dash="dot"),
+                                 hovertemplate="KOSPI %{y:+.2f}%<extra></extra>"))
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="내 계좌", line=dict(color="#0f172a", width=2.2),
+                             customdata=np.stack([cv["equity"], cv["dd"]], axis=1),
+                             hovertemplate="내 계좌 %{y:+.2f}%<br>%{customdata[0]:,.0f}원 · 고점 대비 %{customdata[1]:.1f}%<extra></extra>"))
+    last = y.iloc[-1]
+    fig.add_annotation(x=x[-1], y=last, text=f"<b>{last:+.2f}%</b>", showarrow=False, xanchor="left", xshift=6,
+                       font=dict(size=12, color="#e5484d" if last > 0 else "#2f6fed" if last < 0 else "#0f172a"))
+    fig.add_hline(y=0, line_color="#cbd5e1", line_width=1)
+    fig.update_layout(template="plotly_white", height=260, margin=dict(l=4, r=48, t=8, b=4),
+                      hovermode="x unified", dragmode=False, paper_bgcolor="#fff", plot_bgcolor="#fff",
+                      font=dict(family="Pretendard Variable, Pretendard, sans-serif", size=11, color="#64748b"),
+                      legend=dict(orientation="h", y=1.12, x=0, font=dict(size=11)))
+    fig.update_xaxes(showgrid=False, linecolor="#e8ebf0", tickformat="%m.%d")
+    fig.update_yaxes(gridcolor="#f1f3f6", ticksuffix="%", side="right", zeroline=False)
     return fig
 
 
-def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, high52: float | None = None,
-                 key: str = "cc", is_index: bool = False):
-    """일봉·주봉·월봉 캔들 + 이동평균 + 거래량. 국내 종목은 실시간 시세로 마지막 봉을 갱신해요."""
-    with st.container(key=f"{key}_bar"):
-        c1, c2, c3 = st.columns([1.0, 2.0, 1.6], gap="medium")
-        tf = c1.segmented_control("봉 종류", list(data.CHART_TF), default="일봉", required=True, key=f"{key}_tf",
-                                  width="stretch") or "일봉"
-        periods = PERIODS[tf]
-        default_p = {"일봉": "6개월", "주봉": "2년", "월봉": "10년"}[tf]
-        per = c2.segmented_control("기간", list(periods), default=default_p, required=True, key=f"{key}_per_{tf}",
-                                   width="stretch") or default_p
-        show_opts = ["이동평균", "거래량"] if is_index else ["이동평균", "거래량", "거래대금"]
-        opts = c3.segmented_control("표시", show_opts, selection_mode="multi",
-                                    default=show_opts, key=f"{key}_opts2", width="stretch") or []
-    with st.spinner("차트를 불러오는 중이에요."):
-        bars = load_chart(code, tf)
-    if bars is None or bars.empty:
-        st.info("이 종목의 봉 데이터를 받지 못했어요. 잠시 뒤 다시 시도해 보세요.")
-        return
-    bars = data.chart_with_live(bars, quote, tf)
-    fig = candle_fig(bars, tf, periods[per], "이동평균" in opts, "거래량" in opts, high52, currency, "거래대금" in opts)
-    st.plotly_chart(fig, key=f"{key}_fig", config={"displaylogo": False, "scrollZoom": True,
-                                                   "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
-    st.caption("드래그로 옮기고, 휠·두 손가락으로 확대해요. 더블클릭하면 원래대로. 거래대금은 평균가×거래량으로 계산한 추정치예요. "
-               + ("마지막 봉은 실시간 시세로 갱신돼요." if quote else "해외 종목은 야후 일봉 기준이에요."))
+# ─────────────────────────── 머리 ───────────────────────────
+top_l, top_r = st.columns([4, 1], vertical_alignment="bottom")
+with top_l:
+    html(f"<div class='hd'><div><div class='t'>내 계좌</div>"
+         f"<div class='s'>{datetime.now():%Y.%m.%d %H:%M} 기준</div></div></div>")
+with top_r:
+    if st.button("새로고침", icon=":material/refresh:", width="stretch"):
+        st.cache_data.clear()
+        st.session_state.book = store.load()
+        st.rerun()
+
+if st.session_state.get("save_err"):
+    html("<div class='notice warn' style='background:#fef1f1;color:#b42318'><b>마지막 저장이 실패했어요.</b>&nbsp;"
+         f"{escape(st.session_state.save_err)} — 이 상태로는 앱을 다시 켜면 방금 기록이 사라져요.</div>")
+if not STORE_OK:
+    html(f"<div class='notice warn' style='background:#fef1f1;color:#b42318'><b>기록이 안전하게 저장되지 않고 있어요.</b>&nbsp;"
+         f"{escape(STORE_MSG)} 설정 탭 맨 아래 '저장 상태'를 확인해 주세요.</div>")
+
+tab_sum, tab_edit, tab_judge, tab_calc, tab_set = st.tabs(["요약", "기록", "판단", "계산기", "설정"])
+
+with st.spinner("시세 불러오는 중..."):
+    ROWS, FX, ACC = analyze()
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=200)
-def naver_search(q: str) -> list[tuple[str, str]]:
-    try:
-        return data.search_stock(q)[:12]
-    except Exception:
-        return []
-
-
-def _rep_status():
-    key, token = _secret("ANTHROPIC_API_KEY"), _secret("GITHUB_TOKEN")
-    repo = _secret("GITHUB_REPO", "kimgun124-boop/very")
-    return {"ai": bool(key), "key": key, "model": _secret("ANTHROPIC_MODEL", reports.DEFAULT_MODEL),
-            "gh": bool(token), "token": token, "repo": repo, "branch": _secret("GITHUB_BRANCH") or None,
-            "pw": _secret("APP_PASSWORD")}
-
-
-def _persist(store: dict, stt: dict) -> tuple[bool, str]:
-    reports.save_local(store)
-    if stt["gh"]:
-        return reports.save_github(store, stt["token"], stt["repo"], stt["branch"])
-    return True, "이 서버에만 임시로 저장했어요(앱을 다시 켜면 사라질 수 있어요)."
-
-
-@st.fragment
-def render_reports_tab():
-    """📥 리포트: 앱에서 직접 리포트를 넣으면 종목을 뽑아 보드에 붙여요."""
-    stt = _rep_status()
-    board = {s["code"]: s for s in STOCKS}
-    by_name = {s["name"]: s for s in STOCKS}
-
-    st.markdown('<div class="sec-h"><b>📥 리포트 넣기</b><span>PDF·캡처 이미지·글을 넣으면 종목을 뽑아 보드에 붙여요</span></div>',
-                unsafe_allow_html=True)
-    badges = [("AI 분석", stt["ai"], "켜짐" if stt["ai"] else "꺼짐 · 이름 맞추기로 분석"),
-              ("영구 저장", stt["gh"], "GitHub 저장소" if stt["gh"] else "꺼짐 · 앱 재시작 시 사라질 수 있음"),
-              ("비밀번호", bool(stt["pw"]), "설정됨" if stt["pw"] else "없음 · 누구나 추가 가능")]
-    st.markdown('<div class="rp-badges">' + "".join(
-        f'<span class="rp-badge {"on" if ok else "off"}"><b>{lab}</b> {txt}</span>' for lab, ok, txt in badges) + "</div>",
-        unsafe_allow_html=True)
-    with st.expander("⚙️ 처음 한 번 설정하기 (AI 분석 · 영구 저장 · 비밀번호)", expanded=not (stt["ai"] and stt["gh"])):
-        st.markdown(
-            "Streamlit 앱 오른쪽 아래 **Manage app → ⋮ → Settings → Secrets** 칸에 아래처럼 넣고 저장하세요.\n\n"
-            "```toml\nANTHROPIC_API_KEY = \"sk-ant-...\"   # AI 분석(이미지·스캔 PDF도 읽음)\n"
-            "GITHUB_TOKEN = \"github_pat_...\"     # 넣은 리포트를 저장소에 영구 저장\n"
-            "GITHUB_REPO = \"kimgun124-boop/very\"\n"
-            "APP_PASSWORD = \"원하는 비밀번호\"      # 나만 리포트를 넣을 수 있게\n```\n"
-            "- **ANTHROPIC_API_KEY**: [Claude Console](https://console.anthropic.com)에서 발급해요. "
-            "Claude 구독과 별도로 쓴 만큼 요금이 나가요. 없으면 '이름 맞추기'로만 분석해요(글자로 된 PDF·글만).\n"
-            "- **GITHUB_TOKEN**: GitHub → Settings → Developer settings → Fine-grained tokens → "
-            "저장소 very만 고르고 **Contents: Read and write** 권한으로 만들어요. 없으면 앱을 다시 켤 때 넣은 리포트가 사라질 수 있어요.\n"
-            "- **APP_PASSWORD**: 앱 주소를 아는 누구나 리포트를 넣거나 API 요금을 쓰지 못하게 막아요. 꼭 넣는 걸 권해요.")
-
-    if stt["pw"] and not st.session_state.get("rep_ok"):
-        pw = st.text_input("비밀번호", type="password", key="rep_pw")
-        if pw and pw == stt["pw"]:
-            st.session_state["rep_ok"] = True
-            _rerun_frag()
-        elif pw:
-            st.error("비밀번호가 달라요.")
-        _render_saved_reports(stt, editable=False)
-        return
-
-    # ① 넣기
-    with st.container(border=True, key="rp_box_in"):
-        st.markdown("**① 리포트 넣기**")
-        files = st.file_uploader("파일", type=["pdf", "png", "jpg", "jpeg", "webp", "txt", "md", "html"],
-                                 accept_multiple_files=True, key="rep_files",
-                                 help="PDF 여러 개, 캡처 이미지 여러 장을 한꺼번에 넣어도 돼요.")
-        text = st.text_area("또는 글 붙여넣기", height=110, key="rep_text",
-                            placeholder="리포트 본문, 텔레그램 요약, 기사 내용 등을 붙여넣어도 돼요.")
-        methods = (["🤖 AI로 분석"] if stt["ai"] else []) + ["🔎 이름 맞추기"]
-        c1, c2 = st.columns([2, 1])
-        method = c1.segmented_control("분석 방법", methods, default=methods[0], required=True, key="rep_method")
-        go = c2.button("🔍 분석하기", type="primary", width="stretch", disabled=not (files or text.strip()))
-        if not stt["ai"]:
-            st.caption("AI 키가 없어서 본문에 나온 상장사 이름을 찾아요. 이미지·스캔 PDF는 AI 분석에서만 읽을 수 있어요.")
-    if go:
-        payload = [(f.name, f.getvalue()) for f in (files or [])]
-        if method.startswith("🤖"):
-            with st.spinner("AI가 리포트를 읽고 종목을 뽑는 중이에요. 분량에 따라 30초~2분 걸려요."):
-                res, err = reports.ai_extract(stt["key"], payload, text, stt["model"])
-            if err:
-                st.error(err)
-                return
-            meta = {k: res.get(k, "") for k in ("title", "broker", "date", "summary")}
-            rows = res.get("stocks") or []
-        else:
-            with st.spinner("본문에서 상장사 이름을 찾는 중이에요."):
-                body = "\n".join(reports.file_text(n, raw) for n, raw in payload) + "\n" + text
-                if not body.strip():
-                    st.error("글자를 읽지 못했어요. 이미지·스캔 PDF는 AI 분석이 필요해요.")
-                    return
-                rows = reports.match_stocks(body, STOCKS, reports.krx_listing())
-                first = (files[0].name.rsplit(".", 1)[0] if files else body.strip().split("\n")[0])[:30]
-                meta = {"title": first, "broker": "", "date": now_date(), "summary": ""}
-        draft = []
-        need = [r.get("name") for r in rows if not r.get("code") and r.get("name") and r.get("name") not in by_name
-                and (r.get("market") in (None, "", "KR"))]
-        found, _miss = data.resolve_codes(tuple(need)) if need else ({}, {})
-        for r in rows:
-            name = str(r.get("name") or "").strip()
-            code = str(r.get("code") or "").strip().upper() or found.get(name, "") or (by_name.get(name) or {}).get("code", "")
-            if re.fullmatch(r"\d{1,6}", code):
-                code = code.zfill(6)
-            on = board.get(code)
-            hint = r.get("sector_hint") or ""
-            sector = on["sector"] if on else (hint if hint in SECTOR_ORDER else "기타(리포트 스크린)")
-            draft.append({"넣기": r.get("importance", "상") != "하" or bool(on), "종목명": on["name"] if on else name,
-                          "코드": code, "산업": sector, "세부 분류": on["group"] if on else (r.get("group") or "리포트 추가"),
-                          "한 줄 설명": on["desc"] if on else (r.get("desc") or ""), "리포트 포인트": r.get("point") or "",
-                          "보드에 있음": bool(on)})
-        st.session_state["rep_draft"] = {"meta": meta, "rows": draft,
-                                         "source": ", ".join(f.name for f in files or []) or "붙여넣은 글"}
-
-    # ② 확인·고치기 → 반영
-    dr = st.session_state.get("rep_draft")
-    if dr:
-        with st.container(border=True, key="rp_box_edit"):
-            st.markdown(f"**② 뽑은 종목 확인하기** — {len(dr['rows'])}개. 틀린 건 고치고, 뺄 종목은 '넣기'를 끄세요.")
-            c1, c2, c3 = st.columns([2.2, 1, 1])
-            title = c1.text_input("리포트 제목", dr["meta"].get("title", ""), key="rep_title")
-            broker = c2.text_input("증권사·출처", dr["meta"].get("broker", ""), key="rep_broker")
-            rdate = c3.text_input("날짜", dr["meta"].get("date", ""), key="rep_date", placeholder="26.09.28")
-            summary = st.text_area("핵심 요약", dr["meta"].get("summary", ""), height=80, key="rep_summary")
-            edited = st.data_editor(
-                pd.DataFrame(dr["rows"], columns=["넣기", "종목명", "코드", "산업", "세부 분류", "한 줄 설명", "리포트 포인트", "보드에 있음"]),
-                key="rep_editor", hide_index=True, num_rows="dynamic", width="stretch",
-                column_config={
-                    "넣기": st.column_config.CheckboxColumn(width="small"),
-                    "코드": st.column_config.TextColumn(help="국내 6자리 코드, 해외는 야후 티커(NVDA, 6857.T)", width="small"),
-                    "산업": st.column_config.SelectboxColumn(options=SECTOR_ORDER, required=True),
-                    "한 줄 설명": st.column_config.TextColumn(width="large"),
-                    "리포트 포인트": st.column_config.TextColumn(width="large"),
-                    "보드에 있음": st.column_config.CheckboxColumn(disabled=True, width="small"),
-                })
-            pick = edited[edited["넣기"] == True]  # noqa: E712
-            no_code = pick[pick["코드"].fillna("").astype(str).str.strip() == ""]
-            if len(no_code):
-                st.warning("코드가 비어 있는 종목은 빠져요: " + ", ".join(no_code["종목명"].astype(str)) +
-                           " — 코드를 채우면 들어가요(차트 탭에서 이름으로 검색하면 코드를 알 수 있어요).")
-            n_new = int((~pick["보드에 있음"].fillna(False).astype(bool)).sum()) - len(no_code)
-            c1, c2 = st.columns([3, 1])
-            c1.caption(f"넣을 종목 {len(pick) - len(no_code)}개 (새 종목 {max(n_new, 0)}개 · 이미 있는 종목은 태그와 메모만 붙어요)")
-            if c2.button("✅ 앱에 반영", type="primary", width="stretch", disabled=not title.strip()):
-                stocks_out = [{"name": str(r["종목명"]).strip(), "code": str(r["코드"]).strip(), "sector": r["산업"],
-                               "group": str(r["세부 분류"] or "리포트 추가").strip(), "desc": str(r["한 줄 설명"] or "").strip(),
-                               "point": str(r["리포트 포인트"] or "").strip()}
-                              for _, r in pick.iterrows() if str(r["코드"] or "").strip()]
-                store = reports.load_local()
-                store["reports"].append(reports.new_report(title, broker, rdate, summary, stocks_out, dr["source"]))
-                ok, msg = _persist(store, stt)
-                (st.success if ok else st.error)(msg + (" 보드에 반영하는 중이에요…" if ok else ""))
-                if ok:
-                    st.session_state.pop("rep_draft", None)
-                    st.session_state["rep_saved_msg"] = f"'{title}' 리포트 {len(stocks_out)}종목을 보드에 넣었어요. " \
-                                                        "왼쪽 '리포트 태그'에서 골라 볼 수 있어요."
-                    time.sleep(0.6)
-                    st.rerun(scope="app")
-            if st.button("취소", key="rep_cancel"):
-                st.session_state.pop("rep_draft", None)
-                _rerun_frag()
-    if st.session_state.get("rep_saved_msg"):
-        st.success(st.session_state.pop("rep_saved_msg"))
-    _render_saved_reports(stt, editable=True)
-
-
-# ─────────────────────────── 💼 내 보유 ───────────────────────────
-@st.cache_data(ttl=600, show_spinner=False, max_entries=60)
-def load_evidence(code: str, name: str) -> dict:
-    if data.MOCK:
-        return holdings.mock_gather(code, name)
-    return holdings.gather(code, name, data.is_kr(code))
-
-
-def _persist_holdings(store: dict, stt: dict) -> tuple[bool, str]:
-    holdings.save_local(store)
-    if stt["gh"]:
-        return reports.save_github(store, stt["token"], stt["repo"], stt["branch"], path="user_holdings.json")
-    return True, "이 서버에만 임시로 저장했어요(앱을 다시 켜면 사라질 수 있어요)."
-
-
-def _hold_context(df: pd.DataFrame) -> dict:
-    hist = load_indexes()
-    parts, oks = [], []
-    for name, sym in data.MARKETS.items():
-        sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
-        ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
-        oks.append(ok)
-        parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
-    sm_money = data.sector_money(df, "group") if "tv_live" in df else pd.DataFrame()
-    dist = {name: holdings.distribution_days(hist.get(sym, (None, None))[0]) for name, sym in data.MARKETS.items()}
-    vol_days = 0
-    for sym in data.MARKETS.values():
-        ih = hist.get(sym, (None, None))[0]
-        if ih is not None and len(ih) > 21:
-            ch = pd.to_numeric(ih["close"], errors="coerce").pct_change().tail(20).abs() * 100
-            vol_days = max(vol_days, int((ch >= 3).sum()))
-    return {"vol_mode": vol_days >= 3, "vol_days": vol_days,
-            "ladder": (holdings.load().get("settings") or {}).get("ladder", "2R"),
-            "dist_days": {k: v for k, v in dist.items() if v is not None},
-            "n_above60": sum(1 for x in oks if x),
-            "market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
-            "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
-                       for n, sym in data.MARKETS.items()},
-            "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
-            "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
-
-
-def _hold_metrics(code: str, df: pd.DataFrame, quotes: dict, name: str = "") -> tuple[dict, pd.DataFrame, dict | None]:
-    """보드에 있으면 보드 지표를, 없으면 일봉으로 바로 계산해요."""
-    quote = quotes.get(code)
-    if quote is None and data.is_kr(code):
-        quote = load_quotes((code,))[0].get(code)
-    bars = load_chart(code, "일봉")
-    bars_live = data.chart_with_live(bars, quote if data.is_kr(code) else None, "일봉")
-    hit = df[df["code"] == code]
-    if len(hit):
-        m = hit.iloc[0].to_dict()
-    else:
-        m = data.compute_metrics(bars, quote) if bars is not None and not bars.empty else {}
-    if data.is_kr(code):                       # 펀더멘털(연간 영업이익·EPS·컨센서스)과 수급(외국인·기관)
-        m["_fins"] = load_fin_one(code)
-        m["_flow"] = load_trends((code,)).get(code)
-    m["_news"] = load_evidence(code, name or m.get("name") or code)   # 최신 뉴스·증권사 리포트(10분마다)
-    return m, bars_live, quote
-
-
-@st.cache_data(ttl=43200, show_spinner=False, max_entries=300)
-def load_fin_one(code: str):
-    return data.fetch_financials(code)
-
-
-LEVEL_COLOR = {"red": ("#FDECEC", UP), "orange": ("#FDF1E7", "#D2691E"), "yellow": ("#FFF8E1", "#B7861D"),
-               "green": ("#EEF8F2", "#1E7A45"), "blue": ("#EEF4FC", DOWN), "gray": ("#F1F4F6", "#51616C"),
-               "purple": ("#F4EEFC", "#6B3FC4")}
-
-
-def _rerun_frag():
-    """칸(fragment)만 다시 그리기. 전체 실행 중이라 칸만 못 그리면 전체를 다시 그려요."""
-    try:
-        st.rerun(scope="fragment")
-    except st.errors.StreamlitAPIException:
+# ─────────────────────────── 요약 ───────────────────────────
+def atr_editor(rows):
+    """종목마다 내가 직접 ATR%(또는 손절가)를 넣어야 '적용'으로 인정. 자동으로 채우지 않는다."""
+    key = "atr_ed"
+    status_lab = {"applied": "✓ 적용", "check": "⚠ 확인 필요", "missing": "⚠ 입력 필요"}
+    base = []
+    for r in rows:
+        h, pos, ind = r["h"], r["pos"], r["ind"]
+        stt = core.atr_status(h)
+        ref = core.auto_atr(h, r["df"]) if r["df"] is not None and not r["df"].empty else None
+        base.append({"id": h["id"], "상태": status_lab[stt], "종목": h["name"], "평단": round(pos.avg, 2),
+                     "내 ATR %": float(h["atr_pct"]) if h.get("atr_pct") and stt != "missing" else None,
+                     "직접 손절가": float(h["stop"]) if h.get("stop") else None,
+                     "익절 기준가": float(h.get("target_base") or 0) or core.position(h).first_buy,
+                     "적용": stt == "applied",
+                     "참고: 진입일 ATR(20)": ref,
+                     "참고: 지금 ATR(20)": round(ind["atr_pct"], 1) if ind and not np.isnan(ind["atr_pct"]) else None})
+    df = pd.DataFrame(base)
+    for c_ in ("평단", "내 ATR %", "직접 손절가", "익절 기준가", "참고: 진입일 ATR(20)", "참고: 지금 ATR(20)"):
+        df[c_] = pd.to_numeric(df[c_], errors="coerce").astype(float)     # 빈칸이 'None' 대신 비어 보이게
+    edits = (st.session_state.get(key) or {}).get("edited_rows", {})
+    for i, ch in edits.items():
+        for col, v in ch.items():
+            if col in ("내 ATR %", "직접 손절가", "적용", "익절 기준가"):
+                df.at[int(i), col] = v
+            if col in ("내 ATR %", "직접 손절가") and v not in (None, ""):
+                df.at[int(i), "적용"] = True           # 값을 직접 넣으면 적용으로 체크
+    out = []
+    for i, row in df.iterrows():
+        h = next(r["h"] for r in rows if r["h"]["id"] == row["id"])
+        atr = None if pd.isna(row["내 ATR %"]) else row["내 ATR %"]
+        manual = None if pd.isna(row["직접 손절가"]) or not row["직접 손절가"] else float(row["직접 손절가"])
+        changed = str(i) in edits or i in edits
+        h_prev = {**h, "target_fixed": None, "stop_floor": None,
+                  "target_base": row["익절 기준가"] if not pd.isna(row["익절 기준가"]) else None} if changed else h
+        lv = core.levels(h_prev, row["평단"], S, atr, manual)
+        if lv["implied_atr"] is not None:
+            row = {**row, "내 ATR %": lv["implied_atr"]}
+        applied = bool(row["적용"]) and (atr is not None or manual is not None)
+        out.append({**row, "상태": status_lab["applied"] if applied else row["상태"],
+                    "손절률": f"−{lv['stop_pct']:g}%" + ("" if applied else " (임시)"),
+                    "손절가": lv["stop"], f"{S['target_r']:g}R 목표가": lv["target"]})
+    view = pd.DataFrame(out)
+    for c_ in ("내 ATR %", "직접 손절가", "손절가", f"{S['target_r']:g}R 목표가"):
+        view[c_] = pd.to_numeric(view[c_], errors="coerce").astype(float)
+    ed = st.data_editor(
+        view, key=key, hide_index=True, width="stretch",
+        column_order=["상태", "종목", "평단", "내 ATR %", "직접 손절가", "적용", "손절률", "손절가",
+                      "익절 기준가", f"{S['target_r']:g}R 목표가", "참고: 진입일 ATR(20)", "참고: 지금 ATR(20)"],
+        disabled=["상태", "종목", "평단", "손절률", "손절가", f"{S['target_r']:g}R 목표가",
+                  "참고: 진입일 ATR(20)", "참고: 지금 ATR(20)"],
+        column_config={
+            "평단": st.column_config.NumberColumn(format="%,.0f"),
+            "내 ATR %": st.column_config.NumberColumn(min_value=0.0, max_value=50.0, step=0.5, format="%.1f%%",
+                                                     help=f"직접 입력. 손절률 = MAX({S['stop_pct']:g}%, 이 값)"),
+            "직접 손절가": st.column_config.NumberColumn(min_value=0.0, format="%,.0f",
+                                                     help="적으면 (평단−손절가)/평단 = ATR로 계산. 평단 이상이면 수익 보호용"),
+            "적용": st.column_config.CheckboxColumn(help="'확인 필요' 종목은 값이 맞으면 체크하고 저장"),
+            "익절 기준가": st.column_config.NumberColumn(min_value=0.0, format="%,.0f",
+                                                     help="익절가 = 이 가격 × (1 + 3 × 손절률). 실제 첫 매수가로 고치면 익절가가 다시 정해져요"),
+            "손절가": st.column_config.NumberColumn(format="%,.0f"),
+            f"{S['target_r']:g}R 목표가": st.column_config.NumberColumn(format="%,.0f"),
+            "참고: 진입일 ATR(20)": st.column_config.NumberColumn(format="%.1f%%", help="참고용 — 자동으로 적용되지 않아요"),
+            "참고: 지금 ATR(20)": st.column_config.NumberColumn(format="%.1f%%", help="참고용 — 자동으로 적용되지 않아요"),
+        })
+    if st.button("ATR·손절가 저장", type="primary", icon=":material/save:", width="stretch"):
+        for i, row in ed.iterrows():
+            h = next(r["h"] for r in rows if r["h"]["id"] == row["id"])
+            old = (h.get("atr_pct"), h.get("stop"), h.get("atr_src"), h.get("target_base"))
+            nb = None if pd.isna(row["익절 기준가"]) or not row["익절 기준가"] else float(row["익절 기준가"])
+            h["target_base"] = nb if nb and abs(nb - (core.position(h).first_buy or 0)) >= 0.5 else None
+            new_stop = None if pd.isna(row["직접 손절가"]) or not row["직접 손절가"] else float(row["직접 손절가"])
+            new_atr = None if pd.isna(row["내 ATR %"]) else round(float(row["내 ATR %"]), 2)
+            imp = core.implied_atr(core.position(h).avg, new_stop)
+            h["stop"] = new_stop
+            h["atr_pct"] = imp if imp is not None else new_atr
+            if bool(row["적용"]) and (h["atr_pct"] or new_stop):
+                h["atr_src"] = "stop" if imp is not None else "manual"
+            elif not h["atr_pct"] and not new_stop:
+                h["atr_src"] = None
+            if old != (h.get("atr_pct"), h.get("stop"), h.get("atr_src"), h.get("target_base")):
+                h["stop_floor"] = None
+                core.reset_target(h, S)
+        st.session_state.pop(key, None)
+        save("atr settings")
         st.rerun()
 
 
-def _holding_card(h: dict, m: dict, bars, j: dict, quotes: dict, stt: dict):
-    """보유 종목 한 개의 판단 카드(종목 탭 안)."""
-    bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
-    cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
-    price = m.get("price")
-    pnl_col = UP if (j["pnl"] or 0) > 0 else DOWN
-    with st.container(border=True, key=f"hold_card_{h['id']}"):
-        st.markdown(
-            f'<div class="hd-top"><div><b class="hd-name">{html.escape(h["name"])}</b>'
-            f'<span class="hd-code">{h["code"]}</span>'
-            f'<span class="hd-px">{fmt_price(price, cur)}</span>'
-            f'<span class="hd-pnl" style="color:{pnl_col}">{(j["pnl"] or 0):+.2f}% · {_rtxt(j)}</span></div>'
-            f'<span class="hd-verdict" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span></div>'
-            f'<div class="hd-sub">평단 {fmt_price(h["avg"], cur)}'
-            + (f' · {h["qty"]:,.0f}주 · 평가손익 {(price - h["avg"]) * h["qty"]:+,.0f}' if h.get("qty") and price else "")
-            + (' · 🌱 가치투자 계좌(손절선 대신 가치우파·가치훼손으로 판단)' if j.get("account") == "가치" else
-               f' · 손절선 {fmt_price(j["stop_price"], cur)}(여유 {(j["stop_dist"] or 0):.1f}%)'
-               f' · 3R 목표 {fmt_price(j["target3r"], cur)}')
-            + f' · 매수일 {h.get("buy_date", "-")}'
-            + (f' · {html.escape(h["memo"])}' if h.get("memo") else "") + "</div>",
-            unsafe_allow_html=True)
-        icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
-        st.markdown('<div class="hd-checks">' + "".join(
-            f'<div class="hd-chk {st_}"><span>{icon[st_]} {html.escape(item)}</span><em>{html.escape(txt)}</em></div>'
-            for st_, item, txt in j["checks"]) + "</div>", unsafe_allow_html=True)
-        st.markdown('<div class="hd-act"><b>원칙대로라면</b><ul>' + "".join(
-            f"<li>{html.escape(a)}</li>" for a in j["actions"]) + "</ul></div>", unsafe_allow_html=True)
-        _deep_view(j)
-        _quick_edit(h, stt)
-
-        t_news, t_chart = st.tabs(["📰 뉴스·리포트 근거", "🕯️ 차트"])
-        with t_news:
-            ev = load_evidence(h["code"], h["name"])
-            if stt["ai"]:
-                k = f"hold_ai_{h['id']}"
-                if st.button("🤖 뉴스를 원칙과 연결해 요약", key=f"{k}_btn"):
-                    with st.spinner("뉴스·리포트를 읽는 중이에요."):
-                        txt, err = holdings.ai_news_summary(stt["key"], stt["model"], h["name"], j,
-                                                            ev["news"] + ev["research"])
-                    st.session_state[k] = txt or err
-                if st.session_state.get(k):
-                    st.info(st.session_state[k])
-            c1, c2 = st.columns([1.6, 1])
-            with c1:
-                st.markdown("**최근 뉴스** (네이버 증권 · 구글 뉴스 모음)")
-                if ev["news"]:
-                    st.markdown('<div class="hd-news">' + "".join(
-                        f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
-                        f'<em>{html.escape(x["source"])} · {html.escape(x["time"])} · {x["portal"]}</em></a>'
-                        for x in ev["news"][:12]) + "</div>", unsafe_allow_html=True)
-                else:
-                    st.caption("뉴스를 받지 못했어요.")
-            with c2:
-                st.markdown("**증권사 리포트**")
-                if ev["research"]:
-                    st.markdown('<div class="hd-news">' + "".join(
-                        f'<a href="{html.escape(x["url"])}" target="_blank"><span>{html.escape(x["title"])}</span>'
-                        f'<em>{html.escape(x["source"])} · {html.escape(x["time"])}</em></a>'
-                        for x in ev["research"]) + "</div>", unsafe_allow_html=True)
-                else:
-                    st.caption("최근 리포트가 없거나 받지 못했어요.")
-            st.caption("뉴스는 10분마다 새로 모아요. 제목만으로는 판단이 틀릴 수 있으니 원문을 확인하세요.")
-        with t_chart:
-            candle_chart(h["code"], cur, quotes.get(h["code"]) if data.is_kr(h["code"]) else None,
-                         m.get("high52"), key=f"hold_ch_{h['id']}")
-
-
-SEC_ICON = {"good": ("🟢", "#1E7A45"), "info": ("⚪", "#51616C"), "warn": ("🟡", "#B7861D"), "bad": ("🔴", UP)}
-
-
-def _deep_view(j: dict):
-    """점수(펀더멘털 35·추세 25·수급 15·거래량 15·섹터·시장 10) + 분석 표 + 불타기 점검 + 상황별 대응."""
-    if j.get("score") is None:
-        return
-    secs = j.get("sections") or {}
-    chips = "".join(
-        f'<span class="dp-chip" style="border-color:{SEC_ICON.get(v, SEC_ICON["info"])[1]}">{SEC_ICON.get(v, SEC_ICON["info"])[0]} {k}</span>'
-        for k, v in secs.items())
-    gcol = {"A": "#1E7A45", "B": "#2E6B6F", "C": "#B7861D", "D": UP}.get(j.get("grade"), "#51616C")
-    st.markdown(f'<div class="dp-head"><span class="dp-score" style="background:{gcol}">{j["grade"]} · {j["score"]}점</span>'
-                f'{chips}<em>가중치: 펀더멘털 35 · 추세 30 · 거래량 15 · 수급 10(보너스) · 섹터·시장 10</em></div>',
-                unsafe_allow_html=True)
-    icon = {"good": "✅", "warn": "⚠️", "bad": "🛑", "info": "ℹ️"}
-
-    def block(title, items):
-        if not items:
-            return ""
-        return (f'<div class="dp-block"><b>{title}</b>' + "".join(
-            f'<div class="dp-row {st_}"><span>{icon[st_]} {html.escape(it)}</span><em>{html.escape(tx)}</em></div>'
-            for st_, it, tx in items) + "</div>")
-    st.markdown('<div class="dp-grid">' + block("📊 펀더멘털", j.get("fund")) + block("🧭 수급(외국인·기관)", j.get("flow"))
-                + block("🔊 거래량", j.get("vol")) + block("🎓 거장 관점", j.get("masters")) + "</div>", unsafe_allow_html=True)
-    pyr = j.get("pyramid")
-    if pyr:
-        rows = "".join(f'<span class="dp-cond {"ok" if ok else "no"}">{"✔" if ok else "✖"} {html.escape(n)}'
-                       f'{(" · " + html.escape(v)) if v else ""}</span>' for n, ok, v in pyr["conds"])
-        st.markdown(f'<div class="dp-pyr"><b>🔥 불타기(피라미딩) 점검 — {pyr["n_ok"]}/{pyr["n"]}'
-                    f'{" · 오늘 충족" if pyr["ok"] else ""}</b><div>{rows}</div></div>', unsafe_allow_html=True)
-    plan = j.get("plan") or []
-    if plan:
-        st.markdown('<div class="dp-plan"><b>🗺️ 앞으로 이렇게 대응</b>' + "".join(
-            f'<div><span>{html.escape(k)}</span><em>{html.escape(v)}</em></div>' for k, v in plan) + "</div>",
-            unsafe_allow_html=True)
-
-
-def _rtxt(j: dict) -> str:
-    return "🌱 가치 계좌" if j.get("account") == "가치" else f"{(j.get('r') or 0):+.2f}R"
-
-
-def _merge_holdings(items: list) -> list:
-    """같은 종목(코드)끼리 합치기: 수량 합산, 평단은 수량 가중 평균(수량이 없으면 단순 평균), 매수일은 가장 이른 날."""
-    out, by = [], {}
-    for h in items:
-        c = h["code"]
-        if c not in by:
-            by[c] = dict(h)
-            out.append(by[c])
-            continue
-        a = by[c]
-        qa, qb = float(a.get("qty") or 0), float(h.get("qty") or 0)
-        if qa + qb > 0:
-            a["avg"] = (a["avg"] * qa + h["avg"] * qb) / (qa + qb)
-        else:
-            a["avg"] = (a["avg"] + h["avg"]) / 2
-        a["qty"] = qa + qb
-        dates = [d for d in (a.get("buy_date"), h.get("buy_date")) if d]
-        a["buy_date"] = min(dates) if dates else ""
-        memos = [m for m in (a.get("memo"), h.get("memo")) if m]
-        a["memo"] = " / ".join(dict.fromkeys(memos))
-    return out
-
-
-def _holdings_manager(store: dict, stt: dict):
-    """✏️ 보유 종목 관리: 표에서 바로 고치고, 🗑️ 체크해서 지우고, 같은 종목은 합치기."""
-    hs = store["holdings"]
-    codes = [h["code"] for h in hs]
-    dups = sorted({h["name"] for h in hs if codes.count(h["code"]) > 1})
-    with st.expander(f"✏️ 보유 종목 관리 — 고치기 · 지우기 · 합치기 ({len(hs)}종목)", expanded=bool(dups)):
-        if dups:
-            st.warning("같은 종목이 두 번 이상 들어 있어요: " + ", ".join(dups) + " → 아래 '🔗 같은 종목 합치기'를 누르면 수량을 합치고 평단을 다시 계산해요.")
-        ed = st.data_editor(pd.DataFrame([{
-            "🗑️": False, "종목명": h["name"], "코드": h["code"], "평단가": h["avg"], "수량": h.get("qty") or 0.0,
-            "매수일": h.get("buy_date", ""), "손절%": h.get("stop_pct"), "절반 익절함": bool(h.get("half_taken")),
-            "계좌": h.get("account", "추세"), "메모": h.get("memo", ""), "가치훼손": bool(h.get("impaired")),
-            "순현금(억)": h.get("net_cash"), "영업이익(억)": h.get("op"), "영업이익률(%)": h.get("opm"),
-            "_id": h["id"]} for h in hs]),
-            key=f"hold_editor_{len(hs)}", hide_index=True, num_rows="fixed", width="stretch",
-            column_config={"_id": None,
-                           "🗑️": st.column_config.CheckboxColumn("🗑️ 삭제", help="지울 종목을 체크하고 아래 '체크한 종목 삭제'", width="small"),
-                           "코드": st.column_config.TextColumn(disabled=True, width="small"),
-                           "종목명": st.column_config.TextColumn(disabled=True),
-                           "평단가": st.column_config.NumberColumn(format="%.0f"),
-                           "수량": st.column_config.NumberColumn(format="%.0f"),
-                           "손절%": st.column_config.NumberColumn(help="비우면 8% 또는 ATR (추세 계좌)"),
-                           "계좌": st.column_config.SelectboxColumn(options=["추세", "가치"], required=True, width="small"),
-                           "가치훼손": st.column_config.CheckboxColumn(help="가치 계좌: 가치훼손 이슈가 생기면 체크 → 매도 원칙"),
-                           "순현금(억)": st.column_config.NumberColumn(help="가치 계좌 절대가치 계산용"),
-                           "영업이익(억)": st.column_config.NumberColumn(help="연간(또는 올해 추정) 영업이익"),
-                           "영업이익률(%)": st.column_config.NumberColumn(help="배수 = 영업이익률의 절반")})
-        n_del = int(ed["🗑️"].sum()) if len(ed) else 0
-        c1, c2, c3 = st.columns(3)
-        do_save = c1.button("💾 변경 저장", key="hm_save", type="primary", width="stretch")
-        do_del = c2.button(f"🗑️ 체크한 종목 삭제 ({n_del})", key="hm_del", width="stretch", disabled=n_del == 0)
-        do_merge = c3.button("🔗 같은 종목 합치기", key="hm_merge", width="stretch", disabled=not dups)
-        st.caption("칸을 눌러 바로 고친 뒤 '변경 저장' · 지울 종목은 🗑️ 체크 후 '삭제' · 새 종목은 위 '➕ 보유 종목 추가'(이미 있는 종목이면 추가 매수로 합쳐져요)")
-        if do_save or do_del or do_merge:
-            by_id = {h["id"]: h for h in hs}
-            new = []
-            for _, r in ed.iterrows():
-                h = by_id.get(r.get("_id"))
-                if not h or (do_del and bool(r["🗑️"])):
-                    continue
-                sp = r.get("손절%")
-                h.update(avg=float(r["평단가"]), qty=float(r["수량"] or 0), buy_date=str(r["매수일"] or ""),
-                         stop_pct=float(sp) if sp == sp and sp not in (None, "", 0) else None,
-                         half_taken=bool(r["절반 익절함"]), memo=str(r["메모"] or ""),
-                         account=r.get("계좌") if r.get("계좌") in ("추세", "가치") else "추세",
-                         impaired=bool(r.get("가치훼손")),
-                         net_cash=_numor(r.get("순현금(억)")), op=_numor(r.get("영업이익(억)")),
-                         opm=_numor(r.get("영업이익률(%)")))
-                new.append(h)
-            if do_merge:
-                new = _merge_holdings(new)
-            store["holdings"] = new
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(("삭제했어요. " if do_del else "합쳤어요. " if do_merge else "저장했어요. ") + msg)
-            _rerun_frag()
-
-
-def _quick_edit(h: dict, stt: dict):
-    """종목 탭 안에서 바로 고치기·삭제."""
-    with st.expander("✏️ 이 종목 수정 · 삭제"):
-        c1, c2, c3, c4 = st.columns(4)
-        avg = c1.number_input("평단가", value=float(h["avg"]), step=100.0, format="%.0f", key=f"qe_avg_{h['id']}")
-        qty = c2.number_input("수량", value=float(h.get("qty") or 0), step=1.0, format="%.0f", key=f"qe_qty_{h['id']}")
-        stop = c3.number_input("손절 %(0 = 8%/ATR)", value=float(h.get("stop_pct") or 0), step=0.5, key=f"qe_stop_{h['id']}")
-        acct = c4.selectbox("계좌", ["추세", "가치"], index=0 if h.get("account", "추세") == "추세" else 1, key=f"qe_acct_{h['id']}")
-        half = st.checkbox("절반 익절함", value=bool(h.get("half_taken")), key=f"qe_half_{h['id']}")
-        c1, c2, c3 = st.columns([1, 1, 2])
-        if c1.button("💾 저장", key=f"qe_save_{h['id']}", type="primary", width="stretch"):
-            store = holdings.load()
-            for x in store["holdings"]:
-                if x["id"] == h["id"]:
-                    x.update(avg=avg, qty=qty, stop_pct=stop or None, account=acct, half_taken=half)
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(msg)
-            _rerun_frag()
-        sure = c3.checkbox("정말 지울게요", key=f"qe_sure_{h['id']}")
-        if c2.button("🗑️ 삭제", key=f"qe_del_{h['id']}", width="stretch", disabled=not sure):
-            store = holdings.load()
-            store["holdings"] = [x for x in store["holdings"] if x["id"] != h["id"]]
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(f"{h['name']} 삭제했어요. " + msg)
-            _rerun_frag()
-
-
-def _numor(v):
-    try:
-        v = float(v)
-        return v if v == v else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _render_mode(store: dict, stt: dict, ctx: dict):
-    """변동성 장세 알림 + 손절 사다리(R 단위 트레일링 스톱) 선택."""
-    if ctx.get("vol_mode"):
-        st.warning(f"🌊 변동성 큰 횡보장 — 최근 20거래일 중 지수가 ±3% 넘게 움직인 날 {ctx.get('vol_days')}일. "
-                   "깡토 원칙: 쿠션 있는 종목은 추세가 무너지기 전까지 홀딩, 늦게 산 종목은 손절 -5∼6%·목표 +15∼18%로 타이트하게"
-                   "(손익비 1:3은 그대로, 기준 가격만 좁힘). 확신이 부족하면 비중을 줄이거나 쉬어도 돼요.")
-    cur = (store.get("settings") or {}).get("ladder", "2R")
-    c1, c2 = st.columns([2, 3])
-    lad = c1.segmented_control("🪜 손절 사다리(수익이 날수록 손절선 올리기)", ["1R", "2R", "끄기"], default=cur, required=True,
-                               key="hold_ladder",
-                               format_func=lambda x: {"1R": "1R 간격", "2R": "2R 간격(기본)", "끄기": "끄기"}[x],
-                               help="1R 간격: 1R 오르면 본전, 2R이면 +1R … (초보·변동성 장) / 2R 간격: 2R에 본전, 4R에 +2R … "
-                                    "/ 끄기: 절반 익절 전까지 처음 손절선 유지. 익숙해지면 간격을 넓혀 가라는 게 깡토 권장")
-    c2.caption("예) 손절 8%·1R 간격이면 +8%에 손절선 = 평단, +16%에 손절선 = 평단+8%. 노이즈에 털릴 수 있어 익숙해지면 2R·3R로 넓혀요.")
-    if lad and lad != cur:
-        store.setdefault("settings", {})["ladder"] = lad
-        _persist_holdings(store, stt)
-        _rerun_frag()
-
-
-def _render_capital(store: dict, rows, stt: dict, ctx: dict | None = None):
-    """🧮 자본관리: 계좌 원금·현금을 넣으면 지금 지켜야 할 BEP(멈춤선)를 보여줘요(스승님 원칙)."""
-    acc = store.setdefault("account", {})
-    stock_val = sum((m.get("price") or 0) * (h.get("qty") or 0) for h, m, *_ in rows)
-    equity = stock_val + float(acc.get("cash") or 0)
-    principal = float(acc.get("principal") or 0)
-    peak0 = float(acc.get("peak") or 0)
-    today = data.now_kst().strftime("%Y-%m-%d")
-    # 최고 평가액은 오를 때만 기록 — 저장소에 너무 자주 쓰지 않게(저장할 때마다 앱이 새로 배포돼요) 하루 한 번, 1% 넘게 오를 때만
-    if principal and equity > peak0 * 1.01 and acc.get("peak_day") != today:
-        acc.update(peak=round(equity), peak_day=today)
-        _persist_holdings(store, stt)
-    b = holdings.account_bep(principal, float(acc.get("peak") or 0))
-    with st.expander("🧮 자본관리 — 계좌 BEP(멈춤선)", expanded=bool(b) and equity <= b.get("bep", 0) * 1.03):
-        c1, c2, c3 = st.columns([1, 1, 1])
-        p_in = c1.number_input("계좌 원금(원)", min_value=0.0, step=1_000_000.0, value=principal, format="%.0f", key="cap_p")
-        cash = c2.number_input("현금(원)", min_value=0.0, step=100_000.0, value=float(acc.get("cash") or 0), format="%.0f",
-                               key="cap_c")
-        if c3.button("저장", key="cap_save", width="stretch"):
-            acc.update(principal=p_in, cash=cash)
-            if not acc.get("peak") or p_in > acc["peak"]:
-                acc["peak"] = p_in
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(msg)
-            _rerun_frag()
-        if not b:
-            st.caption("원금을 넣으면 '원금 5% 이상 잃지 않기(최대 10%)', '계좌가 커지면 BEP 올리기', "
-                       "'BEP에 닿으면 전액 현금화' 원칙으로 멈춤선을 계산해요. 보유 종목 수량이 있어야 평가액이 맞아요.")
-            return
-        dist = (equity / b["bep"] - 1) * 100
-        col = UP if dist <= 0 else ("#B7861D" if dist < 3 else "#1E7A45")
-        st.markdown(
-            f'<div class="cap-row"><div><em>지금 평가액</em><b>{equity:,.0f}원</b></div>'
-            f'<div><em>최고 평가액</em><b>{b["peak"]:,.0f}원</b></div>'
-            f'<div><em>지켜야 할 BEP</em><b style="color:{col}">{b["bep"]:,.0f}원</b>'
-            f'<span style="color:{col}">여유 {dist:+.1f}%</span></div>'
-            f'<div><em>절대 마지노선(원금 -10%)</em><b>{b["hard"]:,.0f}원</b></div></div>', unsafe_allow_html=True)
-        # 깡토 책: 한 번에 잃어도 되는 금액(계좌의 1~2%, 내 원칙 1.5%) ÷ 손절 폭(8%) = 한 종목 최대 투자금,
-        # 장세에 따라 유닛 수: 오르는 장 3 · 옆으로 2 · 내리는 장 1
-        n_up = (ctx or {}).get("n_above60")
-        units = {2: 3, 1: 2, 0: 1}.get(n_up, 2)
-        max_pos = equity * 0.015 / 0.08
-        st.markdown(
-            f'<div class="cap-row"><div><em>한 종목 최대 투자금(위험 1.5% ÷ 손절 8%)</em><b>{max_pos:,.0f}원</b>'
-            f'<span>평가액의 {max_pos / equity * 100:.1f}%</span></div>'
-            f'<div><em>지금 장세 유닛</em><b>{units}유닛</b><span>지수 60일선 위 {n_up if n_up is not None else "-"}/2 → '
-            f'한 유닛 {max_pos / 4:,.0f}원(최대 비중을 4유닛으로)</span></div></div>', unsafe_allow_html=True)
-        st.caption("유닛은 이긴 뒤에만 한 칸 늘리고(목표 3R에 닿아야 이긴 것) 진 뒤에는 한 칸 줄여요. 최대 8종목.")
-        if equity <= b["bep"]:
-            st.error("🛑 계좌가 BEP에 닿았어요. 원칙: 욕심이 나도 전액 현금화하고 투자를 멈춘 뒤 시장을 다시 관찰하기.")
-        else:
-            st.caption(f"BEP 단계 {b['level']} — 최고 평가액이 원금보다 10% 오를 때마다 BEP를 한 칸씩 올려요"
-                       "(+10% → 본전, +20% → 원금+10% …). 운전의 브레이크처럼, BEP에서 멈출 수 있느냐가 핵심.")
-
-
-PRINCIPLES = [
-    ("자본관리", ["원금의 5%가 훼손되지 않게(최대 10%) — 항상 계좌 전체 기준으로 비중·손절선을 정한다",
-                "계좌가 커지면 BEP도 단계적으로 올린다 / BEP에 닿으면 전액 현금화하고 시장을 다시 본다"]),
-    ("추세추종", ["그룹주(섹터)가 패턴과 거래대금을 만들 때 — 섹터가 안 움직이면 개별 종목 추세도 어렵다",
-                "매수 4조건: 주도섹터 · 돌파(매물대·신고가) · 장대양봉 · 거래량. 하락 뒤 반등은 돌파가 아니다",
-                "주봉으로 추세(60일선 우상향) 먼저, 일봉으로 타점. 상승 → 조정 → 재돌파가 기본 스테이지",
-                "RS는 지수 RS(코스피·코스닥)보다 높아야 대상 — 91이냐 98이냐보다 커트라인 위인지가 중요",
-                "지지 이평선 이탈 = 패턴 훼손 → 매도(너무 좋아 보이면 절반이라도)",
-                "승률 30%면 2.33R가 손익분기, 3R가 최소 목표이자 출발선 — 하방은 닫고 상방은 연다, 물타기 대신 불타기",
-                "트리거가 올 때까지 기다리는 것 = 개인이 기관을 이기는 방법. 변동성 장에선 쉬어도 된다"]),
-    ("가치투자", ["절대가치 = 순현금 + 영업이익 × (영업이익률의 절반) 배",
-                "가치우파(하락 멈춤·횡보·조금씩 우상향) 확인 후 천천히 분할매수 — 매수 기간과 총 비중을 먼저 정한다",
-                "가치훼손 이슈가 생기면(우파 → 좌파) 매도. 가치투자라고 무조건 들고 가지 않는다"]),
-    ("거장 관점(유명 트레이더 매매법)", [
-        "오닐: 피벗(손잡이 고점) +5% 넘게 쫓아 사지 않기 · 매수가 기준 7~8% 손절 · 지수 물량일(거래량 늘며 -0.2%↓) 25일에 4~5일이면 상승장 끝",
-        "미너비니: 추세 템플릿 8가지(150·200일선 위, 200일선 상승, 50일선 최상단, 52주 저점 +25%↑·고점 -25% 이내, RS 상위) · 돌파 직후 20일선 아래 마감이면 확률 절반",
-        "와인스타인: 2단계(30주선 위·상승)에서만, 4단계는 사지 않음 · 손절은 %가 아니라 돌파 자리 아래, 15%보다 멀면 안 삼",
-        "쟁거: 거래량 실린 하락일엔 절반 덜고, 되돌리는 거래량 실린 상승일에 다시 채움 · 돌파 지점 아래로 되돌아오면 전량",
-        "깡토 책: 기관+외국인 순매수가 거래량의 10%↑ · 주봉·일봉 정배열 · 피라미드 1차 30%→2차 15%→3차 10% · 2~3주 횡보면 시간 손절"]),
-    ("깡토 Q&A · 횡보장", [
-        "변동성 큰 횡보장: 지켜보기보다 타이트하게 — 손절 -5~6%면 목표 +15~18%(손익비 1:3 유지, 기준 가격만 변경)",
-        "수익 쿠션 있는 종목은 추세가 무너지기 전까지 홀딩, 늦게 산 후발 종목만 타이트하게",
-        "변동성 장 종목: 시총 크고 RS 높고 섹터가 같이 움직이고 거래량 최대, 섹터에서 가장 먼저 신고가 쓴 종목",
-        "R 사다리: 1R 오르면 손절 본전, 2R이면 +1R … 처음엔 1R 간격, 익숙해지면 2R·3R로 넓히기",
-        "수급·매크로·시즈널리티는 보너스 알파 — 메인 팩터는 추세, 그 추세를 만드는 건 이익(하이브리드)",
-        "숫자 없는 내러티브 종목은 해도 되지만 비중을 줄여서, 넘버스+내러티브가 같이 있는 종목이 우선",
-        "IPO 셋업: 상장 첫날 시가를 넘을 때",
-        "실적이 어긋나면 — 추세 계좌: 맞았냐보다 추세가 꺾였냐 / 가치 계좌: 단순히 다음 분기로 밀린 거면 홀딩",
-        "고멀티플: 추세 계좌에선 시장이 높게 쳐준다는 뜻이라 오히려 괜찮음, 가치 계좌에선 후순위"]),
-    ("검증 메모", ["한국 논문(유명 트레이더 매매법 11장): 52주 최고가 하나만으로는 한국에서 예측력이 약하다는 결과도 있음 → 신고가는 주도섹터·실적·수급과 같이 볼 때 의미",
-                "정리본의 [복원]·[2차] 숫자는 원전값이 아님 — 앱의 기준치는 참고용이고 바꿔 가며 확인할 자리"]),
-    ("계좌 분리", ["추세 계좌와 가치 계좌는 물과 기름 — 섞지 않는다",
-                 "추세 계좌에서 '많이 빠졌으니 싸다'며 사거나, 20일선 이탈 후 'AI가 좋으니까' 버티지 않는다 → 그건 가치 계좌의 일"]),
-]
-
-
-def _render_principles():
-    with st.expander("📘 내 투자 원칙 (스승님·깡토 정리)"):
-        st.markdown('<div class="pr-grid">' + "".join(
-            f'<div class="pr-card"><b>{html.escape(t)}</b><ul>' + "".join(f"<li>{html.escape(x)}</li>" for x in items)
-            + "</ul></div>" for t, items in PRINCIPLES) + "</div>", unsafe_allow_html=True)
-        st.caption("보유 종목 판정은 이 원칙을 점검표로 옮긴 거예요. 매수·매도 추천이 아니라 원칙 확인용이에요.")
-
-
-def _holdings_overview(rows, dot):
-    """보유 종목 한눈에: 판정·수익률·손절선 여유를 표 하나로."""
-    trs = []
-    for h, m, bars, j in rows:
-        cur = m.get("currency") or ("KRW" if data.is_kr(h["code"]) else "USD")
-        bg, fg = LEVEL_COLOR.get(j["level"], LEVEL_COLOR["gray"])
-        pnl = j["pnl"] or 0
-        pc = UP if pnl > 0 else (DOWN if pnl < 0 else "#51616C")
-        sd = j["stop_dist"]
-        sd_col = UP if sd is not None and sd < 3 else "#16212B"
-        bar_w = max(0, min(100, (sd or 0) / 15 * 100))
-        trs.append(
-            f'<tr><td class="l"><b>{html.escape(h["name"])}</b><span class="ho-code">{h["code"]}</span>'
-            f'<span class="ho-acct">{"🌱가치" if h.get("account") == "가치" else "📈추세"}</span></td>'
-            f'<td class="l"><span class="ho-badge" style="background:{bg};color:{fg};border-color:{fg}">{j["verdict"]}</span>'
-            f'{(" <span class=\'ho-acct\'>" + str(j.get("grade")) + " · " + str(j.get("score")) + "점</span>") if j.get("score") is not None else ""}</td>'
-            f'<td>{fmt_price(m.get("price"), cur)}</td><td>{fmt_price(h["avg"], cur)}</td>'
-            f'<td style="color:{pc};font-weight:800">{pnl:+.2f}%</td><td style="color:{pc}">{_rtxt(j)}</td>'
-            f'<td>{fmt_price(j["stop_price"], cur)}</td>'
-            f'<td class="ho-sd"><div class="ho-bar"><i style="width:{bar_w:.0f}%"></i></div>'
-            f'<span style="color:{sd_col}">{(sd or 0):.1f}%</span></td>'
-            f'<td>{fmt_price(j["target3r"], cur)}</td>'
-            f'<td class="l ho-memo">{html.escape(h.get("memo") or "")}</td></tr>')
-    st.markdown(
-        '<div class="ho-wrap"><table class="ho-tbl"><thead><tr><th class="l">종목</th><th class="l">원칙 판정</th>'
-        '<th>현재가</th><th>평단</th><th>수익률</th><th>R</th><th>손절선</th><th>손절까지 여유</th><th>3R 목표</th>'
-        '<th class="l">메모</th></tr></thead><tbody>' + "".join(trs) + '</tbody></table></div>',
-        unsafe_allow_html=True)
-    st.caption("🔴 손절·정리 조건 · 🟠 비중 축소 신호 · 🔵 3R 익절 구간 · 🟡 주의 · 🟢 원칙상 보유 — 위 탭에서 종목을 고르면 점검표·뉴스·차트가 나와요.")
-
-
-LOCK_IDLE_MIN = 30        # 연 지 이만큼(분) 지나면 다시 잠가요
-LOCK_MAX_FAIL = 5         # 연속으로 틀리면
-LOCK_WAIT_SEC = 60        # 이만큼(초) 기다려야 해요
-
-
-def _persist_settings(d: dict, stt: dict) -> tuple[bool, str]:
-    holdings.save_settings_local(d)
-    if stt["gh"]:
-        return reports.save_github(d, stt["token"], stt["repo"], stt["branch"], path="user_settings.json")
-    return True, "이 서버에만 임시로 저장했어요(GitHub 토큰이 없으면 앱을 다시 켤 때 사라질 수 있어요)."
-
-
-def _pw_ok(pw: str, pw2: str) -> str | None:
-    if len(pw) < 4:
-        return "비밀번호는 4자 이상으로 정해 주세요."
-    if pw != pw2:
-        return "두 번 넣은 비밀번호가 달라요."
-    return None
-
-
-def _question_inputs(prefix: str, cur: str | None = None) -> tuple[str, str]:
-    qs = holdings.RECOVERY_QUESTIONS
-    idx = qs.index(cur) if cur in qs else (len(qs) - 1 if cur else 0)
-    q = st.selectbox("복구 질문", qs, index=idx, key=f"{prefix}_q")
-    if q == "직접 질문 쓰기":
-        q = st.text_input("질문", value=cur if cur and cur not in qs else "", key=f"{prefix}_qc")
-    a = st.text_input("답(띄어쓰기·대소문자는 상관없어요)", key=f"{prefix}_a")
-    return q, a
-
-
-def _show_code_once():
-    code = st.session_state.get("lock_new_code")
-    if code:
-        st.markdown(f'<div class="lk-code"><b>🔑 복구 코드</b><span>{code}</span>'
-                    '<em>비밀번호를 잊었을 때 쓰는 코드예요. 지금 한 번만 보여 드려요 — 휴대폰 메모나 종이에 꼭 적어 두세요.</em></div>',
-                    unsafe_allow_html=True)
-        if st.button("적어 뒀어요", key="lock_code_ack"):
-            st.session_state.pop("lock_new_code", None)
-            _rerun_frag()
-
-
-def _lock_gate(stt: dict) -> bool:
-    """보유 종목 잠금. 열렸으면 True. 잠겨 있으면 화면(만들기·열기·찾기)을 그리고 False."""
-    now = time.time()
-    if st.session_state.get("hold_unlocked"):
-        # 자동 새로고침이 계속 돌아서 '안 쓴 시간'을 잴 수 없어요 → 연 지 LOCK_IDLE_MIN분이 지나면 다시 잠가요
-        if now - st.session_state.get("hold_seen", now) > LOCK_IDLE_MIN * 60:
-            st.session_state["hold_unlocked"] = False
-            st.info(f"연 지 {LOCK_IDLE_MIN}분이 지나서 다시 잠갔어요.")
-        else:
-            return True
-    cfg = holdings.load_settings()
-    has_hold = bool(holdings.load().get("holdings"))
-    reset_key = _secret("RESET_KEY") or _secret("APP_PASSWORD")
-
-    with st.container(border=True, key="lock_box"):
-        # ① 처음: 비밀번호 만들기
-        if not holdings.has_password(cfg):
-            st.markdown('<div class="lk-title">🔐 보유 종목 비밀번호 만들기</div>'
-                        '<div class="lk-sub">내 보유 종목은 비밀번호를 넣어야만 보여요. 처음 한 번 정해 주세요.</div>',
-                        unsafe_allow_html=True)
-            if has_hold and not reset_key:
-                st.error("저장된 보유 종목은 있는데 비밀번호 설정이 없어졌어요. 다른 사람이 새 비밀번호를 만들지 못하게, "
-                         "Streamlit Secrets에 RESET_KEY = \"아무 문구\"를 넣은 뒤 그 문구로 다시 만들어 주세요.")
-                return False
-            need_key = has_hold and bool(reset_key)
-            pw = st.text_input("새 비밀번호(4자 이상)", type="password", key="lk_new1")
-            pw2 = st.text_input("한 번 더", type="password", key="lk_new2")
-            hint = st.text_input("비밀번호 힌트(선택 · 잠금 화면에 보여요)", key="lk_hint",
-                                 placeholder="예: 우리 반 번호 + 좋아하는 숫자")
-            q, a = _question_inputs("lk_setq")
-            rk = st.text_input("RESET_KEY(Secrets에 넣은 문구)", type="password", key="lk_rk") if need_key else ""
-            if st.button("비밀번호 만들기", type="primary", key="lk_make"):
-                err = _pw_ok(pw, pw2) or (None if a.strip() else "복구 질문의 답을 넣어 주세요.") \
-                    or ("RESET_KEY가 달라요." if need_key and rk != reset_key else None)
-                if err:
-                    st.error(err)
-                else:
-                    code = holdings.set_password(cfg, pw, hint, q, a, new_code=True)
-                    ok, msg = _persist_settings(cfg, stt)
-                    if ok:
-                        st.session_state.update(hold_unlocked=True, hold_seen=now, lock_new_code=code)
-                        _rerun_frag()
-                    st.error(msg)
-            return False
-
-        # ② 잠금 화면: 비밀번호 넣기
-        lock = cfg.get("lock") or {}
-        st.markdown('<div class="lk-title">🔒 내 보유 종목은 잠겨 있어요</div>'
-                    '<div class="lk-sub">비밀번호를 넣으면 열려요. ' + f'열고 {LOCK_IDLE_MIN}분이 지나거나 창을 새로 열면 다시 잠겨요.</div>',
-                    unsafe_allow_html=True)
-        wait = st.session_state.get("lk_until", 0) - now
-        if wait > 0:
-            st.error(f"{LOCK_MAX_FAIL}번 틀려서 잠깐 멈췄어요. {int(wait) + 1}초 뒤에 다시 넣어 주세요.")
-        c1, c2 = st.columns([3, 1])
-        pw = c1.text_input("비밀번호", type="password", key="lk_pw", label_visibility="collapsed",
-                           placeholder="비밀번호", disabled=wait > 0)
-        go = c2.button("열기", type="primary", width="stretch", key="lk_go", disabled=wait > 0)
-        tried = go or (pw and pw != st.session_state.get("lk_last"))   # 자동 새로고침 때 같은 값으로 다시 세지 않게
-        if tried and pw and wait <= 0:
-            st.session_state["lk_last"] = pw
-            if holdings.check_password(cfg, pw):
-                st.session_state.update(hold_unlocked=True, hold_seen=now, lk_fail=0)
-                _rerun_frag()
-            else:
-                n = st.session_state.get("lk_fail", 0) + 1
-                st.session_state["lk_fail"] = n
-                if n >= LOCK_MAX_FAIL:
-                    st.session_state.update(lk_until=now + LOCK_WAIT_SEC, lk_fail=0)
-                st.error(f"비밀번호가 달라요. ({n}/{LOCK_MAX_FAIL})")
-        if lock.get("hint"):
-            st.caption(f"💡 힌트: {lock['hint']}")
-
-        # ③ 비밀번호 찾기(다시 정하기)
-        with st.expander("🔑 비밀번호를 잊으셨나요?"):
-            st.caption("비밀번호는 암호화해서 저장해서 그대로 보여 드릴 수는 없어요. 아래 방법 중 하나로 확인하면 새 비밀번호로 바꿀 수 있어요.")
-            ways = ["복구 질문"] + ["복구 코드"] + (["Secrets의 RESET_KEY"] if reset_key else [])
-            way = st.segmented_control("확인 방법", ways, default="복구 질문", required=True, key="lk_way")
-            if way == "복구 질문":
-                st.markdown(f"**{lock.get('question', '(질문 없음)')}**")
-                proof = st.text_input("답", key="lk_ans")
-                ok_proof = holdings.check_answer(cfg, proof) if proof else False
-            elif way == "복구 코드":
-                proof = st.text_input("복구 코드(예: ABCD-EFGH-JKLM)", key="lk_code")
-                ok_proof = holdings.check_code(cfg, proof) if proof else False
-            else:
-                proof = st.text_input("RESET_KEY", type="password", key="lk_rk2")
-                ok_proof = bool(proof) and proof == reset_key
-            if proof and not ok_proof:
-                st.error("확인이 안 됐어요. 다시 넣어 주세요.")
-            if ok_proof:
-                st.success("확인됐어요. 새 비밀번호를 정해 주세요.")
-                n1 = st.text_input("새 비밀번호", type="password", key="lk_r1")
-                n2 = st.text_input("한 번 더", type="password", key="lk_r2")
-                if st.button("새 비밀번호로 바꾸기", type="primary", key="lk_reset"):
-                    err = _pw_ok(n1, n2)
-                    if err:
-                        st.error(err)
-                    else:
-                        code = holdings.set_password(cfg, n1, new_code=(way == "복구 코드"))
-                        ok, msg = _persist_settings(cfg, stt)
-                        if ok:
-                            st.session_state.update(hold_unlocked=True, hold_seen=now, lk_fail=0,
-                                                    lock_new_code=code if code else None)
-                            _rerun_frag()
-                        st.error(msg)
-    return False
-
-
-def _security_panel(stt: dict):
-    """🛡️ 보안: 앱 전체 잠금 · 접속 기록 · IP 차단/해제 · 점검표."""
-    cfg = holdings.load_settings()
-    with st.expander("🛡️ 보안 — 앱 전체 잠금 · 접속 기록 · 차단"):
-        forced = _secret("APP_LOCK").lower() in ("on", "true", "1", "yes")
-        on = bool(cfg.get("app_lock")) or forced
-        st.markdown(f"**앱 전체 잠금: {'🔒 켜짐' if on else '🔓 꺼짐'}** — 켜면 첫 화면부터 비밀번호가 있어야 보여요(내 보유 비밀번호와 같아요)."
-                    + (" · Secrets의 APP_LOCK으로 켜져 있어요." if forced else ""))
-        cur = st.text_input("지금 비밀번호(확인용)", type="password", key="sec_cur")
-        if not forced and st.button("🔒 앱 전체 잠금 켜기" if not on else "🔓 앱 전체 잠금 끄기", key="sec_toggle"):
-            if not holdings.check_password(cfg, cur):
-                st.error("지금 비밀번호가 달라요.")
-            else:
-                cfg["app_lock"] = not on
-                ok, msg = _persist_settings(cfg, stt)
-                (st.success if ok else st.error)("앱 전체 잠금을 " + ("켰어요." if not on else "껐어요.") + " " + msg)
-                st.session_state["app_unlocked"] = True
-        log = list(reversed(_sec_store()["log"]))
-        st.markdown(f"**최근 접속 기록** ({len(log)}건 · 앱을 다시 켜면 비워져요)")
-        if log:
-            st.dataframe(pd.DataFrame(log[:200]), hide_index=True, height=240, width="stretch")
-        c1, c2, c3 = st.columns([1.3, 1.6, 0.8])
-        ip = c1.text_input("차단할 IP", key="sec_ip", placeholder="예: 203.0.113.7")
-        memo = c2.text_input("메모", key="sec_memo", placeholder="예: 비밀번호 계속 틀림")
-        if c3.button("차단", key="sec_ban", width="stretch", disabled=not ip.strip()):
-            if not holdings.check_password(cfg, cur):
-                st.error("위에 지금 비밀번호를 넣어야 차단할 수 있어요.")
-            elif ip.strip() == _client_ip():
-                st.error("지금 내가 쓰는 주소는 차단할 수 없어요.")
-            else:
-                cfg.setdefault("blocked_ips", []).append({"ip": ip.strip(), "at": data.now_kst().strftime("%Y-%m-%d %H:%M"),
-                                                          "memo": memo.strip()})
-                ok, msg = _persist_settings(cfg, stt)
-                (st.success if ok else st.error)(f"{ip.strip()} 차단했어요. {msg}")
-        bl = cfg.get("blocked_ips", [])
-        if bl:
-            st.markdown(f"**차단 목록** ({len(bl)}개)")
-            for i, b in enumerate(bl):
-                c1, c2 = st.columns([5, 1])
-                c1.caption(f"🚫 {b.get('ip')} · {b.get('at', '')} · {b.get('memo', '')}")
-                if c2.button("해제", key=f"sec_unban_{i}"):
-                    if holdings.check_password(cfg, cur):
-                        cfg["blocked_ips"] = [x for j, x in enumerate(bl) if j != i]
-                        ok, msg = _persist_settings(cfg, stt)
-                        (st.success if ok else st.error)(msg)
-                        _rerun_frag()
-                    else:
-                        st.error("위에 지금 비밀번호를 넣어야 해제할 수 있어요.")
-        st.caption(f"지금 내 주소: {_client_ip()} · 한 주소가 {SEC_MAX_FAIL}번 틀리면 1시간 막고, 하루 {SEC_AUTOBAN}번 넘게 틀리면 자동으로 차단 목록에 올려요.")
-        st.markdown(
-            "**꼭 같이 해 두세요(앱 밖 설정)**\n"
-            "1. **GitHub 저장소 비공개(Private)** — 코드·보유 종목·리포트 파일을 아무도 못 봐요. 저장소 → Settings → Change visibility.\n"
-            "2. **Streamlit 공유 설정 'Only specific people'** — 내가 허락한 이메일만 앱 주소에 들어올 수 있어요. "
-            "앱 오른쪽 위 Share → Who can view this app. 가장 강력한 잠금이에요.\n"
-            "3. **Secrets** — API 키·토큰은 Secrets에만 두고 코드·저장소에 절대 넣지 마세요.")
-
-
-def _lock_settings(stt: dict):
-    """열린 상태에서: 잠그기 · 비밀번호 바꾸기 · 힌트/복구 질문 바꾸기 · 복구 코드 새로 받기."""
-    cfg = holdings.load_settings()
-    lock = cfg.get("lock") or {}
-    c1, c2 = st.columns([5, 1])
-    c1.caption(f"🔓 열림 · 연 지 {LOCK_IDLE_MIN}분이 지나면 자동으로 잠겨요"
-               + (f" · 비밀번호 바꾼 날 {lock['changed_at']}" if lock.get("changed_at") else ""))
-    if c2.button("🔒 잠그기", width="stretch", key="lk_lock"):
-        st.session_state["hold_unlocked"] = False
-        _rerun_frag()
-    _show_code_once()
-    with st.expander("⚙️ 비밀번호 · 힌트 · 복구 설정"):
-        what = st.segmented_control("바꿀 것", ["비밀번호", "힌트", "복구 질문", "복구 코드 새로 받기"], default="비밀번호",
-                                    required=True, key="lk_what")
-        cur = st.text_input("지금 비밀번호(확인용)", type="password", key="lk_cur")
-        if what == "비밀번호":
-            n1 = st.text_input("새 비밀번호", type="password", key="lk_c1")
-            n2 = st.text_input("한 번 더", type="password", key="lk_c2")
-        elif what == "힌트":
-            new_hint = st.text_input("새 힌트(비우면 힌트 없음)", value=lock.get("hint", ""), key="lk_ch")
-        elif what == "복구 질문":
-            q, a = _question_inputs("lk_chq", lock.get("question"))
-        else:
-            st.caption("새 코드를 받으면 예전 복구 코드는 더 이상 안 돼요.")
-        if st.button("저장", type="primary", key="lk_save"):
-            if not holdings.check_password(cfg, cur):
-                st.error("지금 비밀번호가 달라요.")
-                return
-            code = None
-            if what == "비밀번호":
-                err = _pw_ok(n1, n2)
-                if err:
-                    st.error(err)
-                    return
-                holdings.set_password(cfg, n1)
-            elif what == "힌트":
-                cfg["lock"]["hint"] = new_hint.strip()
-            elif what == "복구 질문":
-                if not a.strip():
-                    st.error("답을 넣어 주세요.")
-                    return
-                cfg["lock"]["question"] = q.strip()
-                cfg["lock"]["answer"] = holdings._hash(holdings._norm_answer(a))
-            else:
-                code = holdings.new_recovery_code()
-                cfg["lock"]["code"] = holdings._hash(code.replace("-", ""))
-            ok, msg = _persist_settings(cfg, stt)
-            if ok:
-                st.session_state["lock_new_code"] = code
-                st.success(f"{what} 저장했어요.")
-                _rerun_frag()
-            else:
-                st.error(msg)
-
-
-@st.fragment
-def render_holdings_tab(df: pd.DataFrame, quotes: dict):
-    """💼 내 보유: 평단가를 넣으면 내 원칙으로 점검하고, 뉴스·리포트 근거를 모아 보여줘요."""
-    stt = _rep_status()
-    _sec_h("💼 내 보유 종목", "평단가를 넣으면 내 매매 원칙으로 점검해요 · 매수·매도 추천이 아니라 원칙 점검표예요")
-    if not _lock_gate(stt):
-        return
-    _lock_settings(stt)
-    _security_panel(stt)
-    store = holdings.load()
-    board_labels = {s["code"]: s["name"] for s in STOCKS}
-
-    with st.expander("➕ 보유 종목 추가", expanded=not store["holdings"]):
-        c1, c2 = st.columns([1.4, 1])
-        q = c1.text_input("종목 이름이나 코드", key="hold_q", placeholder="예: 인텍플러스, 064290")
-        cands = []
-        if q.strip():
-            ql = q.strip().lower()
-            cands = [(c, n) for c, n in board_labels.items() if ql in n.lower() or c.lower().startswith(ql)][:10]
-            if data.is_kr(q.strip()) and len(q.strip()) == 6 and q.strip() not in board_labels:
-                cands.insert(0, (q.strip(), q.strip()))
-            if len(cands) < 5:
-                cands += [x for x in naver_search(q.strip()) if x[0] not in {c for c, _ in cands}][:8]
-        pick = c2.selectbox("찾은 종목", cands, format_func=lambda t: f"{t[1]} ({t[0]})", key="hold_pick",
-                            placeholder="먼저 왼쪽에 검색", index=0 if cands else None)
-        c1, c2, c3, c4 = st.columns(4)
-        avg = c1.number_input("평단가", min_value=0.0, step=100.0, format="%.2f", key="hold_avg")
-        qty = c2.number_input("수량(선택)", min_value=0.0, step=1.0, format="%.0f", key="hold_qty")
-        bdate = c3.date_input("매수일", value=data.now_kst().date(), key="hold_date")
-        stop = c4.number_input("손절 %(비우면 8% 또는 ATR)", min_value=0.0, max_value=50.0, step=0.5, value=0.0, key="hold_stop")
-        c1, c2 = st.columns([3, 1])
-        memo = c1.text_input("메모(선택)", key="hold_memo", placeholder="예: 후공정 섹터 2번째 돌파 진입")
-        acct = c1.segmented_control("계좌", ["추세", "가치"], default="추세", required=True, key="hold_acct",
-                                    format_func=lambda a: "📈 추세추종 계좌" if a == "추세" else "🌱 가치투자 계좌",
-                                    help="추세·가치 계좌는 섞지 않는 게 원칙. 추세 = 돌파 매수·손절선 / 가치 = 가치우파에서 분할매수·가치훼손 시 매도")
-        half = c1.checkbox("이미 절반 익절함(손절선을 본전으로)", key="hold_half")
-        if c2.button("저장", type="primary", width="stretch", disabled=not (pick and avg > 0)):
-            nh = holdings.new_holding(pick[0], pick[1], avg, qty, str(bdate), stop or None, half, memo, acct or "추세")
-            if any(x["code"] == pick[0] for x in store["holdings"]):
-                store["holdings"] = _merge_holdings(store["holdings"] + [nh])
-                st.info(f"{pick[1]}은(는) 이미 있어서 추가 매수로 합쳤어요(수량 합산·평단 재계산).")
-            else:
-                store["holdings"].append(nh)
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(msg)
-            _rerun_frag()
-
-    if not store["holdings"]:
-        st.info("아직 넣은 보유 종목이 없어요. 위에서 종목과 평단가를 넣어 주세요.")
-        return
-
-    ctx = _hold_context(df)
-    rows = []
-    for h in store["holdings"]:
-        m, bars, quote = _hold_metrics(h["code"], df, quotes, h["name"])
-        rows.append((h, m, bars, holdings.judge(h, m, bars, ctx)))
-    _render_mode(store, stt, ctx)
-    _render_capital(store, rows, stt, ctx)
-    _render_principles()
-
-    # 요약
-    tot_cost = sum(h["avg"] * h["qty"] for h, *_ in rows if h.get("qty"))
-    tot_val = sum((_m.get("price") or 0) * h["qty"] for h, _m, *_ in rows if h.get("qty"))
-    cnt = {}
-    for *_, j in rows:
-        cnt[j["verdict"]] = cnt.get(j["verdict"], 0) + 1
-    c = st.columns(4)
-    c[0].metric("보유 종목", f"{len(rows)}개")
-    if tot_cost:
-        c[1].metric("평가손익", f"{tot_val - tot_cost:+,.0f}원", f"{(tot_val / tot_cost - 1) * 100:+.2f}%")
-    c[2].metric("손절·정리 신호", f"{sum(v for k, v in cnt.items() if k.startswith(('🛑', '📉', '⚠️')))}개")
-    c[3].metric("시장", "60일선 위" if ctx["market_ok"] else ("60일선 아래" if ctx["market_ok"] is False else "-"),
-                ctx["market_text"], delta_color="off")
-
-    order = {"red": 0, "orange": 1, "purple": 2, "blue": 3, "yellow": 4, "green": 5, "gray": 6}
-    dot = {"red": "🔴", "orange": "🟠", "purple": "🔥", "blue": "🔵", "yellow": "🟡", "green": "🟢", "gray": "⚪"}
-    rows = sorted(rows, key=lambda x: order.get(x[3]["level"], 9))
-
-    # 종목마다 탭: 맨 앞 '한눈에' + 종목 탭(판정 색 점 · 이름 · 수익률)
-    labels = ["📊 한눈에"] + [f"{dot.get(j['level'], '⚪')} {h['name']} {(j['pnl'] or 0):+.1f}%" for h, m, b, j in rows]
-    with st.container(key="hold_tabs"):
-        try:
-            tabs = st.tabs(labels, key="hold_tab_sel", on_change="rerun")
-            lazy = True
-        except TypeError:
-            tabs = st.tabs(labels)
-            lazy = False
-    if (not lazy) or tabs[0].open:
-        with tabs[0]:
-            _holdings_overview(rows, dot)
-    for tab, (h, m, bars, j) in zip(tabs[1:], rows):
-        if (not lazy) or tab.open:       # (속도) 고른 종목 탭만 뉴스·차트를 불러와요
-            with tab:
-                _holding_card(h, m, bars, j, quotes, stt)
-
-    _holdings_manager(store, stt)
-    if stt["gh"]:
-        st.caption("보유 종목은 GitHub 저장소의 user_holdings.json에 저장돼요. 저장소가 공개(Public)면 누구나 볼 수 있으니 "
-                   "GitHub에서 저장소를 비공개(Private)로 바꿔 두세요.")
-
-
-def now_date() -> str:
-    return data.now_kst().strftime("%y.%m.%d")
-
-
-def _render_saved_reports(stt: dict, editable: bool):
-    store = reports.load_local()
-    reps = list(reversed(store.get("reports", [])))
-    st.markdown(f'<div class="sec-h"><b>📚 넣은 리포트</b><span>{len(reps)}개</span></div>', unsafe_allow_html=True)
-    if not reps:
-        st.caption("아직 앱에서 넣은 리포트가 없어요.")
-        return
-    for rep in reps:
-        with st.expander(f"{reports.tag_name(rep)} · {len(rep.get('stocks', []))}종목 · {rep.get('added_at', '')}"):
-            if rep.get("summary"):
-                st.markdown(rep["summary"])
-            st.dataframe(pd.DataFrame(rep.get("stocks", [])).rename(columns={
-                "name": "종목명", "code": "코드", "sector": "산업", "group": "세부 분류", "desc": "한 줄 설명", "point": "리포트 포인트"}),
-                hide_index=True, width="stretch")
-            if editable and st.button("🗑️ 이 리포트 지우기", key=f"rep_del_{rep['id']}"):
-                store["reports"] = [r for r in store["reports"] if r.get("id") != rep["id"]]
-                ok, msg = _persist(store, stt)
-                (st.success if ok else st.error)(msg)
-                if ok:
-                    time.sleep(0.6)
-                    st.rerun(scope="app")
-
-
-@st.fragment
-def render_chart_tab(df: pd.DataFrame, quotes: dict):
-    """(속도) 이 탭 안에서 검색·버튼을 눌러도 이 칸만 다시 그려요. 예전엔 보드 전체(600종목 계산·모든 탭)를 다시 돌려서 느렸어요."""
-    _render_chart_tab(df, quotes)
-
-
-CHART_INDEXES = {"코스피": ("KOSPI", "코스피"), "코스닥": ("KOSDAQ", "코스닥"), "나스닥": ("^IXIC", None),
-                 "S&P 500": ("^GSPC", None), "다우": ("^DJI", None), "니케이225": ("^N225", None)}
-INDEX_CODES = {v[0]: k for k, v in CHART_INDEXES.items()}
-
-
-def _render_index_chart(code: str):
-    """지수 차트(코스피·코스닥은 실시간으로 마지막 봉 갱신)."""
-    label = INDEX_CODES[code]
-    live = None
-    ov_key = CHART_INDEXES[label][1]
-    if ov_key:
-        try:
-            ov = (load_overview() or {}).get(ov_key) or {}
-            if ov.get("last"):
-                live = {"price": ov["last"], "status": ov.get("status") or "OPEN"}
-        except Exception:
-            live = None
-    bars = load_chart(code, "일봉")
-    if live and bars is not None and len(bars):
-        ref = float(bars["close"].iloc[-1])
-        if ref and abs(live["price"] / ref - 1) > 0.3:      # 실시간 값이 이상하면(단위·자료 오류) 쓰지 않아요
-            live = None
-    last = live["price"] if live else (float(bars["close"].iloc[-1]) if bars is not None and len(bars) else None)
-    prev = None
-    if bars is not None and len(bars) >= 2:
-        same_day = pd.Timestamp(bars["date"].iloc[-1]).date() == data.now_kst().date()
-        prev = float(bars["close"].iloc[-2] if (same_day or not live) else bars["close"].iloc[-1])
-    chg = (last / prev - 1) * 100 if last and prev else None
-    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#51616C")
-    st.markdown(
-        f'<div class="ch-head"><b>{label}</b><span class="ch-code">{code}</span>'
-        f'<span class="ch-px" style="color:{col}">{last:,.2f}' + (f" <small>{chg:+.2f}%</small>" if chg is not None else "")
-        + '</span><span class="ch-sub">' + ("실시간 · 마지막 봉이 새로고침마다 바뀌어요" if live else "해외 지수 · 야후 기준(지연)")
-        + "</span></div>" if last else f'<div class="ch-head"><b>{label}</b></div>', unsafe_allow_html=True)
-    candle_chart(code, "IDX", live, None, key="idxchart", is_index=True)
-
-
-def _render_chart_tab(df: pd.DataFrame, quotes: dict):
-    """🕯️ 차트: 종목을 검색해서 일봉·주봉·월봉 캔들로 봐요."""
-    board = df.drop_duplicates("code")
-    labels = {r.code: f"{r.name} · {r.code} · {'한국' if data.is_kr(r.code) else r.market}" for r in board.itertuples()}
-    codes = list(labels)
-    mine = [c for c in codes if _mkt(c) == market]
-    ordered = mine + [c for c in codes if c not in mine]
-    names = st.session_state.setdefault("chart_names", {})
-    want = st.session_state.get("chart_code")
-    if want in ordered and st.session_state.get("chart_pick") != want:
-        st.session_state["chart_pick"] = want          # 표·카드에서 고른 종목으로 맞춰요
-    if st.session_state.get("chart_pick") not in ordered:
-        st.session_state.pop("chart_pick", None)
-
-    with st.container(key="chart_idx_bar"):
-        cur_idx = INDEX_CODES.get(st.session_state.get("chart_code"))
-        if st.session_state.get("chart_idx") != cur_idx:
-            st.session_state["chart_idx"] = cur_idx
-        st.segmented_control("📈 지수 차트", list(CHART_INDEXES), key="chart_idx", width="stretch",
-                             on_change=lambda: st.session_state.update(
-                                 chart_code=CHART_INDEXES[st.session_state["chart_idx"]][0])
-                             if st.session_state.get("chart_idx") else None)
-    if st.session_state.get("chart_code") in INDEX_CODES:
-        _render_index_chart(st.session_state["chart_code"])
-        st.caption("종목 차트로 돌아가려면 아래 검색칸에서 종목을 고르세요.")
-    with st.container(key="chart_search"):
-        c1, c2 = st.columns([1.35, 1], gap="medium")
-        q = c1.text_input("🔍 종목 검색", placeholder="종목 이름이나 코드를 치고 엔터 — 예: 삼성, 토마토, 035720",
-                          key="chart_q").strip()
-        c2.selectbox("📋 보드 종목에서 고르기", ordered, format_func=labels.get, key="chart_pick",
-                     on_change=lambda: st.session_state.update(chart_code=st.session_state["chart_pick"]))
-        if q:
-            ql = q.lower()
-            res = [(r.code, r.name) for r in board.itertuples()
-                   if ql in str(r.name).lower() or str(r.code).lower().startswith(ql)]
-            on_board = {c for c, _ in res}
-            if data.is_kr(q) and len(q) == 6 and q not in on_board:
-                res.insert(0, (q, q))
-            for c, nm in naver_search(q):
-                if c not in on_board and c not in {x for x, _ in res}:
-                    res.append((c, nm))
-            res = res[:18]
-            if res:
-                names.update({c: nm for c, nm in res})
-                opts = [c for c, _ in res]
-                st.pills(f"관련 종목 {len(res)}개", opts, key=f"chart_res_{q}",
-                         format_func=lambda c: f"{'★ ' if c in on_board else ''}{names.get(c, c)}",
-                         on_change=lambda k=f"chart_res_{q}": st.session_state.update(
-                             chart_code=st.session_state[k]) if st.session_state.get(k) else None,
-                         help="★ = 보드에 넣어 둔 종목. 누르면 아래에 차트가 떠요.")
-            else:
-                st.caption("검색 결과가 없어요. 이름을 조금 짧게 쓰거나 6자리 코드를 넣어 보세요.")
-    code = st.session_state.get("chart_code") or st.session_state.get("chart_pick") or (ordered[0] if ordered else None)
-    if code is None or code in INDEX_CODES:
-        return
-    name, currency, row = (labels.get(code) or "").split(" · ")[0] or names.get(code, code), "KRW", None
-    st.session_state["chart_code"] = code
-    hit = board[board["code"] == code]
-    if len(hit):
-        row = hit.iloc[0]
-        currency = row["currency"]
-    quote = quotes.get(code)
-    if quote is None and data.is_kr(code) and row is None:
-        got, _ = load_quotes((code,))
-        quote = got.get(code)
-    unit = UNIT.get(currency, currency)
-    price = (quote or {}).get("price") or (row["price"] if row is not None else None)
-    prev = (quote or {}).get("prev")
-    chg = (price / prev - 1) * 100 if price and prev else (row["change"] if row is not None else None)
-    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#51616C")
-    sub = []
-    if row is not None:
-        if pd.notna(row.get("to_high")):
-            sub.append(f"52주 최고까지 {row['to_high']:+.1f}%")
-        if pd.notna(row.get("rs")):
-            sub.append(f"RS {row['rs']:.0f}")
-        sub.append(str(row["group"]))
-    st.markdown(
-        f'<div class="ch-head"><b>{html.escape(str(name))}</b><span class="ch-code">{html.escape(code)}</span>'
-        f'<span class="ch-px" style="color:{col}">{fmt_price(price, currency)}{unit}'
-        f'{f" <small>{chg:+.2f}%</small>" if chg is not None and pd.notna(chg) else ""}</span>'
-        f'<span class="ch-sub">{" · ".join(html.escape(x) for x in sub)}</span></div>', unsafe_allow_html=True)
-    candle_chart(code, currency, quote if data.is_kr(code) else None,
-                 row["high52"] if row is not None and pd.notna(row.get("high52")) else None, key="tabchart")
-
-
-@st.fragment
-def render_detail(f: pd.DataFrame, histories: dict, trends: dict):
-    """(속도) 종목을 바꾸거나 차트 버튼을 눌러도 이 칸만 다시 그려요."""
-    _render_detail(f, histories, trends)
-
-
-def _render_detail(f: pd.DataFrame, histories: dict, trends: dict):
-    options = f[f["price"].notna()]
-    if options.empty:
-        return
-    st.subheader("종목 자세히 보기")
-    labels = {r.code: f"{r.name} ({r.code})" for r in options.itertuples()}
-    if st.session_state.get("detail_code") not in labels:
-        st.session_state.pop("detail_code", None)
-    code = st.selectbox("종목", list(labels), format_func=labels.get, label_visibility="collapsed",
-                        key="detail_code")
-    row = options[options["code"] == code].iloc[0]
-
-    c1, c2, c3, c4 = st.columns(4)
-    unit = UNIT.get(row.currency, row.currency)
-    c1.metric("현재가", f"{fmt_price(row.price, row.currency)}{unit}",
-              f"{row.change:+.2f}%" if pd.notna(row.change) else None, delta_color="off")
-    c2.metric("52주 최고", f"{fmt_price(row.high52, row.currency)}{unit}", f"{row.gap:.1f}%", delta_color="off")
-    c3.metric("신고가까지", f"{row.to_high:+.1f}%",
-              "오늘 신고가" if row.days_since_high == 0 else
-              (f"고점 후 {row.days_since_high:.0f}거래일" if pd.notna(row.days_since_high) else "고점 날짜 확인 필요"),
-              delta_color="off")
-    c4.metric("52주 최저", f"{fmt_price(row.low52, row.currency)}{unit}")
-    if getattr(row, "h52_fixed", False) is True:
-        st.caption(f"⚠️ 52주 최고·최저를 네이버 공식값으로 고쳤어요. 일봉 계산값은 최고 "
-                   f"{fmt_price(row.high52_calc, row.currency)}{unit} · 최저 {fmt_price(row.low52_calc, row.currency)}{unit}였어요. "
-                   "이 종목은 일봉 기준 돌파 판정(매수 후보)을 보류해요.")
-
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("종합 RS", _n(row.rs), f"3M {_n(row.rs_3m)} · 6M {_n(row.rs_6m)}", delta_color="off", help=RS_HELP)
-    d2.metric("단기 RS(1M)", _n(row.rs_1m),
-              f"1개월 {row.ret_1m:+.1f}%" if pd.notna(row.ret_1m) else None, delta_color="off")
-    d3.metric("ATR%(20일)", _pct(row.atr_pct), "손절폭은 8%와 ATR 중 큰 값", delta_color="off")
-    if isinstance(row.bo_status, str):
-        if row.bo_status == "유지":
-            sub = (f"{row.bo_date:%m/%d} 돌파 · 직전 52주 최고 {fmt_price(row.bo_level, row.currency)} "
-                   f"대비 {row.bo_vs:+.1f}%")
-        else:
-            sub = (f"52주 최고 {fmt_price(row.bo_level, row.currency)}({row.bo_date:%m/%d}) "
-                   f"대비 {row.bo_vs:+.1f}%")
-        d4.metric("52주 최고가 기준", f"{row.bo_status} {int(row.bo_days)}일", sub, delta_color="off")
-    else:
-        d4.metric("52주 최고가 기준", "-", "일봉이 부족해요", delta_color="off")
-    nh52, ath = _nh_text(row, "nh52"), _nh_text(row, "ath")
-    ath_note = (f"역대 최고가 {fmt_price(row.ath_price, row.currency)}{unit}" if pd.notna(row.ath_price) else "")
-    st.markdown(f"**신고가 봉** — 52주: {nh52 or '없음'} · 역대: {ath or ('없음' if row.ath_ok else '월봉 못 받음')}"
-                + (f"  ·  {ath_note}" if ath_note else ""))
-    if pd.notna(row.cap_local):
-        cap_text = f"시가총액 {data.format_local_cap(row.cap_local, row.currency)}"
-        if row.currency != "KRW" and pd.notna(row.cap_krw):
-            cap_text += f" (약 {data.format_krw(row.cap_krw)}원)"
-        st.markdown(f"**{cap_text}**  \n상장주식수 {row.shares:,.0f}주")
-    if st.button("🕯️ 차트 탭에서 크게 보기", key=f"to_chart_{code}"):
-        st.session_state["chart_code"] = code
-        st.session_state["main_tab_sel"] = "🕯️ 차트"
-        st.rerun()
-    st.write(f"**{row['group']}**  \n{row.desc}")
-    if isinstance(row.get("src"), str) and row.get("src"):
-        st.caption(row["src"])
-    if row.tags:
-        st.caption("리포트 태그: " + ", ".join(row.tags))
-
-    notes = row.get("notes") or []
-    tab_chart, tab_earn, tab_flow, tab_notes = st.tabs(["차트", "실적(영업이익·EPS)", "수급(개인·외국인·기관)",
-                                                        f"자료 메모 {len(notes)}"])
-    with tab_chart:
-        hist = histories.get(code, (None, data.empty_frame(), None))[1]
-        candle_chart(code, row.currency, _QUOTES.get(code) if data.is_kr(code) else None,
-                     row.high52 if pd.notna(row.high52) else None, key="detailchart")
-        if not hist.empty:
-            hist_rows = row.get("bo_history")
-            hist_rows = hist_rows if isinstance(hist_rows, list) else []
-            if hist_rows:
-                st.caption("직전 52주 최고가 종가 돌파 기록 (그 아래에서 마감한 날이 이탈일)")
-                st.dataframe(pd.DataFrame(hist_rows).astype({"이탈일": str})
-                             .style.format({"돌파한 직전 52주 최고가": "{:,.0f}"}), hide_index=True)
-    with tab_earn:
-        render_earnings(code, row.currency)
-    with tab_flow:
-        render_stock_flow(code, trends)
-    with tab_notes:
-        if notes:
-            st.markdown('<ol class="notes">' + "".join(f"<li>{html.escape(n)}</li>" for n in notes) + "</ol>",
-                        unsafe_allow_html=True)
-            st.caption("엣지방 대화 요약(9/22~24)과 캡처 자료에서 모은 포인트예요. 매수·매도 추천이 아니에요.")
-        else:
-            st.caption("이 종목은 따로 모아 둔 메모가 없어요. 위 설명이 요약이에요.")
-
-
-# ─────────────────────────── 매수 후보 ───────────────────────────
-BUY_TIER_STYLE = {"매수 가능": ("#1B8A4B", "✅"), "종가 확인": ("#A87400", "⏳"),
-                  "시장 대기": ("#C0262E", "⛔"), "1개 미충족": ("#51616C", "⚠️")}
-
-
-def _buy_params() -> dict:
-    """원칙은 고정값, 숫자를 정해 주지 않은 기준만 바꿀 수 있게."""
-    d = data.BUY_DEFAULTS
-    with st.expander("⚙️ 기준 · 계좌 금액"):
-        st.caption("고정 원칙: 지수 60일선 위 · 주도섹터의 대장주 · 52주 신고가 돌파(첫 돌파 우선) · RS 70↑ & 지수 RS보다 위 · "
-                   "정배열(강한 종목 면제) · ADX 20↑ · 영업이익·EPS 정배열 · 손절 8%(또는 ATR) · 위험 1.5% · 최대 8종목 · 3R 절반 익절")
-        st.caption("아래 숫자는 원칙에 없어 정해 둔 기본값이에요.")
-        c1, c2, c3 = st.columns(3)
-        fresh = c1.number_input("돌파 후 며칠 이내", 1, 20, d["fresh_days"], key="buy_fresh",
-                                help="돌파 유지 1일째 = 돌파한 날. 너무 오래된 돌파는 타점이 지났다고 봐요.")
-        ext = c2.number_input("20일선 이격 최대(%)", 5.0, 50.0, d["max_ext"], step=1.0, key="buy_ext",
-                              help="원칙: 이평선에서 너무 뜬(단기 과열) 종목은 피하기")
-        cap = c3.number_input("최소 시가총액(억원)", 0.0, 100000.0, d["min_cap"], step=500.0, key="buy_cap",
-                              help="원칙: 너무 작은 종목·테마성 소형주 피하기")
-        c4, c5, c6 = st.columns(3)
-        vol = c4.number_input("돌파일 거래량(50일 평균의 몇 배)", 1.0, 5.0, d["vol_mult"], step=0.1, key="buy_vol",
-                              help="원칙: 3stage 돌파는 큰 거래량")
-        dcr = c5.number_input("돌파일 DCR 최소(%)", 0.0, 100.0, d["dcr_min"], step=5.0, key="buy_dcr",
-                              help="원칙: 강한 종가(DCR 100%에 가까울수록 고가 근처 마감)")
-        top_n = st.number_input("섹터 몇 위까지 주도주로 볼까요", 1, 3, d["top_n"], key="buy_topn",
-                                help="원칙은 1위(대장주)만. 대장이 아직 안 움직일 때 2위까지 보고 싶으면 2")
-        first_only = st.toggle("52주 안 첫 돌파만 보기", value=d["first_only"], key="buy_first",
-                               help="끄면 첫 돌파를 맨 위에 두고 2번째 이상 돌파도 보여줘요. 켜면 첫 돌파만 통과.")
-        equity = c6.number_input("계좌 평가금액(원, 수량 계산용)", 0, 10_000_000_000, 0, step=1_000_000,
-                                 key="buy_equity", help="0이면 수량 계산을 안 해요. 이 값은 저장되지 않아요.")
-    return {**d, "top_n": int(top_n), "first_only": bool(first_only), "fresh_days": int(fresh), "max_ext": float(ext), "min_cap": float(cap),
-            "vol_mult": float(vol), "dcr_min": float(dcr), "earn_years": earn_years, "equity": float(equity or 0)}
-
-
-# ─────────────────────────── 차기 주도섹터 · 섹터 안 급상승 엔진 ───────────────────────────
-def load_trends_all():
-    """화면에 보이는 국내 종목의 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
-    codes = VIEW_CODES.get("heavy") or KR_CODES
-    return swr(("trends_all", codes), 1800, lambda: data.fetch_stock_trends(codes, workers=6), first_wait=False)
-
-
-def load_fins_all():
-    """화면에 보이는 국내 종목의 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
-    codes = VIEW_CODES.get("heavy") or KR_CODES
-    return swr(("fins_all", codes), 43200, lambda: data.fetch_financials_many(codes, workers=12), first_wait=False)
-
-
-def load_official_52w_bg(codes: tuple[str, ...]) -> dict:
-    """새로 들어온 전 종목의 네이버 공식 52주 최고·최저(1시간마다, 기다리지 않음)."""
-    return swr(("h52_all", codes), 3600, lambda: data.fetch_official_52w(codes), first_wait=False, empty={}) or {}
-
-
-def _ok_mark(v) -> str:
-    return "✅" if v is True else ("❌" if v is False else "❔")
-
-
-def _pct_txt(v) -> str:
-    return "-" if v is None or pd.isna(v) else f"{v:+.1f}%"
-
-
-TIER_STYLE = {"차기 주도 후보": ("🔭 후보", "#D6333B"), "주도 유지": ("👑 주도 유지", "#F2B134"),
-              "관찰": ("👀 관찰", "#7FA7C9"), "해당 없음": ("· 미달", "#C9D2D8")}
-
-
-def render_next(df: pd.DataFrame, fins, trends, leaders: set):
-    _sec_h("🔭 차기 주도섹터", "이익증가율 가속 · 기관/외국인 수급 · 신고가 근처 종목 다수")
-    d = data.NEXT_DEFAULTS
-    with st.expander("⚙️ 기준"):
-        c1, c2, c3 = st.columns(3)
-        near_pct = c1.number_input("52주 고가 대비 % 이내", 3.0, 30.0, d["near_pct"], step=1.0, key="nx_near")
-        near_rs = c2.number_input("그중 RS 최소", 0, 99, d["near_rs"], key="nx_rs")
-        min_near = c3.number_input("몇 종목 이상", 1, 10, d["min_near"], key="nx_min")
-        st.caption("① 분류 영업이익 합: 올해(E) 증가율 > 작년 증가율 & > 0 · ② 외국인+기관 20일·5일 모두 순매수 "
-                   "(연기금·투신은 기관 합계에 포함) · ③ 위 조건의 종목 수. 3개 통과 = 후보, 2개 = 관찰. "
-                   "가능성 = 이익 가속 40 · 시총 대비 수급 30 · 신고가 근처 비율 30 (섹터끼리 백분위, 비중은 제가 정한 값)")
-    if fins is None or trends is None:
-        st.info("업종 실적·수급을 받는 중이에요(처음 1~2분).")
-    res = data.next_leader_sectors(df, fins, trends, leaders,
-                                   {"near_pct": near_pct, "near_rs": near_rs, "min_near": min_near}, include_all=True)
-    if res.empty:
-        st.info("섹터를 판정할 데이터가 아직 없어요.")
-        return
-    cnt = res["tier"].value_counts()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🔭 차기 주도 후보", f"{cnt.get('차기 주도 후보', 0)}")
-    c2.metric("👑 주도 유지", f"{cnt.get('주도 유지', 0)}")
-    c3.metric("👀 관찰", f"{cnt.get('관찰', 0)}")
-
-    top = res.dropna(subset=["score"]).sort_values("score", ascending=False).head(15)
-    if not top.empty:
-        dom = list(TIER_STYLE)
-        chart = alt.Chart(top.assign(tier_lab=top["tier"].map(lambda x: TIER_STYLE[x][0]))).mark_bar(cornerRadius=3).encode(
-            y=alt.Y("group:N", sort="-x", title=None, axis=alt.Axis(labelLimit=180)),
-            x=alt.X("score:Q", title="가능성", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("tier:N", scale=alt.Scale(domain=dom, range=[TIER_STYLE[k][1] for k in dom]),
-                            legend=alt.Legend(orient="top", title=None, labelExpr=
-                                              "datum.label == '차기 주도 후보' ? '🔭 후보' : datum.label == '주도 유지' ? "
-                                              "'👑 주도 유지' : datum.label == '관찰' ? '👀 관찰' : '· 미달'")),
-            tooltip=[alt.Tooltip("group:N", title="섹터"), alt.Tooltip("tier_lab:N", title="상태"),
-                     alt.Tooltip("score:Q", title="가능성", format=".0f"), alt.Tooltip("n_near:Q", title="신고가 근처")],
-        ).properties(height=max(180, 26 * len(top)), width="container")
-        st.altair_chart(chart)
-
-    show_all = st.toggle("미달 섹터도 표에 보기", value=False, key="nx_all")
-    full = res
-    if not show_all:
-        res = res[res["tier"] != "해당 없음"]
-    if not res.empty:
-        y = res["years"].iloc[0]
-        view = pd.DataFrame({
-            "상태": res["tier"].map(lambda x: TIER_STYLE[x][0]), "섹터": res["group"], "가능성": res["score"],
-            f"① 이익({y[2]}E)": res.apply(lambda r: f"{_ok_mark(r['earn_ok'])} {_pct_txt(r['g_prev'])} → {_pct_txt(r['g_now'])}", axis=1),
-            "② 외+기 20일(억)": res.apply(lambda r: (r["f20"] or 0) + (r["i20"] or 0) if r["flow_ok"] is not None else None, axis=1),
-            "②": res["flow_ok"].map(_ok_mark) + res["both20"].map(lambda b: " ⭐" if b else ""),
-            "③ 신고가 근처": res.apply(lambda r: f"{_ok_mark(r['near_ok'])} {r['n_near']}개", axis=1),
-        })
-        st.dataframe(
-            view.style.format({"② 외+기 20일(억)": _eok_num}, na_rep="-")
-            .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}; font-weight: 700",
-                 subset=["② 외+기 20일(억)"]),
-            hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
-            column_config={"섹터": st.column_config.Column(pinned=True),
-                           "가능성": st.column_config.ProgressColumn("가능성", min_value=0, max_value=100, format="%d")},
-        )
-    render_next_drill(df, full, fins, trends)
-
-
-def render_next_drill(df: pd.DataFrame, res: pd.DataFrame, fins, trends):
-    """섹터 하나를 골라 종목별로 들여다보기."""
-    _sec_h("🔍 섹터 들여다보기")
-    opts = res["group"].tolist()
-    if not opts:
-        return
-    g = st.selectbox("섹터", opts, key="nx_drill",
-                     format_func=lambda x: f"{x} (가능성 {res.set_index('group').loc[x, 'score']:.0f})"
-                     if pd.notna(res.set_index("group").loc[x, "score"]) else x)
-    m = data.momentum_engine(df, trends, fresh_days=recent_days)
-    sub = m[m["group"] == g].copy()
-    if sub.empty:
-        return
-    y = data.now_kst().year
-    def og(code):
-        f = (fins or {}).get(code)
-        yo = data._year_op(f) if f is not None else {}
-        a, b = yo.get(y - 1), yo.get(y)
-        return (b / a - 1) * 100 if a and a > 0 and b is not None else None
-    sub["og"] = sub["code"].map(og)
-    sub = sub.sort_values("mom", ascending=False)
-    view = pd.DataFrame({
-        "종목": sub["name"] + sub["lead_rank"].map(lambda x: " 👑" if x == 1 else "").where(sub["lead_ok"] == True, ""),  # noqa: E712
-        "급상승 점수": sub["mom"], "현재가": sub["price"], "등락률": sub["change"],
-        "52주 고가 대비": sub["gap"], "RS": sub["rs"], "1개월 RS": sub["rs_1m"],
-        "외국인 20일(억)": sub["f20"], "기관 20일(억)": sub["i20"],
-        f"영업이익 {y}E 증가율": sub["og"], "신고가까지": sub["to_high"], "돌파": sub.apply(_bo_full, axis=1),
-    })
-    st.dataframe(
-        view.style.format({"급상승 점수": "{:.0f}", "현재가": "{:,.0f}", "등락률": "{:+.2f}%", "52주 고가 대비": "{:+.1f}%",
-                           "RS": "{:.0f}", "1개월 RS": "{:.0f}", "외국인 20일(억)": _eok_num, "기관 20일(억)": _eok_num,
-                           f"영업이익 {y}E 증가율": "{:+.1f}%", "신고가까지": "{:+.1f}%"}, na_rep="-")
-        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"])
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}",
-             subset=["등락률", "외국인 20일(억)", "기관 20일(억)", f"영업이익 {y}E 증가율"]),
-        hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
-    )
-
-
-def _sec_h(title: str, note: str = ""):
-    st.markdown(f'<div class="sec-h"><b>{title}</b><span>{html.escape(note)}</span></div>', unsafe_allow_html=True)
-
-
-def _score_bars(v: pd.DataFrame):
-    """급상승 점수를 구성(수급·RS·캔들·저항 돌파)별로 쌓은 막대."""
-    w = data.MOM_WEIGHTS
-    parts = {"수급": ("s_flow", w["flow"]), "RS": ("s_rs", w["rs"]), "캔들": ("s_candle", w["candle"]),
-             "저항 돌파": ("s_break", w["break"])}
-    rows = []
-    for _, r in v.iterrows():
-        label = r["name"] + (" 👑" if (r["lead_rank"] == 1 and r["lead_ok"]) else "")
-        for k, (col, wt) in parts.items():
-            val = r[col]
-            rows.append({"종목": label, "구성": k, "점수": 0 if pd.isna(val) else val * wt, "order": -r["mom"]})
-    d = pd.DataFrame(rows)
-    order = list(dict.fromkeys(d.sort_values("order")["종목"]))
-    c = alt.Chart(d).mark_bar(cornerRadius=2).encode(
-        y=alt.Y("종목:N", sort=order, title=None, axis=alt.Axis(labelLimit=140)),
-        x=alt.X("점수:Q", title=None, scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("구성:N", sort=list(parts), scale=alt.Scale(domain=list(parts),
-                        range=["#D6333B", "#F2B134", "#2E6B6F", "#7FA7C9"]), legend=alt.Legend(orient="top", title=None)),
-        order=alt.Order("구성:N"),
-        tooltip=["종목:N", "구성:N", alt.Tooltip("점수:Q", format=".0f")],
-    ).properties(height=max(160, 24 * len(order)), width="container")
-    st.altair_chart(c)
-
-
-def render_money(df: pd.DataFrame):
-    """💰 거래대금: 지금 어느 섹터에 돈(거래대금)이 몰리는지 + 종목별 실시간 거래량."""
-    d = df[df["code"].map(_mkt) == market].copy()
-    if not {"tv_live", "tv_x", "vol_live", "vol_src"} <= set(d.columns):
-        st.warning("거래량 자료를 아직 못 불러왔어요. 오른쪽 아래 'Manage app' → 'Reboot app'을 한 번 눌러 주세요.")
-        return
-    for c in ("tv_live", "tv_x", "vol_live", "change", "price"):
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d[d["tv_live"].notna()]
-    if d.empty:
-        st.info("거래량 자료가 아직 없어요. 잠시 뒤 새로고침해 보세요.")
-        return
-    live = (d["vol_src"] == "실시간").any()
-    frac = data.session_frac()
-    when = (f"실시간 · 장 진행 {frac * 100:.0f}%" if live and frac < 1 else "실시간(오늘 누적)") if live else "최근 거래일 기준"
-    st.markdown(f'<div class="sec-h"><b>💰 지금 돈이 몰리는 섹터</b><span>{when} · 보드에 넣은 {market_label} 종목 기준</span></div>',
-                unsafe_allow_html=True)
-
-    by = st.segmented_control("묶는 기준", ["세부 분류", "산업"], default="세부 분류", required=True,
-                              key="money_by", label_visibility="collapsed") or "세부 분류"
-    sm = data.sector_money(d, "group" if by == "세부 분류" else "sector")
-    total = d["tv_live"].sum()
-    has = d["tv_x"].notna() & (d["tv_x"] > 0)
-    base = (d.loc[has, "tv_live"] / d.loc[has, "tv_x"]).sum() if has.any() else None
-    tv_b = d.loc[has, "tv_live"].sum()
-    hot = sm[(sm["x"] >= 1.3) & (sm["n"] >= 2)].sort_values("x", ascending=False)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("보드 전체 거래대금", data.format_krw(total) + ("원" if market == "KR" else ""))
-    c2.metric("평소 대비", f"{tv_b / base:.2f}배" if base else "-", help="직전 20거래일 평균 거래대금을 지금 시각까지로 환산해 비교")
-    c3.metric("거래대금 1위 섹터", sm.iloc[0]["sector"] if len(sm) else "-",
-              f"비중 {sm.iloc[0]['share']:.1f}%" if len(sm) else None, delta_color="off")
-    c4.metric("평소보다 뜨거운 섹터", hot.iloc[0]["sector"] if len(hot) else "없음",
-              f"{hot.iloc[0]['x']:.1f}배" if len(hot) else None, delta_color="off")
-
-    top = sm.head(15).copy()
-    top["label"] = top["sector"].astype(str).str.replace("(해외)", "", regex=False)
-    top["tv_eok"] = top["tv"] / 1e8
-    top["heat"] = top["x"].apply(lambda v: "평소의 2배 이상" if v == v and v >= 2 else
-                                 ("1.3~2배" if v == v and v >= 1.3 else ("평소 수준" if v == v and v >= 0.7 else "평소보다 적음")))
-    chart = (
-        alt.Chart(top)
-        .mark_bar(cornerRadiusEnd=4)
-        .encode(
-            y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200, labelOverlap=False)),
-            x=alt.X("tv_eok:Q", title="거래대금(억)" if market == "KR" else "거래대금(현지 통화, 억)"),
-            color=alt.Color("heat:N", title="평소 대비",
-                            scale=alt.Scale(domain=["평소의 2배 이상", "1.3~2배", "평소 수준", "평소보다 적음"],
-                                            range=[UP, "#F08A8F", "#9FB0BA", "#7FA7DE"]),
-                            legend=alt.Legend(orient="top")),
-            tooltip=[alt.Tooltip("label:N", title="섹터"), alt.Tooltip("tv_eok:Q", title="거래대금(억)", format=",.0f"),
-                     alt.Tooltip("share:Q", title="비중(%)", format=".1f"), alt.Tooltip("x:Q", title="평소 대비(배)", format=".2f"),
-                     alt.Tooltip("chg:Q", title="등락(거래대금 가중, %)", format="+.2f"), alt.Tooltip("top:N", title="상위 종목")],
-        )
-        .properties(height=max(220, 26 * len(top)), width="container")
-    )
-    st.altair_chart(chart)
-
-    view = pd.DataFrame({
-        "섹터": sm["sector"], "거래대금": sm["tv"], "비중": sm["share"], "평소 대비": sm["x"],
-        "등락(가중)": sm["chg"], "상승/하락": sm.apply(lambda r: f"{r['up']} / {r['down']}", axis=1),
-        "종목 수": sm["n"], "거래대금 상위 종목": sm["top"],
-    })
-    st.dataframe(
-        view.style.format({"거래대금": data.format_krw, "비중": "{:.1f}%", "평소 대비": "{:.2f}배", "등락(가중)": "{:+.2f}%"},
-                          na_rep="-")
-        .map(_x_color, subset=["평소 대비"])
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}; font-weight: 600",
-             subset=["등락(가중)"]),
-        hide_index=True, height=min(420, 36 * (len(view) + 1) + 4),
-        column_config={"섹터": st.column_config.Column(pinned=True)})
-    st.caption("평소 대비 = 지금까지 거래대금 ÷ (직전 20거래일 평균 거래대금 × 장 진행 비율). 1.3배 이상이면 평소보다 돈이 더 도는 섹터예요. "
-               "장 초반(9시~9시 30분)에는 거래가 몰려서 배수가 크게 나오기 쉬워요. 거래대금만으로는 사는 돈인지 파는 돈인지 모르니 등락과 같이 보세요.")
-
-    st.markdown('<div class="sec-h"><b>📊 종목별 실시간 거래량</b><span>거래대금 많은 순</span></div>', unsafe_allow_html=True)
-    c1, c2 = st.columns([2, 1])
-    pick = c1.selectbox("섹터", ["전체", *sm["sector"].tolist()], key="money_pick", label_visibility="collapsed")
-    n_show = c2.segmented_control("표시", [30, 100, "전체"], default=30, required=True, key="money_n",
-                                  label_visibility="collapsed") or 30
-    col = "group" if by == "세부 분류" else "sector"
-    t = d if pick == "전체" else d[d[col] == pick]
-    t = t.sort_values("tv_live", ascending=False)
-    if n_show != "전체":
-        t = t.head(int(n_show))
-    tv_view = pd.DataFrame({
-        "종목": t["name"], "분류": t["group"], "현재가": t["price"], "일간%": t["change"],
-        "거래량": t["vol_live"], "거래대금": t["tv_live"], "평소 대비": t["tv_x"],
-    })
-    whole = tv_view.index[t["currency"].isin(["KRW", "JPY"]).values]
-    st.dataframe(
-        tv_view.style
-        .format({"현재가": "{:,.2f}", "일간%": "{:+.2f}%", "거래량": fmt_vol, "거래대금": data.format_krw,
-                 "평소 대비": "{:.1f}배"}, na_rep="-")
-        .format("{:,.0f}", subset=pd.IndexSlice[whole, ["현재가"]], na_rep="-")
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}; font-weight: 600", subset=["일간%"])
-        .map(_x_color, subset=["평소 대비"])
-        .map(lambda _: "font-weight: 600", subset=["종목"]),
-        hide_index=True, height=min(760, 36 * (len(tv_view) + 1) + 4),
-        column_config={"종목": st.column_config.Column(pinned=True)})
-    if market == "KR":
-        st.caption("거래량은 네이버 실시간 누적(몇 초 지연)이에요. 자동 새로고침 주기마다 바뀌어요. 매매 전에는 HTS로 다시 확인하세요.")
-    else:
-        st.caption("해외 종목은 실시간 거래량을 받지 않아서 최근 거래일 일봉 기준이에요.")
-
-
-def render_engine(df: pd.DataFrame, trends, leaders: set, fins=None):
-    _sec_h("🚀 섹터 안에서 치고 올라오는 종목", "영업이익 증가 종목만")
-    if fins is None:
-        st.info("영업이익 확인 중이에요(처음 1~2분).")
-        return
-    m = data.momentum_engine(df, trends, fresh_days=recent_days, fins=fins, require_op=True)
-    if m.empty:
-        st.info("영업이익이 늘어나는 종목 중에 순위를 매길 종목이 없어요.")
-        return
-    groups = (m.groupby("group")["mom"].max().sort_values(ascending=False).index.tolist())
-    lead_first = [g for g in groups if g in leaders] + [g for g in groups if g not in leaders]
-    opts = ["섹터별 1위 모아보기"] + lead_first
-    pick = st.selectbox("섹터", opts, key="eng_group", label_visibility="collapsed",
-                        format_func=lambda g: g if g == opts[0] else (f"👑 {g}" if g in leaders else g))
-    if pick == opts[0]:
-        v = m[m["mom_rank"] == 1].sort_values("mom", ascending=False).head(15)
-    else:
-        v = m[m["group"] == pick].sort_values("mom", ascending=False).head(15)
-    _score_bars(v)
-
-    view = pd.DataFrame({
-        "종목": v["name"] + v["lead_rank"].map(lambda x: " 👑" if x == 1 else "").where(v["lead_ok"] == True, ""),  # noqa: E712
-        "점수": v["mom"], "등락률": v["change"], "신고가까지": v["to_high"], "돌파": v.apply(_bo_full, axis=1),
-        "영업이익": v["op_txt"], "섹터": v["group"],
-        "외+기 5일(억)": v["fi5"],
-    })
-    detail = st.toggle("세부 지표", key="eng_detail")
-    if detail:
-        view = view.assign(**{"수급": v["s_flow"].values, "RS점수": v["s_rs"].values, "캔들": v["s_candle"].values,
-                              "저항": v["s_break"].values, "1개월 RS": v["rs_1m"].values, "종합 RS": v["rs"].values,
-                              "오늘 거래량": v["vol_today"].values, "오늘 DCR": v["dcr_today"].values})
-    fmt = {"점수": "{:.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "외+기 5일(억)": _eok_num, "수급": "{:.0f}",
-           "RS점수": "{:.0f}", "캔들": "{:.0f}", "저항": "{:.0f}", "1개월 RS": "{:.0f}", "종합 RS": "{:.0f}",
-           "오늘 거래량": "{:.1f}배", "오늘 DCR": "{:.0f}%"}
-    st.dataframe(
-        view.style.format({k: f for k, f in fmt.items() if k in view.columns}, na_rep="-")
-        .map(lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}", subset=["등락률", "외+기 5일(억)"])
-        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"]),
-        hide_index=True, height=min(460, 36 * (len(view) + 1) + 4),
-        column_config={"종목": st.column_config.Column(pinned=True),
-                       "점수": st.column_config.ProgressColumn("점수", min_value=0, max_value=100, format="%.0f"),
-                       "돌파": st.column_config.Column(help=BO_FULL_HELP)},
-    )
-    with st.expander("ℹ️ 점수 기준"):
-        st.markdown("- 국내 보드 종목 전체 기준 백분위를 가중 평균: **수급 30% · RS 25% · 캔들 20% · 저항 돌파 25%** (비중은 제가 정한 값)\n"
-                    "- 수급 = 외국인+기관 5일 순매수 ÷ 시총 · RS = 1개월 RS + RS 가속 · 캔들 = 오늘 거래량 배수 + 종가 위치(DCR) · "
-                    f"저항 돌파 = 돌파 {recent_days}거래일 이내 만점, 아니면 52주 고가에 가까울수록\n"
-                    "- 올해(E) 영업이익이 작년보다 늘지 않은 종목은 빼요. 매수 판단은 🎯 매수 후보 원칙으로.")
-
-
-# ─────────────────────────── 🧭 시나리오 ───────────────────────────
-SCN_COLOR = {1: "#1B8A4B", 2: "#C27C0E", 2.5: "#A87400", 3: "#1B6FD6", 4: "#C0262E", 0: "#51616C", None: "#51616C"}
-
-
-def _index_ret(hist: dict, window: str) -> dict:
-    out = {}
-    for name, sym in data.MARKETS.items():
-        h = hist.get(sym, (data.empty_frame(), None))[0]
-        if h is None or h.empty or len(h) < 3:
-            out[name] = None
-            continue
-        c = pd.Series(h["close"].to_numpy(dtype=float), index=pd.to_datetime(h["date"]).dt.normalize())
-        last = c.index[-1]
-        if window == "오늘":
-            base = c.iloc[-2]
-        elif window == "이번 주":
-            before = c[c.index < last - pd.Timedelta(days=last.weekday())]
-            base = before.iloc[-1] if len(before) else c.iloc[0]
-        else:
-            base = c.iloc[max(0, len(c) - 1 - int(window.replace("거래일", "")))]
-        out[name] = (c.iloc[-1] / base - 1) * 100
-    return out
-
-
-def _scn_action(sid, hold: str, a: str, b: str) -> str:
-    """보유 상태에 맞춘 행동. 기본(A 보유)은 효석 메모 그대로."""
-    base = data.SCN_INFO[sid][2].replace("{A}", a).replace("{B}", b)
-    if hold == "A 보유":
-        return base
-    if hold == "없음":
-        return {1: f"{a} 쪽에서 매수 후보 원칙 통과 종목만", 2: f"{b} 쪽 원칙 통과 종목부터", 2.5: f"{b} 쪽 원칙 통과 종목 일부, {a} 쪽은 관찰",
-                3: f"{a}·{b} 모두 원칙 통과 종목", 4: "신규 매수 쉬기(현금)", 0: "다음 신호 대기"}[sid]
-    if hold == "B 보유":
-        return {1: f"{b} 보유분은 5일선·50일선 점검(시간이 필요한 구간), {a} 원칙 통과 종목 검토",
-                2: f"{b} 보유 유지(유리)", 2.5: f"{b} 보유 유지, {a} 흐름 확인", 3: f"{b} 유지(유리) + {a} 원칙 통과 종목",
-                4: "현금 확대", 0: "다음 신호 대기"}[sid]
-    return {1: f"{a} 유지, {b} 비중 점검", 2: f"{a} 일부 줄이고 {b} 늘리기", 2.5: f"{a} 급하게 줄이지 말고 {b} 흐름 확인",
-            3: "둘 다 유지(유리)", 4: "현금 확대", 0: "다음 신호 대기"}[sid]
-
-
-VERDICT_COLOR = {"섹터 확장": "#1B6FD6", "로테이션 확인": "#D9822B", "기존 리더 유지": "#1B8A4B",
-                 "돈이 빠지는 중": "#C0262E", "확인 불가": "#8A979F"}
-ZONES = [   # (x1, x2, y1, y2 — 기준 t의 배수, 'L'=끝), 이름, 색
-    ("t", "L", "t", "L", "3 둘 다 감", "#1B6FD6"),
-    ("-t", "t", "t", "L", "3쪽", "#6FA3E8"),
-    ("-ct", "-t", "t", "L", "2↔3", "#E3B341"),
-    ("-L", "-ct", "t", "L", "2 로테이션", "#D9822B"),
-    ("t", "L", "-L", "t", "1 A만 감", "#1B8A4B"),
-    ("-t", "t", "-L", "t", "관망", "#B9C4CC"),
-    ("-L", "-t", "-L", "t", "4 현금", "#C0262E"),
-]
-
-
-def _quadrant_chart(ra: float, rb: float, t: float, crash: float, a_name: str, b_name: str, trail: pd.DataFrame):
-    """가로 = A 수익률, 세로 = B 수익률. 칸 색 = 시나리오, 큰 점 = 지금, 선 = 최근 5거래일 누적 궤적."""
-    vals = [abs(ra), abs(rb), crash * t * 1.3]
-    if not trail.empty:
-        vals += [trail["a"].abs().max(), trail["b"].abs().max()]
-    L = max(vals) * 1.15
-    num = {"t": t, "-t": -t, "ct": crash * t, "-ct": -crash * t, "L": L, "-L": -L}
-    z = pd.DataFrame([{"x1": num[a], "x2": num[b], "y1": num[c], "y2": num[d], "zone": nm.replace("A", a_name),
-                       "color": col, "cx": (num[a] + num[b]) / 2, "cy": (num[c] + num[d]) / 2}
-                      for a, b, c, d, nm, col in ZONES])
-    sx = alt.Scale(domain=[-L, L], nice=False)
-    sy = alt.Scale(domain=[-L, L], nice=False)
-    rects = alt.Chart(z).mark_rect(opacity=0.16).encode(
-        x=alt.X("x1:Q", scale=sx, title=f"{a_name} 수익률(%) →"), x2="x2:Q",
-        y=alt.Y("y1:Q", scale=sy, title=f"{b_name} 수익률(%) →"), y2="y2:Q",
-        color=alt.Color("color:N", scale=None), tooltip=[alt.Tooltip("zone:N", title="시나리오")])
-    labels = alt.Chart(z).mark_text(fontSize=12, fontWeight="bold", opacity=0.7).encode(
-        x="cx:Q", y="cy:Q", text="zone:N", color=alt.Color("color:N", scale=None))
-    zero = alt.Chart(pd.DataFrame({"v": [0]}))
-    axes = zero.mark_rule(color="#8A979F", strokeDash=[3, 3]).encode(x="v:Q") + \
-        zero.mark_rule(color="#8A979F", strokeDash=[3, 3]).encode(y="v:Q")
-    layers = [rects, labels, axes]
-    if not trail.empty:
-        tr = trail.reset_index(drop=True).assign(i=lambda d: range(len(d)))
-        layers.append(alt.Chart(tr).mark_line(color="#51616C", strokeWidth=1.5, point=alt.OverlayMarkDef(size=35, color="#51616C"))
-                      .encode(x="a:Q", y="b:Q", order="i:Q",
-                              tooltip=[alt.Tooltip("day:N", title="날짜"), alt.Tooltip("a:Q", title=a_name, format="+.2f"),
-                                       alt.Tooltip("b:Q", title=b_name, format="+.2f")]))
-        layers.append(alt.Chart(tr).mark_text(dy=-9, fontSize=10, color="#51616C").encode(x="a:Q", y="b:Q", text="day:N"))
-    now = pd.DataFrame({"a": [ra], "b": [rb], "t": ["지금"]})
-    layers.append(alt.Chart(now).mark_point(size=420, filled=True, color="#16212B", stroke="#FFFFFF", strokeWidth=2)
-                  .encode(x="a:Q", y="b:Q", tooltip=[alt.Tooltip("a:Q", title=a_name, format="+.2f"),
-                                                    alt.Tooltip("b:Q", title=b_name, format="+.2f")]))
-    layers.append(alt.Chart(now).mark_text(dy=-18, fontSize=13, fontWeight="bold", color="#16212B")
-                  .encode(x="a:Q", y="b:Q", text="t:N"))
-    st.altair_chart(alt.layer(*layers).properties(height=380, width="container"))
-
-
-def _daily_bars(A: dict, B: dict, a_name: str, b_name: str):
-    d = pd.DataFrame({a_name: A["daily"], b_name: B["daily"]}).dropna(how="all")
-    if d.empty:
-        return
-    d.index = [x.strftime("%m/%d") for x in d.index]
-    long = d.reset_index(names="날짜").melt("날짜", var_name="바스켓", value_name="수익률")
-    c = alt.Chart(long).mark_bar(cornerRadius=2).encode(
-        x=alt.X("날짜:N", title=None, axis=alt.Axis(labelAngle=0)),
-        xOffset=alt.XOffset("바스켓:N", sort=[a_name, b_name]),
-        y=alt.Y("수익률:Q", title="%"),
-        color=alt.Color("바스켓:N", sort=[a_name, b_name], scale=alt.Scale(range=["#F2B134", "#2E6B6F"]),
-                        legend=alt.Legend(orient="top", title=None)),
-        tooltip=["날짜:N", "바스켓:N", alt.Tooltip("수익률:Q", format="+.2f")],
-    ).properties(height=200, width="container")
-    st.altair_chart(c)
-
-
-def _tile(ok, label: str, value: str) -> str:
-    cls = "ok" if ok is True else ("no" if ok is False else "na")
-    ic = "✓" if ok is True else ("✕" if ok is False else "?")
-    return (f'<div class="tile {cls}"><span class="t-ic">{ic}</span><div class="t-lb">{html.escape(label)}</div>'
-            f'<div class="t-v">{html.escape(value)}</div></div>')
-
-
-def render_money_confirm(df: pd.DataFrame, a_groups, b_groups, a_name: str, b_name: str, price_sid):
-    c = data.rotation_confirm(df, a_groups, b_groups)
-    title, _mean, act = c["verdict"]
-    col = VERDICT_COLOR.get(title, "#8A979F")
-    price_name = data.SCN_INFO[price_sid][0].replace("{A}", a_name).replace("{B}", b_name) if price_sid is not None else "-"
-    price_map = {1: "기존 리더 유지", 2: "로테이션 확인", 2.5: "로테이션 확인", 3: "섹터 확장", 4: "돈이 빠지는 중"}
-    mismatch = price_sid in price_map and price_map[price_sid] != title and title != "확인 불가"
-    st.markdown(
-        f'<div class="verdict" style="--vc:{col}"><div class="v-top"><span class="v-lab">돈의 방향</span>'
-        f'<span class="v-price">가격 기준 {html.escape(price_name)}{" · ⚠ 돈과 다름" if mismatch else ""}</span></div>'
-        f'<div class="v-title">{html.escape(title)}</div><div class="v-act">{html.escape(act.split(" · ")[0])}</div></div>',
-        unsafe_allow_html=True)
-    B, A = c["B"], c["A"]
-    bp, bn = c["b_share"]
-    b_tiles = [
-        _tile(c["b_checks"][0][1], "거래대금", "-" if B["tv_ratio"] is None else f"{B['tv_ratio']:.2f}배"),
-        _tile(c["b_checks"][1][1], "거래대금 비중", "-" if bn is None else f"{bp * 100:.1f}→{bn * 100:.1f}%"),
-        _tile(c["b_checks"][2][1], "신규 돌파", f"{B['n_break']}개"),
-        _tile(c["b_checks"][3][1], "RS 동반 상승", "-" if B["rs_up"] is None else f"{B['rs_up'] * 100:.0f}%"),
-    ]
-    n_def = len(c["defense"])
-    a_tiles = [
-        _tile(c["a_checks"][1][1], "리더 방어", f"{sum(x['ok'] for x in c['defense'])}/{n_def}" if n_def else "-"),
-        _tile(c["a_checks"][0][1], "RS(1M) 중앙값", "-" if A["rs1m_med"] is None else f"{A['rs1m_med']:.0f}"),
-    ]
-    chips = []
-    for x in c["defense"]:
-        v20 = "" if x["vs20"] is None else f" {x['vs20']:+.0f}%"
-        chips.append(f'<span class="lc {"ok" if x["ok"] else "no"}">{html.escape(x["name"])}{v20}</span>')
-    st.markdown(
-        f'<div class="tiles-wrap"><div><div class="tiles-h">{html.escape(b_name)} · 돈을 받아가나 <b>{c["b_ok"]}/4</b></div>'
-        f'<div class="tiles">{"".join(b_tiles)}</div></div>'
-        f'<div><div class="tiles-h">{html.escape(a_name)} · 리더가 버티나 <small>(20일선 대비)</small></div>'
-        f'<div class="tiles t2">{"".join(a_tiles)}</div>'
-        f'<div class="lead-chips">{"".join(chips)}</div></div></div>', unsafe_allow_html=True)
-
-
-def render_money_radar(df: pd.DataFrame, leaders: set):
-    st.markdown("#### 📡 섹터 간 돈의 이동")
-    r, sm = data.sector_money_radar(df, leaders, {"fresh_days": recent_days})
-    if r.empty:
-        st.caption("거래대금 데이터가 아직 부족해요.")
-        return
-    allr = sm["all_tv_ratio"]
-    flow_line = (f'<span class="mv out">{html.escape(", ".join(sm["losers"]) or "—")}</span>'
-                 f'<span class="mv-arrow">→</span>'
-                 f'<span class="mv in">{html.escape(", ".join(sm["gainers"]) or "받는 쪽 없음")}</span>')
-    total = "" if allr is None else (f'<span class="mv-total">보드 전체 거래대금 {allr:.2f}배 '
-                                     f'{"▲ 새 돈" if allr >= 1.1 else ("▼ 이탈" if allr <= 0.9 else "· 비슷")}</span>')
-    st.markdown(f'<div class="mv-row">{flow_line}{total}</div>', unsafe_allow_html=True)
-    kind = r["state"].map(lambda x: "돈 들어옴" if x in ("💰 돈 들어오는 중", "🔥 리더 강화") else
-                          ("돈 빠짐" if x in ("🧊 돈 빠지는 중", "📉 리더 약화(돈 빠짐)") else
-                           ("주도 유지" if x == "👑 리더 유지" else "변화 없음")))
-    d = r.assign(kind=kind, rsu=r["rs_up"].fillna(0) * 100,
-                 label=r.apply(lambda x: ("👑 " if x["leading"] else "") + x["group"], axis=1))
-    dom = ["돈 들어옴", "돈 빠짐", "주도 유지", "변화 없음"]
-    base = alt.Chart(d).encode(
-        x=alt.X("share_chg:Q", title="거래대금 비중 변화(%p) →"),
-        y=alt.Y("rsu:Q", title="RS 동반 상승(%) →", scale=alt.Scale(domain=[0, 100])))
-    pts = base.mark_circle(opacity=0.8, stroke="#FFFFFF", strokeWidth=1).encode(
-        size=alt.Size("share_now:Q", legend=None, scale=alt.Scale(range=[40, 900])),
-        color=alt.Color("kind:N", scale=alt.Scale(domain=dom, range=["#D6333B", "#1F66C9", "#F2B134", "#C9D2D8"]),
-                        legend=alt.Legend(orient="top", title=None)),
-        tooltip=[alt.Tooltip("group:N", title="섹터"), alt.Tooltip("state:N", title="상태"),
-                 alt.Tooltip("share_prev:Q", title="이전 비중%", format=".2f"),
-                 alt.Tooltip("share_now:Q", title="최근 비중%", format=".2f"),
-                 alt.Tooltip("n_break:Q", title="신규 돌파"), alt.Tooltip("rsu:Q", title="RS 동반%", format=".0f")])
-    txt = base.transform_filter(alt.datum.kind != "변화 없음").mark_text(dy=-12, fontSize=11, fontWeight="bold") \
-        .encode(text="label:N", color=alt.Color("kind:N", scale=alt.Scale(domain=dom, range=["#B0242B", "#1A56A8", "#A87400", "#8A979F"]),
-                                               legend=None))
-    rules = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#8A979F", strokeDash=[3, 3]).encode(x="x:Q") + \
-        alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(color="#8A979F", strokeDash=[3, 3]).encode(y="y:Q")
-    st.altair_chart((rules + pts + txt).properties(height=380, width="container"))
-    with st.expander("섹터별 숫자 보기"):
-        view = pd.DataFrame({"상태": r["state"], "섹터": r["group"],
-                             "비중": r.apply(lambda x: f"{x['share_prev']:.1f}→{x['share_now']:.1f}%", axis=1),
-                             "변화(%p)": r["share_chg"], "거래대금": r["tv_ratio"], "신규 돌파": r["n_break"],
-                             "RS 동반": r["rs_up"]})
-        st.dataframe(view.style.format({"변화(%p)": "{:+.2f}", "거래대금": "{:.2f}배", "RS 동반": "{:.0%}"}, na_rep="-")
-                     .map(lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}", subset=["변화(%p)"]),
-                     hide_index=True, column_config={"섹터": st.column_config.Column(pinned=True)})
-
-
-def _mini_list(rows: list[str]) -> None:
-    st.markdown('<div class="mini">' + "".join(rows) + "</div>", unsafe_allow_html=True)
-
-
-def _mini_row(name: str, right: str, sub: str) -> str:
-    return (f'<div class="mini-row"><div><b>{html.escape(name)}</b><small>{sub}</small></div>'
-            f'<span>{right}</span></div>')
-
-
-def render_scenario(df: pd.DataFrame, histories: dict, trends, leaders: set, fins=None):
-    groups_all = sorted(df["group"].dropna().unique().tolist())
-    pr0 = data.SCENARIO_PRESETS["반도체 후공정 vs 전공정"]
-    with st.expander("⚙️ 바스켓 · 기간 · 기준", expanded=False):
-        preset = st.selectbox("프리셋", list(data.SCENARIO_PRESETS), key="scn_preset")
-        pr = data.SCENARIO_PRESETS[preset]
-        c1, c2 = st.columns(2)
-        a_name = c1.text_input("A (지금 들고 있는/주도 쪽)", pr["a_name"], key="scn_an")
-        b_name = c2.text_input("B (다음 후보 쪽)", pr["b_name"], key="scn_bn")
-        a_groups = c1.multiselect("A 분류", groups_all, [g for g in pr["a_groups"] if g in groups_all], key="scn_ag")
-        b_groups = c2.multiselect("B 분류", groups_all, [g for g in pr["b_groups"] if g in groups_all], key="scn_bg")
-        c3, c4, c5, c6 = st.columns(4)
-        window = c3.selectbox("기간", list(data.SCN_WINDOWS), index=1, key="scn_win")
-        t = c4.number_input("간다/빠진다 기준(%)", 0.3, 15.0, data.SCN_WINDOWS[window], step=0.5, key=f"scn_t_{window}")
-        crash = c5.number_input("과하게 빠짐(기준 ×)", 1.5, 5.0, 2.5, step=0.5, key="scn_crash")
-        hold = c6.selectbox("지금 보유", ["A 보유", "B 보유", "둘 다", "없음"], key="scn_hold")
-        st.caption(f"칸 = 시나리오 · 큰 점 = {window} 수익률(시총가중) · 선 = 최근 5거래일 누적 궤적. "
-                   f"±{t:g}% 넘으면 간다/빠진다, A가 −{crash * t:g}% 아래면 과하게 빠짐. 행동은 돈의 방향 판정을 따라요.")
-    if not a_groups or not b_groups:
-        st.info("A·B 분류를 하나 이상씩 골라 주세요.")
-        return
-    A = data.basket_stats(df, histories, a_groups, window, trends)
-    B = data.basket_stats(df, histories, b_groups, window, trends)
-    cls = data.classify_scenario(A["ret_cap"], B["ret_cap"], t, crash)
-    if cls["id"] is None:
-        st.warning("바스켓 가격 데이터가 부족해요.")
-        return
-
-    render_money_confirm(df, a_groups, b_groups, a_name, b_name, cls["id"])
-
-    idx = _index_ret(load_indexes(), window)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(a_name, _pct_txt(A["ret_cap"]), f"상승 {A['breadth'] or 0:.0f}%", delta_color="off")
-    m2.metric(b_name, _pct_txt(B["ret_cap"]), f"상승 {B['breadth'] or 0:.0f}%", delta_color="off")
-    m3.metric("코스피", _pct_txt(idx.get("코스피")))
-    m4.metric("코스닥", _pct_txt(idx.get("코스닥")))
-
-    ca, cb = st.columns([1.35, 1])
-    with ca:
-        a_d, b_d = A["daily"], B["daily"]
-        days = [d for d in a_d.index if d in b_d.index]
-        trail = pd.DataFrame({"day": [d.strftime("%m/%d") for d in days],
-                              "a": ((1 + a_d.loc[days] / 100).cumprod() - 1).values * 100,
-                              "b": ((1 + b_d.loc[days] / 100).cumprod() - 1).values * 100}) if days else pd.DataFrame()
-        _quadrant_chart(A["ret_cap"], B["ret_cap"], t, crash, a_name, b_name, trail)
-    with cb:
-        st.markdown("**하루씩**")
-        _daily_bars(A, B, a_name, b_name)
-        paths = [p_ for p_ in data.scenario_paths(A["ret_cap"], B["ret_cap"], t, crash) if p_["dist"] > 1e-6][:2]
-        if paths:
-            st.markdown("**다음으로 가까운 시나리오**")
-            rows = []
-            for p_ in paths:
-                nm = data.SCN_INFO[p_["id"]][0].replace("{A}", a_name).replace("{B}", b_name)
-                mv = " · ".join(f"{lab} {x:+.1f}%p" for lab, x in ((a_name, p_["move_a"]), (b_name, p_["move_b"])) if abs(x) > 1e-6)
-                rows.append(_mini_row(nm, "", mv))
-            _mini_list(rows)
-
-    m = data.momentum_engine(df, trends, fresh_days=recent_days, fins=fins, require_op=fins is not None)
-    cA, cB = st.columns(2)
-    with cA:
-        st.markdown(f"**{a_name} 대장 · 끌고 가기**")
-        rows = []
-        for r in data.sector_leaders(df, a_groups).itertuples():
-            g = r.ma5_vs_50
-            sig = "-" if pd.isna(g) else ("🔴 정리" if g <= 0 else ("🟡 근접" if g < 3 else "🟢 보유"))
-            rows.append(_mini_row(r.name, sig, f"{html.escape(r.group)} · {_bo_full(r)}"))
-        if rows:
-            _mini_list(rows)
-        else:
-            st.caption("대장주 없음")
-    with cB:
-        st.markdown(f"**{b_name} 담을 후보**")
-        if fins is None:
-            st.caption("영업이익 확인 중…")
-        else:
-            rows = []
-            for r in m[m["group"].isin(b_groups)].sort_values("mom", ascending=False).head(5).itertuples():
-                th = "-" if pd.isna(r.to_high) else f"{r.to_high:+.1f}%"
-                rows.append(_mini_row(r.name + (" 👑" if (r.lead_rank == 1 and r.lead_ok) else ""),
-                                      f"신고가까지 {th}", f"{_bo_full(r)} · {r.op_txt}"))
-            if rows:
-                _mini_list(rows)
-            else:
-                st.caption("조건에 맞는 종목 없음")
-    st.divider()
-    render_money_radar(df, leaders)
-
-
-def _hold_text(r) -> str:
-    """원칙: 3R 절반 익절 뒤 나머지는 일봉 5일선이 50일선에 닿으면 정리. 그 전까지 끌고 간다."""
-    g = r.get("ma5_vs_50")
-    if g is None or pd.isna(g):
-        return "-"
-    if g <= 0:
-        return f"🔴 5일선이 50일선 닿음({g:+.1f}%) — 나머지 정리 신호"
-    if g < 3:
-        return f"🟡 5일선이 50일선 +{g:.1f}% — 가까워짐"
-    return f"🟢 끌고 가기(5일선 50일선 +{g:.1f}%)"
-
-
-def _hold_short(r) -> str:
-    g = r.get("ma5_vs_50")
-    if g is None or pd.isna(g):
-        return "-"
-    return f"🔴 정리 신호 {g:+.1f}%" if g <= 0 else (f"🟡 근접 {g:+.1f}%" if g < 3 else f"🟢 보유 {g:+.1f}%")
-
-
-def render_leaders(df: pd.DataFrame, leaders: set):
-    """주도섹터마다 대장주 1위와 끌고 가기 점검(5일선 vs 50일선)."""
-    if not leaders:
-        return
-    lead = data.sector_leaders(df, leaders)
-    if lead.empty:
-        return
-    _sec_h("👑 주도섹터 대장주 · 끌고 가기", "5일선이 50일선에 닿으면 나머지 정리")
-    view = pd.DataFrame({
-        "대장주": lead["name"], "섹터": lead["group"], "현재가": lead["price"], "등락률": lead["change"],
-        "신고가까지": lead["to_high"], "돌파": lead.apply(_bo_full, axis=1), "RS": lead["rs"],
-        "끌고 가기": lead.apply(_hold_short, axis=1),
-    })
-    st.dataframe(
-        view.style.format({"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}"}, na_rep="-")
-        .map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}", subset=["등락률"])
-        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"]),
-        hide_index=True, height=min(360, 36 * (len(view) + 1) + 4),
-        column_config={"대장주": st.column_config.Column(pinned=True), "돌파": st.column_config.Column(help=BO_FULL_HELP)},
-    )
-
-
-def render_buy(df: pd.DataFrame, quotes: dict):
-    """내 매매 원칙을 모두 통과한 국내 종목. 산업·태그 필터와 관계없이 보드 전체에서 찾아요."""
-    _sec_h("🎯 매수 후보", "내 원칙을 모두 통과한 국내 종목만")
-    p = _buy_params()
-    hist = load_indexes()
-    parts, oks = [], []
-    for name, sym in data.MARKETS.items():
-        sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
-        ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
-        oks.append(ok)
-        parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
-    market_ok = None if None in oks else all(oks)
-    idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
-              for name, sym in data.MARKETS.items()}
-    market_text = " · ".join(parts)
-    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
-    intraday = data.market_status(quotes).startswith("장중")
-
-    pre = data.buy_screen(df, market_ok, market_text, leaders, p, fins=None, intraday=intraday, idx_rs=idx_rs)
-    res = pd.DataFrame()
-    if not pre.empty:
-        codes = tuple(pre["code"])
-        with st.spinner("후보 실적 확인 중…"):
-            fins = data.fetch_financials_many(codes)
-        res = data.buy_screen(df[df["code"].isin(codes)], market_ok, market_text, leaders, p, fins=fins,
-                              intraday=intraday, idx_rs=idx_rs)
-    counts = res["tier"].value_counts() if not res.empty else pd.Series(dtype=int)
-    idx_txt = " · ".join(f"{n} {'✓' if o else ('✕' if o is False else '?')}" for n, o in zip(data.MARKETS, oks))
-    tiles = [
-        _tile(market_ok, "시장 60일선", idx_txt),
-        _tile(bool(leaders), "주도섹터", f"{len(leaders)}개"),
-        _tile(True if counts.get("매수 가능", 0) else None, "✅ 매수 가능", f"{counts.get('매수 가능', 0)}"),
-        _tile(None, "⏳ 종가 확인 · ⚠️ 1개 미충족", f"{counts.get('종가 확인', 0)} · {counts.get('1개 미충족', 0)}"),
-    ]
-    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
-    if market_ok is False:
-        st.error("⛔ 매수 쉬는 구간 — 코스피·코스닥 둘 다 60일선 위일 때만. 아래는 참고용이에요.")
-
-    render_leaders(df, leaders)
-    if res.empty:
-        st.caption("원칙에 맞는 종목도, 하나만 빠지는 종목도 지금은 없어요.")
-        return
-    trends = data.fetch_stock_trends(tuple(res["code"]))
-    labels = dict(data.BUY_RULES)
-    rows = []
-    for x in res.itertuples():
-        r, c = x.row, x.checks
-        plan = data.position_plan(float(r["price"]), r.get("atr_pct"), p["equity"], p)
-        sm = data.trend_summary(trends.get(x.code))
-        rows.append({
-            "상태": f"{BUY_TIER_STYLE[x.tier][1]} {x.tier}", "종목": x.name,
-            "섹터 순위": c["top"][1].split(" (")[0].split("/")[0],
-            "현재가": r["price"], "신고가까지": r.get("to_high"), "돌파": _bo_full(r.to_dict()),
-            "손절가": plan["stop_price"], "3R 목표가": plan["target_price"],
-            "수량": plan["shares"], "매수금액": plan["amount"],
-            "미충족": ", ".join(labels[k].split("(")[0] for k in x.fails) or "-",
-            "등락률": r["change"], "RS": r.get("rs"), "ADX": r.get("adx"), "20일선 이격": r.get("dist_ma20"),
-            "돌파일 거래량": r.get("bo_vol_ratio"), "DCR": r.get("bo_dcr"), "손절폭": plan["stop_pct"],
-            "외국인 5일(억)": sm["flow5_외국인"], "기관 5일(억)": sm["flow5_기관"], "끌고 가기": _hold_short(r),
-            "분류": x.group, "메모": "HTF — 리스크 타이트" if r.get("htf") else "",
-        })
-    view = pd.DataFrame(rows)
-    base_cols = ["상태", "종목", "섹터 순위", "현재가", "신고가까지", "돌파", "손절가", "3R 목표가"] + \
-        (["수량", "매수금액"] if p["equity"] else []) + ["미충족"]
-    if not st.toggle("지표 자세히", key="buy_detail"):
-        view = view[base_cols]
-    elif not p["equity"]:
-        view = view.drop(columns=["수량", "매수금액"])
-    fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}", "ADX": "{:.0f}",
-           "20일선 이격": "{:+.1f}%", "돌파일 거래량": "{:.1f}배", "DCR": "{:.0f}%", "손절가": "{:,.0f}",
-           "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}",
-           "외국인 5일(억)": _eok_num, "기관 5일(억)": _eok_num}
-    sty = view.style.format({k: v for k, v in fmt.items() if k in view.columns}, na_rep="-") \
-        .map(lambda v: f"color: {BUY_TIER_STYLE[v.split(' ', 1)[1]][0]}; font-weight: 700", subset=["상태"]) \
-        .map(_bo_color, subset=["돌파"]).map(_to_high_color, subset=["신고가까지"])
-    for col in ("등락률", "외국인 5일(억)", "기관 5일(억)"):
-        if col in view.columns:
-            sty = sty.map(lambda v: "" if pd.isna(v) or v == 0 else f"color: {UP if v > 0 else DOWN}", subset=[col])
-    st.dataframe(sty, hide_index=True, height=min(520, 36 * (len(view) + 1) + 4),
-                 column_config={"종목": st.column_config.Column(pinned=True),
-                                "돌파": st.column_config.Column(help=BO_FULL_HELP)})
-
-    good = res[res["tier"].isin(["매수 가능", "종가 확인", "시장 대기"])]
-    for x in good.itertuples():
-        with st.expander(f"{BUY_TIER_STYLE[x.tier][1]} {x.name} · 조건 체크"):
-            st.markdown('<div class="tiles">' + "".join(
-                _tile(x.checks[k][0], lab.split("(")[0], x.checks[k][1][:22]) for k, lab in data.BUY_RULES) + "</div>",
-                unsafe_allow_html=True)
-            if x.tier == "종가 확인":
-                st.caption("오늘 장중 돌파 — 종가가 직전 52주 최고가 위에서 마감하는지 확인.")
-    with st.expander("ℹ️ 표 읽는 법"):
-        st.markdown("- ⏳ 종가 확인 = 오늘 장중 돌파 · ⛔ 시장 대기 = 종목은 통과, 시장 미충족 · ⚠️ 1개 미충족 = 관심 종목(매수 대상 아님)\n"
-                    "- 손절가 = 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR) · 수량 = 계좌 1.5% 위험 · 3R 목표가에서 절반 익절\n"
-                    "- 해외 종목은 제외 · 종목별 수급의 연기금·투신은 기관 합계에 포함 · 마지막 확인은 HTS 차트로")
-
-
-def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
-    mb = _GC.get("mb") or rss_mb()
-    if mb:
-        st.caption(f"🖥️ 서버 메모리 {mb:,.0f}MB" + (" · 빠듯해서 뒤쪽 새로 받기를 잠시 멈췄어요" if mb > MEM_SOFT else ""))
-    failed = df[df["price"].isna()]
-    mismatch = df[df["name_ok"] == False]  # noqa: E712
-    cap_missing = int(df["cap_krw"].isna().sum())
-    fixed = df[df["h52_fixed"] == True] if "h52_fixed" in df else df.iloc[0:0]  # noqa: E712
-    if not fixed.empty:
-        with st.expander(f"🔧 52주 최고·최저 교정 {len(fixed)}종목 — 네이버 공식값으로 고쳐서 보여주고 있어요"):
-            view = pd.DataFrame({
-                "종목": fixed["name"], "코드": fixed["code"],
-                "앱 계산 최고": fixed["high52_calc"], "네이버 최고": fixed["high52"],
-                "차이(%)": pd.to_numeric(fixed["h52_diff"], errors="coerce").round(1),
-                "앱 계산 최저": fixed["low52_calc"], "네이버 최저": fixed["low52"],
-            })
-            st.dataframe(view, hide_index=True)
-            st.caption("일봉 데이터로 계산한 값이 네이버 공식 52주 최고·최저와 0.3% 넘게 다른 종목이에요. "
-                       "주로 유·무상증자·액면분할로 과거 주가가 수정된 종목이에요. 표·괴리율·신고가까지는 공식값으로 보여주고, "
-                       "일봉 기준 돌파 판정이 틀릴 수 있어서 🎯 매수 후보에서는 '판정 보류'로 빼요. 매매 전에는 HTS 차트로 확인하세요.")
-    if failed.empty and mismatch.empty and not quote_error and cap_missing == 0 and not PENDING_MISS:
-        return
-    n_items = len(failed) + len(mismatch) + (1 if cap_missing else 0) + len(PENDING_MISS)
-    with st.expander(f"데이터 점검 필요 {n_items}건"):
-        for name, cands in PENDING_MISS.items():
-            hint = ", ".join(f"{nm} {c}" for c, nm in cands) if cands else "후보 없음"
-            st.write(f"코드 못 찾음: {name} — 네이버 검색 후보: {hint}")
-        if cap_missing and shares_store:
-            miss = df[df["cap_krw"].isna()]
-            kr, os_ = shares_store.get("kr", {}), shares_store.get("os", {})
-            by_market = miss.groupby("market")["name"].apply(list)
-            parts = [f"{m} {len(v)}개: {', '.join(v[:15])}{' 외' if len(v) > 15 else ''}" for m, v in by_market.items()]
-            st.write(f"시가총액 없는 종목 {cap_missing}개 — " + " / ".join(parts))
-            st.caption(
-                f"최근 조회 결과: 국내 {sum(v for k, v in kr.items() if k != 'total')}/{kr.get('total', 0)} "
-                f"(상세API {kr.get('상세API', 0)}, 순위표 {kr.get('순위표', 0)}, 종목페이지 {kr.get('종목페이지', 0)}, 모바일 {kr.get('모바일', 0)}), "
-                f"해외 {os_.get('SEC', 0) + os_.get('네이버', 0) + os_.get('야후', 0)}/{os_.get('total', 0)} "
-                f"(SEC {os_.get('SEC', 0)}, 네이버 {os_.get('네이버', 0)}, 야후 {os_.get('야후', 0)}). "
-                "빠진 종목은 10분마다 다시 시도해요(종목당 3번까지, 12시간마다 전체 새로 받기). "
-                "대만·유럽·호주 종목은 네이버가 다루지 않고 야후가 막히면 '-'로 남을 수 있어요."
-            )
-        if quote_error:
-            st.write(f"실시간 시세: {quote_error}. 일봉 마지막 값으로 대신 보여주고 있어요.")
-        for r in failed.itertuples():
-            st.write(f"조회 실패: {r.name} ({r.code}) — {r.error}")
-        for r in mismatch.itertuples():
-            st.write(f"이름 불일치: 목록에는 {r.name}, 네이버에는 {r.naver_name} ({r.code})")
-        st.caption("코드가 틀렸거나 사명이 바뀐 경우예요. verify.bat을 실행하면 올바른 코드를 찾아줘요.")
-
-
-def load_financials(codes: tuple[str, ...]) -> dict:
-    """종목별 연간 영업이익·EPS. data 쪽에서 종목마다 12시간 기억해요."""
-    with st.spinner(f"영업이익·EPS 실적과 전망을 불러오는 중이에요({len(codes)}종목, 처음 한 번만 오래 걸려요)."):
-        return data.fetch_financials_many(codes)
-
-
-def add_earnings(f: pd.DataFrame, fins: dict) -> pd.DataFrame:
-    res = [data.earnings_trend(fins.get(c), earn_years) for c in f["code"]]
-    keys = list(data.earnings_trend(None))
-    return f.assign(**{k: [r[k] for r in res] for k in keys}) if len(f) else f.assign(**{k: [] for k in keys})
-
-
-def render_earnings(code: str, currency: str):
-    """종목 자세히 보기: 연간 매출·영업이익·EPS와 정배열 판정."""
-    if not data.is_kr(code):
-        st.caption("해외 종목은 실적 정배열 판정을 하지 않아요.")
-        return
-    fin = data.fetch_financials(code)
-    if fin is None or fin.empty:
-        st.caption("실적 자료를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
-        return
-    tr = data.earnings_trend(fin, earn_years)
-    mark = {True: "✅ 정배열", False: "❌ 아님", None: "판정 불가(전망 없음/자료 부족)"}
-    c1, c2, c3 = st.columns(3)
-    c1.metric("영업이익·EPS 정배열", mark[tr["earn_ok"]], tr["earn_span"], delta_color="off")
-    c2.metric("영업이익", mark[tr["op_ok"]])
-    c3.metric("EPS", mark[tr["eps_ok"]])
-    view = fin.set_index("period")[[c for c in ("sales", "op", "eps") if c in fin]].T
-    view.index = [{"sales": "매출액(억원)", "op": "영업이익(억원)", "eps": "EPS(원)"}[i] for i in view.index]
-    st.dataframe(view.style.format("{:,.0f}", na_rep="-"))
-    st.caption("네이버 증권 기업실적분석(연결 우선) 기준, (E)는 컨센서스 전망치예요. "
-               "네이버는 보통 전망을 1~2년만 줘서 3년 치 전망을 보여주는 사이트와 판정이 다를 수 있어요.")
-
-
-# ─────────────────────────── 🏁 신고가 후보 ───────────────────────────
-NHC_CSS = """
-<style>
-.nh-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; margin: 0.2rem 0 0.7rem; }
-.nh-head b { font-size: 1.35rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em; }
-.nh-head span { font-size: 0.8rem; color: #7A8A94; }
-.nh-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; margin-bottom: 1.3rem; }
-.nh-box { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; overflow: hidden; }
-.nh-box-h { background: #F7F9FA; border-bottom: 1px solid #EEF1F3; padding: 0.75rem 1rem 0.65rem; }
-.nh-box-t { display: flex; justify-content: space-between; align-items: center; font-size: 1.05rem; font-weight: 800; color: #16212B; }
-.nh-box-t .cnt { font-size: 1.2rem; font-weight: 800; font-variant-numeric: tabular-nums; }
-.nh-box-d { font-size: 0.78rem; color: #6B7A84; margin-top: 0.15rem; }
-.nh-box-b { padding: 0.6rem 0.7rem 0.7rem; display: flex; flex-direction: column; gap: 0.5rem; max-height: 470px; overflow-y: auto; }
-.nh-empty { text-align: center; color: #6B7A84; font-size: 0.85rem; padding: 1.6rem 0; }
-.stApp a.nh-card { display: block; border: 1px solid #E3E8EB; border-radius: 10px; padding: 0.6rem 0.7rem 0.55rem;
-  text-decoration: none; color: #16212B; background: #FFFFFF; }
-.stApp a.nh-card:hover { border-color: #B9C7CF; }
-.nh-c-top { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
-.nh-c-name { font-weight: 800; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nh-c-chg { font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.nh-c-sub { font-size: 0.75rem; color: #6B7A84; margin: 0.1rem 0 0.45rem; }
-.nh-c-keys { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.35rem; }
-.nh-c-keys div { background: #F2F5F7; border-radius: 7px; padding: 0.3rem 0.5rem; font-size: 0.68rem; color: #6B7A84; min-width: 0;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nh-c-keys b { display: block; font-size: 0.95rem; font-weight: 800; color: #16212B; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.nh-c-keys b small { font-size: 0.7rem; font-weight: 600; color: #6B7A84; margin-left: 0.1rem; }
-.nh-pill { display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.72rem; font-weight: 700; padding: 0.15rem 0.5rem;
-  border-radius: 6px; white-space: nowrap; }
-.nh-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.nh-pill.s-돌파 { background: #FCE4E5; color: #C0262E; }
-.nh-pill.s-터치 { background: #FFF1C9; color: #9A6A00; }
-.nh-pill.s-임박 { background: #FFE8D6; color: #C2570E; }
-.nh-pill.s-근접 { background: #E3F4EA; color: #1B6B3E; }
-.nh-pill.s-관찰 { background: #EEF1F3; color: #51616C; }
-.nh-tbl-wrap { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; overflow-x: auto; }
-table.nh-tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.nh-tbl th { background: #F7F9FA; font-size: 0.78rem; font-weight: 700; color: #51616C; padding: 0.6rem 0.6rem; text-align: right;
-  white-space: nowrap; border-bottom: 1px solid #E3E8EB; }
-.nh-tbl td { padding: 0.55rem 0.6rem; border-top: 1px solid #F0F3F5; text-align: right; white-space: nowrap; font-size: 0.86rem; vertical-align: middle; }
-.nh-tbl tr:first-child td { border-top: none; }
-.nh-tbl th.l, .nh-tbl td.l { text-align: left; } .nh-tbl th.c, .nh-tbl td.c { text-align: center; }
-.nh-tbl td.rk { color: #6B7A84; }
-.nh-tbl td.nm a { color: #16212B; font-weight: 800; text-decoration: none; font-size: 0.93rem; }
-.nh-tbl td small { display: block; font-size: 0.72rem; color: #7A8A94; font-weight: 500; margin-top: 0.05rem; }
-.nh-tbl td.sp { min-width: 170px; }
-.nh-tbl .sp-lab { font-size: 0.8rem; margin-bottom: 0.1rem; }
-.nh-tbl .sp-lab b { font-weight: 800; } .nh-tbl .sp-lab span { color: #7A8A94; font-size: 0.74rem; margin-left: 0.15rem; }
-.nh-tbl td b.px { font-weight: 800; color: #16212B; }
-.nh-tbl td b.rs { font-weight: 800; font-size: 0.95rem; color: #16212B; }
-.vs-tag { display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 0.05rem 0.4rem; border-radius: 6px; margin-left: 0.3rem; }
-.vs-tag.first { background: #FCE4E5; color: #C0262E; } .vs-tag.multi { background: #FFE8D6; color: #C2570E; }
-.vs-tag.dn { background: #E4EDFA; color: #1F66C9; }
-@media (max-width: 640px) {
-  .nh-grid { grid-template-columns: 1fr; gap: 0.6rem; }
-  .nh-box-b { max-height: 430px; }
-  .nh-tbl .hide-m { display: none; }
-  .nh-tbl td, .nh-tbl th { padding: 0.45rem 0.4rem; font-size: 0.8rem; }
-  .nh-tbl td.sp { min-width: 130px; }
+SHORT = {
+    "stop": "손절가 이탈 → 전량 매도 (손실은 짧게)",
+    "exit_rest": "절반 익절 후 5일선이 50일선에 닿음 → 나머지 매도",
+    "take_half": "3R 익절가 도달 → 절반 매도, 손절가는 본전으로",
+    "climax": "신고가 대량 윗꼬리 · 고점 −10% 대량 음봉 → 비중 축소",
+    "trend": "속도에 맞는 이평선 이탈 → 종가로 2~3일 확인",
+    "breakeven": "+2R 본절 · +4R → +1R · +5R → +2R 잠금",
+    "protect": "올려 둔 손절가(수익 잠금) 이탈 → 남은 물량 정리",
+    "add": "수익 중 신고가 돌파 + 거래량 → 1유닛 추가 (물타기 금지)",
+    "market": "지수가 60일선 아래 → 신규·추가 매수 쉬기",
+    "fund": "영업이익이 늘지 않으면 배제",
+    "rs": "종목 RS가 지수보다 위여야 함",
+    "hold": "손절가 위 · 추세 유지 → 그대로 보유",
 }
-</style>
-"""
-
-NHC_SECTIONS = [
-    ("신선 후보", "✳️", "#1B8A4B", "최근 돌파 이력이 없고 거래대금과 RS가 살아난 후보예요."),
-    ("돌파권", "🎯", "#C27C0E", "신고가 기준가까지 가까워 관찰 우선순위가 높아요."),
-    ("돌파 중", "📈", "#D6333B", "현재가가 기준가(직전 52주 최고가) 위에 있어요."),
-    ("터치 후 밀림", "〰️", "#1F66C9", "오늘 신고가를 터치했지만 기준 아래로 밀린 재관찰 후보예요."),
-]
-NHC_LABEL = {"돌파": "돌파성공", "터치": "터치 후 밀림", "임박": "임박", "근접": "근접", "관찰": "관찰"}
 
 
-def _spark_svg(vals, ref: float | None, up: bool, w: int = 160, hgt: int = 34) -> str:
-    """종가 스파크라인 + 신고가 기준선(점선). 끝점: 돌파 초록, 아니면 빨강."""
-    vals = [v for v in (vals or []) if v == v]
-    if len(vals) < 2:
+def range_bar(price, avg, stop, target, mk) -> str:
+    lo, hi = min(stop, price), max(target, price)
+    if hi <= lo:
         return ""
-    lo, hi = min(vals + ([ref] if ref else [])), max(vals + ([ref] if ref else []))
-    rng = (hi - lo) or 1.0
-    pad = 3
-    def y(v):
-        return pad + (hgt - 2 * pad) * (1 - (v - lo) / rng)
-    step = (w - 2 * pad) / (len(vals) - 1)
-    pts = " ".join(f"{pad + i * step:.1f},{y(v):.1f}" for i, v in enumerate(vals))
-    end_x, end_y = pad + (len(vals) - 1) * step, y(vals[-1])
-    parts = [f'<svg width="{w}" height="{hgt}" viewBox="0 0 {w} {hgt}" style="display:block">']
-    if ref:
-        ry = y(ref)
-        fill = "#E3F4EA" if up else "#FCE9EA"
-        parts.append(f'<rect x="0" y="0" width="{w}" height="{max(ry, 0):.1f}" fill="{fill}" opacity="0.55"/>')
-        parts.append(f'<line x1="0" x2="{w}" y1="{ry:.1f}" y2="{ry:.1f}" stroke="#E08A8F" stroke-width="1" stroke-dasharray="3 3"/>')
-    parts.append(f'<polyline points="{pts}" fill="none" stroke="#5B6770" stroke-width="1.3" stroke-linejoin="round"/>')
-    parts.append(f'<circle cx="{end_x:.1f}" cy="{end_y:.1f}" r="2.8" fill="{"#1FA75A" if up else "#D6333B"}"/>')
-    parts.append("</svg>")
-    return "".join(parts)
+    pos = lambda v: max(0.0, min(100.0, (v - lo) / (hi - lo) * 100))
+    return (f"<div class='rng' style='--avg:{pos(avg):.1f}%'><div class='bar'></div>"
+            f"<div class='avg' style='left:{pos(avg):.1f}%'></div>"
+            f"<div class='now' style='left:{pos(price):.1f}%' title='현재가'></div>"
+            f"<div class='tk l' style='left:0'>손절 {fmt(stop, mk)}</div>"
+            f"<div class='tk' style='left:{pos(avg):.1f}%'>평단</div>"
+            f"<div class='tk r' style='left:100%'>익절 {fmt(target, mk)}</div></div>")
 
 
-def _chg_html(v) -> str:
-    if v is None or pd.isna(v):
-        return "-"
-    color = UP if v > 0 else DOWN if v < 0 else "#51616C"
-    return f'<span style="color:{color}">{v:+.2f}%</span>'
+SECTOR_ALIAS = {   # 네이버 업종명을 짧게
+    "반도체와반도체장비": "반도체", "전자장비와기기": "전자장비", "디스플레이장비및부품": "디스플레이",
+    "IT서비스": "IT서비스", "전기장비": "전기장비", "전기제품": "전기제품", "우주항공과국방": "방산·우주",
+    "화장품": "화장품", "건강관리장비와용품": "의료기기", "생물공학": "바이오", "제약": "제약",
+    "기계": "기계", "조선": "조선", "건설": "건설", "화학": "화학", "철강": "철강",
+    "에너지장비및서비스": "에너지장비", "석유와가스": "정유", "자동차부품": "자동차부품", "자동차": "자동차",
+    "소프트웨어": "소프트웨어", "통신장비": "통신장비", "핸드셋": "휴대폰", "식품": "식품", "음료": "음료",
+}
 
 
-def _tv_eok(v) -> str:
-    if v is None or pd.isna(v):
-        return "-"
-    e = v / 1e8
-    return f"{e / 1e4:,.2f}조" if e >= 1e4 else f"{e:,.0f}억"
+def sector_of(h) -> str:
+    if h.get("sector"):
+        return h["sector"]
+    s_ = auto_sector(h["code"], h["market"])
+    return SECTOR_ALIAS.get(s_, s_) if s_ else "미분류"
 
 
-def _dist_html(r, big: bool = False) -> tuple[str, str]:
-    """('10.40%', '돌파') / ('3.83%', '남음')"""
-    if r["nh_state"] == "돌파":
-        return f'<b style="color:{UP}">{r["nh_brk"]:.2f}%</b>', "돌파"
-    return f'<b>{max(r["nh_dist"], 0):.2f}%</b>', "남음"
-
-
-def _nh_card(r) -> str:
-    brk = r["nh_state"] == "돌파"
-    head, lab = ("고가에서", "돌파") if brk else ("고가까지", "남음")
-    num = f'<span style="color:{UP}">{r["nh_brk"]:.2f}%</span>' if brk else f'{max(r["nh_dist"], 0):.2f}%'
-    tvr = "-" if pd.isna(r["tv_ratio"]) else f"{r['tv_ratio']:.1f}배"
-    rs = "-" if pd.isna(r["rs"]) else f"{r['rs']:.0f}"
-    rs1 = "-" if pd.isna(r["rs_1m"]) else f"{r['rs_1m']:.0f}"
-    return (
-        f'<a class="nh-card" href="?chart={html.escape(str(r["code"]))}" target="_self">'
-        f'<div class="nh-c-top"><span class="nh-c-name">{html.escape(str(r["name"]))} '
-        f'<span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></span>'
-        f'<span class="nh-c-chg">{_chg_html(r["change"])}</span></div>'
-        f'<div class="nh-c-sub">{r["code"]} · {html.escape(str(r["group"]))}</div>'
-        f'<div class="nh-c-keys"><div>{head}<b>{num}<small>{lab}</small></b></div>'
-        f'<div>거래대금 20일 평균대비<b>{tvr}</b></div><div>RS / RS1M<b>{rs} / {rs1}</b></div></div></a>'
-    )
-
-
-def _nh_params() -> dict:
-    d = data.NHC_DEFAULTS
-    with st.expander("⚙️ 후보 기준 바꾸기"):
-        c1, c2, c3 = st.columns(3)
-        p = {
-            "imminent": c1.slider("임박: 기준가까지 %", 0.5, 5.0, float(d["imminent"]), 0.5, key="nhc_imm"),
-            "near": c2.slider("근접: 기준가까지 %", 3.0, 15.0, float(d["near"]), 0.5, key="nhc_near"),
-            "watch": c3.slider("관찰: 기준가까지 %", 8.0, 30.0, float(d["watch"]), 1.0, key="nhc_watch"),
-        }
-        c4, c5, c6 = st.columns(3)
-        p["tv_min"] = c4.slider("돌파권·신선: 거래대금 20일 평균대비(배)", 1.0, 5.0, float(d["tv_min"]), 0.1, key="nhc_tv")
-        p["rs_min"] = c5.slider("돌파권·신선: 종합 RS 이상", 50, 99, int(d["rs_min"]), 1, key="nhc_rs")
-        p["fresh_days"] = c6.slider("신선: 최근 며칠간 신고가 없음(거래일)", 20, 120, int(d["fresh_days"]), 5, key="nhc_fresh")
-    return p
-
-
-def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
-    st.markdown(NHC_CSS, unsafe_allow_html=True)
-    st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
-                f'{data.market_status(quotes)} · 국내 종목 전체</span></div>', unsafe_allow_html=True)
-    with st.expander("읽는 법"):
-        st.markdown(
-            "- **기준가** = 오늘을 뺀 직전 52주(250거래일) 장중 최고가. 오늘 값은 실시간 시세로 계산해요.\n"
-            "- **돌파성공** 현재가 > 기준가 · **터치 후 밀림** 오늘 고가는 기준가를 넘었지만 현재가는 아래 · "
-            "**임박/근접/관찰** 기준가까지 남은 % (기본 2% / 7% / 15%)\n"
-            "- **거래대금 20일 평균대비** = 오늘 거래대금 ÷ 직전 20거래일 평균 거래대금 (장중엔 쌓이는 중이라 작게 나와요)\n"
-            "- **돌파권** = 임박·근접 중 거래대금 1.5배 이상 + RS 80 이상 · "
-            "**신선 후보** = 돌파·터치·임박·근접 중 같은 조건 + 최근 60거래일 동안 52주 신고가를 쓴 적 없음\n"
-            "- 카드를 누르면 네이버 증권이 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
-    p = _nh_params()
-    cand = data.nh_candidates(df, histories, quotes, p)
-    if cand.empty:
-        st.info("지금 조건에 맞는 신고가 후보가 없어요.")
+def sector_section(rows):
+    """계좌 안 섹터 비중 — 평가금액 기준 가로 막대."""
+    rows = [r for r in rows if r["ind"]]
+    if not rows:
         return
+    agg = {}
+    for r in rows:
+        v = r["ind"]["price"] * r["pos"].qty * r["fx"]
+        sec = sector_of(r["h"])
+        a = agg.setdefault(sec, {"v": 0.0, "pl": 0.0, "names": []})
+        a["v"] += v
+        a["pl"] += (r["ind"]["price"] - r["pos"].avg) * r["pos"].qty * r["fx"]
+        a["names"].append((r["h"]["name"], v))
+    total = sum(a["v"] for a in agg.values())
+    acc = ACC["account"]
+    items = sorted(agg.items(), key=lambda kv: kv[1]["v"])          # 가로 막대: 큰 게 위로
+    html("<div class='sec'>섹터 비중</div>"
+         f"<div class='sub'>보유 종목 평가금액 기준 · 주식 {won(total)} = 계좌의 {total / acc * 100:.0f}%</div>")
+    top_sec, top = items[-1]
+    html("<div class='kpis k3'>"
+         f"<div class='kpi'><div class='l'>가장 큰 섹터</div><div class='v'>{escape(top_sec)}</div>"
+         f"<div class='d'>주식의 {top['v'] / total * 100:.1f}% · 계좌의 {top['v'] / acc * 100:.1f}%</div></div>"
+         f"<div class='kpi'><div class='l'>섹터 수</div><div class='v'>{len(agg)}개</div>"
+         f"<div class='d'>{len(rows)}종목</div></div>"
+         f"<div class='kpi'><div class='l'>상위 2개 섹터 합</div>"
+         f"<div class='v'>{sum(a['v'] for _, a in items[-2:]) / total * 100:.0f}%</div><div class='d'>주식 중 비중</div></div>"
+         "</div>")
+    ys = [k for k, _ in items]
+    xs = [a["v"] / total * 100 for _, a in items]
+    cols = ["#2563eb" if i == len(items) - 1 else "#93c5fd" if i >= len(items) - 3 else "#cbd5e1" for i in range(len(items))]
+    hover = []
+    for k, a in items:
+        lst = "<br>".join(f"· {n} {v / total * 100:.1f}%" for n, v in sorted(a["names"], key=lambda x: -x[1]))
+        hover.append(f"<b>{k}</b> {a['v'] / total * 100:.1f}% ({a['v'] / 1e4:,.0f}만원)<br>평가손익 {a['pl']:+,.0f}원<br>{lst}")
+    labels = [f"{x:.1f}%  ·  {len(a['names'])}종목" for x, (_, a) in zip(xs, items)]
+    fig = go.Figure(go.Bar(x=xs, y=ys, orientation="h", marker=dict(color=cols, cornerradius=6),
+                           text=labels, textposition="outside", cliponaxis=False,
+                           textfont=dict(size=12, color="#334155"),
+                           hovertext=hover, hoverinfo="text"))
+    fig.update_layout(template="plotly_white", height=max(180, 44 * len(items) + 40), bargap=0.35,
+                      margin=dict(l=4, r=90, t=6, b=6), paper_bgcolor="#fff", plot_bgcolor="#fff", dragmode=False,
+                      font=dict(family="Pretendard Variable, Pretendard, Noto Sans KR, sans-serif", size=13, color="#0f172a"),
+                      hoverlabel=dict(bgcolor="#fff", font_size=12, bordercolor="#e2e8f0"))
+    fig.update_xaxes(visible=False, range=[0, max(xs) * 1.05])
+    fig.update_yaxes(showgrid=False, ticks="", ticklabelstandoff=8, tickfont=dict(size=13, color="#0f172a"))
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    # 섹터별 종목 칩
+    chips = []
+    for k, a in reversed(items):
+        nm = " ".join(f"<span class='fchip'>{escape(n)} {v / total * 100:.0f}%</span>"
+                      for n, v in sorted(a["names"], key=lambda x: -x[1]))
+        chips.append(f"<div class='ck' style='grid-template-columns:110px 1fr'><span class='k'>{escape(k)}</span>"
+                     f"<span class='bchips' style='flex-wrap:wrap'>{nm}</span></div>")
+    with st.expander("섹터별 종목 보기", icon=":material/category:"):
+        html("<div class='checks'>" + "".join(chips) + "</div>")
+        st.caption("섹터는 네이버 업종 분류를 자동으로 가져와요. 바꾸고 싶으면 기록 → 판단 기준의 '섹터'에 적으면 그 이름이 우선이에요.")
 
-    masks = {"신선 후보": cand["fresh"], "돌파권": cand["section"] == "돌파권",
-             "돌파 중": cand["nh_state"] == "돌파", "터치 후 밀림": cand["nh_state"] == "터치"}
-    boxes = []
-    for sec, icon, color, desc in NHC_SECTIONS:
-        sub = cand[masks[sec]]
-        body = "".join(_nh_card(r) for _, r in sub.head(12).iterrows()) or '<div class="nh-empty">해당 종목이 없습니다.</div>'
-        more = f'<div class="nh-empty" style="padding:0.3rem 0">외 {len(sub) - 12}개는 아래 리스트에서</div>' if len(sub) > 12 else ""
-        boxes.append(
-            f'<div class="nh-box"><div class="nh-box-h"><div class="nh-box-t"><span>{icon} {sec}</span>'
-            f'<span class="cnt" style="color:{color}">{len(sub)}</span></div><div class="nh-box-d">{desc}</div></div>'
-            f'<div class="nh-box-b">{body}{more}</div></div>')
-    st.markdown(f'<div class="nh-grid">{"".join(boxes)}</div>', unsafe_allow_html=True)
 
-    # ── 상세 후보 리스트 ──
-    st.markdown('<div class="nh-head"><b style="font-size:1.15rem">상세 후보 리스트</b></div>', unsafe_allow_html=True)
-    counts = cand["nh_state"].value_counts()
-    opts = ["전체"] + list(data.NHC_STATES)
-    c1, c2, c3 = st.columns([4, 1.2, 1.4])
-    pick = c1.segmented_control("상태", opts, default="전체", key="nhc_pick", label_visibility="collapsed",
-                                format_func=lambda s: f"{s} {len(cand) if s == '전체' else int(counts.get(s, 0))}")
-    sort_by = c2.selectbox("정렬", ["고가까지", "등락률", "거래대금 배수", "RS", "ATR%"], key="nhc_sort",
+def raised(h) -> str:
+    """최근 7일 안에 추가 매수로 손절가가 올라갔으면 표시."""
+    log = [x for x in (h.get("stop_log") or []) if x.get("from") is not None and x.get("to") is not None]
+    if not log:
+        return ""
+    x = log[-1]
+    try:
+        recent = (date.today() - date.fromisoformat(x["date"])).days <= 7
+    except Exception:
+        recent = False
+    return "<i class='upmark'> ▲상향</i>" if recent and x.get("to", 0) > x.get("from", 0) else ""
+
+
+def atr_popovers(need_rows):
+    """ATR 입력이 필요한 종목마다 버튼 → 눌러서 직접 입력. 저장하면 그 버튼은 사라진다."""
+    if not need_rows:
+        return
+    html(f"<div class='notice warn'><b>ATR 입력이 필요한 종목 {len(need_rows)}개</b> — 지금은 임시로 기본 8%로 계산 중이에요. "
+         "아래 버튼을 눌러 직접 입력하면 그 종목은 목록에서 사라져요.</div>")
+    cols = st.columns(min(4, len(need_rows)))
+    for i, r in enumerate(need_rows):
+        h, pos = r["h"], r["pos"]
+        mk = h["market"]
+        with cols[i % len(cols)]:
+            with st.popover(f"ATR 입력 · {h['name']}", icon=":material/edit:", width="stretch"):
+                ref_e = core.auto_atr(h, r["df"]) if r["df"] is not None and not r["df"].empty else None
+                ref_n = r["ind"]["atr_pct"] if r["ind"] else None
+                html(f"<div class='sub' style='margin:0 0 6px'><b>{escape(h['name'])}</b> · 평단 {fmt(pos.avg, mk)} · {pos.qty:,.0f}주<br>"
+                     f"참고 ATR(20): 진입일 {f'{ref_e:g}%' if ref_e else '-'} · 지금 {f'{ref_n:.1f}%' if ref_n and not np.isnan(ref_n) else '-'}</div>")
+                with st.form(f"atrpop_{h['id']}", border=False):
+                    a_in = st.number_input("내 ATR %", min_value=0.0, max_value=50.0, value=None, step=0.5, format="%.1f",
+                                           placeholder="예: 10")
+                    s_in = st.number_input("또는 손절가 직접", min_value=0.0, value=None, format="%.2f",
+                                           placeholder="적으면 ATR 자동 계산")
+                    st.caption(f"손절률 = MAX({S['stop_pct']:g}%, ATR) · 익절가 = 첫 매수가 × (1 + {S['target_r']:g} × 손절률)")
+                    if st.form_submit_button("저장", type="primary", width="stretch"):
+                        if not a_in and not s_in:
+                            st.error("ATR이나 손절가 중 하나를 넣어 주세요.")
+                        else:
+                            imp = core.implied_atr(pos.avg, s_in) if s_in else None
+                            h["stop"] = float(s_in) if s_in else None
+                            h["atr_pct"] = imp if imp is not None else (round(float(a_in), 2) if a_in else None)
+                            h["atr_src"] = "stop" if (imp is not None or (s_in and not a_in)) else "manual"
+                            h["stop_floor"] = None
+                            core.reset_target(h, S)
+                            lv = core.levels(h, pos.avg, S)
+                            save(f"atr {h['code']}")
+                            st.session_state["flash"] = (f"{h['name']} ATR 적용 — 손절가 {fmt(lv['stop'], mk)} · "
+                                                         f"익절가 {fmt(lv['target'], mk)}")
+                            st.rerun()
+
+
+def quick_trade(rows):
+    """보드 바로 아래에서 추가 매수·매도 기록. 넣는 즉시 손절가(새 평단 기준)·익절가(고정)를 보여준다."""
+    if not rows:
+        return
+    html("<div class='sec'>빠른 매매 기록</div>"
+         "<div class='sub'>추가 매수를 넣으면 익절가는 그대로, 손절가는 새 평단 기준으로 올라가요</div>")
+    nonce = st.session_state.get("qt_nonce", 0)
+    with st.container(border=True):
+        names = {r["h"]["id"]: f"{r['h']['name']} · {r['pos'].qty:,.0f}주" for r in rows}
+        a, b, c, d = st.columns([1.6, 1.1, 1, 0.8], vertical_alignment="bottom")
+        hid = a.selectbox("종목", list(names), format_func=names.get, key=f"qt_h_{nonce}")
+        side = b.segmented_control("구분", ["추가 매수", "매도", "잔고 맞추기"], default="추가 매수", key=f"qt_s_{nonce}")
+        fix = side == "잔고 맞추기"
+        price = c.number_input("실제 평단" if fix else "단가", min_value=0.0, value=None, placeholder="0", format="%.2f",
+                               key=f"qt_p_{nonce}")
+        qty = d.number_input("실제 수량" if fix else "수량", min_value=0.0, value=None, placeholder="0", step=1.0,
+                             format="%.0f", key=f"qt_q_{nonce}")
+        r = next(x for x in rows if x["h"]["id"] == hid)
+        h, pos = r["h"], r["pos"]
+        mk = h["market"]
+        side_k = "sell" if side == "매도" else "buy"
+        if fix:
+            st.caption(f"앱 기록: {pos.qty:,.0f}주 · 평단 {fmt(pos.avg, mk)} — 증권사 앱의 실제 보유수량과 평단을 넣으면 "
+                       "차이만큼 추가 매수/매도로 기록해서 맞춰요")
+            if price and qty is not None:
+                plan_ = core.reconcile({"holdings": [h]}, [{"name": h["name"], "code": h["code"], "qty": float(qty),
+                                                            "avg_price": float(price), "price": r["ind"]["price"]}])
+                p_ = plan_[0] if plan_ else None
+                if not p_ or not p_["side"] or not p_["trade_qty"]:
+                    html("<div class='notice info'>앱 기록과 같아요. 맞출 게 없어요.</div>")
+                    price = qty = None
+                else:
+                    side_k, price, qty = p_["side"], float(p_["trade_price"]), float(p_["trade_qty"])
+                    html(f"<div class='notice info'>맞추기: <b>{escape(p_['action'])}</b> @ {fmt(price, mk)} 로 기록돼요</div>")
+        if price and qty:
+            if side_k == "sell" and qty > pos.qty:
+                html(f"<div class='notice warn'>보유 수량({pos.qty:,.0f}주)보다 많이 팔 수 없어요.</div>")
+            else:
+                pv = core.trade_preview(h, side_k, float(price), float(qty), S, ACC["account"])
+                b0, a1 = pv["before"], pv["after"]
+                arrow = lambda x0, x1: ("<b class='up'>▲</b>" if x1 > x0 + 1e-9 else "<b class='down'>▼</b>" if x1 < x0 - 1e-9 else "")
+                html("<div class='qt-pv'>"
+                     f"<span><label>평단</label>{fmt(b0['avg'], mk)} → <b>{fmt(a1['avg'], mk)}</b></span>"
+                     f"<span><label>손절가</label>{fmt(b0['stop'], mk)} → <b>{fmt(a1['stop'], mk)}</b> {arrow(b0['stop'], a1['stop'])}</span>"
+                     f"<span><label>익절가 (고정)</label><b>{fmt(a1['target'], mk)}</b> 그대로</span>"
+                     + (f"<span><label>손익비</label>{b0['rr']:.1f} → <b>{a1['rr']:.1f}</b> : 1</span>" if b0["rr"] and a1["rr"] else "")
+                     + (f"<span><label>손절 시 계좌</label><b>−{a1['loss_pct']:.2f}%</b></span>" if a1["loss_pct"] is not None else "")
+                     + "</div>"
+                     + "".join(f"<div class='notice warn'>{escape(w)}</div>" for w in pv["warn"])
+                     + "".join(f"<div class='notice info'>{escape(i)}</div>" for i in pv["info"]))
+        if st.button("기록하기", type="primary", width="stretch", key=f"qt_go_{nonce}"):
+            if not price or not qty:
+                st.error("단가와 수량을 넣어 주세요.")
+            elif side_k == "sell" and qty > pos.qty:
+                st.error(f"보유 수량({pos.qty:,.0f}주)보다 많이 팔 수 없어요.")
+            else:
+                pv = core.apply_trade(h, side_k, date.today().isoformat(), float(price), float(qty), "", S, ACC["account"])
+                save(f"trade {h['code']}")
+                st.session_state["flash"] = (f"{h['name']} {'추가 매수' if side_k == 'buy' else '매도'} 기록 — 손절가 "
+                                             f"{fmt(pv['before']['stop'], mk)} → {fmt(pv['after']['stop'], mk)} · "
+                                             f"익절가 {fmt(pv['after']['target'], mk)} 그대로")
+                st.session_state["qt_nonce"] = nonce + 1
+                st.rerun()
+
+
+def rule_line(j) -> str:
+    r0 = j["rules"][0] if j["rules"] else None
+    if not r0:
+        return ""
+    if j["level"] in ("sell", "take"):
+        return (f"<div class='rule'><b>{escape(r0['title'])}</b> — {escape(r0['principle'])}<br>"
+                f"<span class='mut'>지금</span> {escape(r0['fact'])}</div>")
+    return f"<div class='why'>{escape(r0['fact'])}</div>"
+
+
+with tab_sum:
+    if st.session_state.get("flash"):
+        html(f"<div class='notice' style='background:#ecfdf3;color:#067647'><b>✓</b> {escape(st.session_state.pop('flash'))}</div>")
+    acc, init = ACC["account"], float(S["equity"])
+    tot_ret = (acc / init - 1) * 100 if init else 0
+    cv = equity_curve_cached(json.dumps(book, ensure_ascii=False, sort_keys=True), FX)
+    day_chg = mdd = None
+    if cv is not None and len(cv) > 1:
+        day_chg = cv["equity"].iloc[-1] - cv["equity"].iloc[-2]
+        mdd = cv["dd"].min()
+    html("<div class='hero'>"
+         f"<div><div class='lab'>계좌 총액</div><div class='big'>{won(acc)}</div></div>"
+         f"<div><div class='lab'>누적 수익률</div><div class='ret {sign_cls(tot_ret)}'>{tot_ret:+.2f}%</div></div>"
+         f"<div><div class='lab'>손익</div><div class='ret {sign_cls(acc - init)}'>{acc - init:+,.0f}원</div></div>"
+         + (f"<div><div class='lab'>오늘</div><div class='ret {sign_cls(day_chg)}'>{day_chg:+,.0f}원</div></div>"
+            if day_chg is not None else "")
+         + f"<div class='sm'>초기 자본금 {won(init)}"
+         + (f" · 증권사 총자산 {won(book['snapshots'][-1]['total_asset'])} ({book['snapshots'][-1]['date'][5:].replace('-', '.')} 사진)"
+            if book.get("snapshots") and book["snapshots"][-1].get("total_asset") else "")
+         + (f" · 예수금 {won(book['snapshots'][-1]['cash'])}"
+            if book.get("snapshots") and book["snapshots"][-1].get("cash") else "")
+         + (f" · 최대 낙폭 {mdd:.1f}%" if mdd is not None else "") + "</div></div>")
+
+    c_board, c_chart, c_sec, c_idx = st.container(), st.container(), st.container(), st.container()
+    with c_sec:
+        sector_section(ROWS)
+    with c_chart:
+        html("<div class='sec'>계좌 수익률</div>")
+        if cv is not None and len(cv) > 1:
+            rng = st.segmented_control("기간", ["1개월", "3개월", "전체"], default="전체", key="cv_rng",
+                                       label_visibility="collapsed")
+            days = {"1개월": 22, "3개월": 66}.get(rng)
+            cvv = cv.tail(days + 1) if days else cv
+            kdf, _ = hist("KOSPI", "KR")
+            bench = None
+            if not kdf.empty:
+                k = kdf["Close"].reindex(cvv.index, method="ffill").dropna()
+                if len(k):
+                    bench = (k / k.iloc[0] - 1) * 100 + cvv["ret"].iloc[0]
+            st.plotly_chart(curve_chart(cvv, bench), width="stretch", config={"displayModeBar": False})
+            st.caption("계좌 총액 = 초기 자본금 + 실현손익 + 평가손익 (엑셀 계좌일지의 누적잔고와 같은 계산). 점선은 같은 기간 KOSPI.")
+        else:
+            html("<div class='notice info'>매매를 기록하면 계좌 수익률 그래프가 여기에 그려져요. "
+                 "설정 탭에서 초기 자본금을 먼저 넣어 주세요.</div>")
+    with c_idx:
+        html("<div class='sec'>시장</div>")
+        chips = []
+        for name in ("KOSPI", "KOSDAQ", "S&P500", "NASDAQ"):
+            r = regime(name)
+            if r:
+                chips.append(f"<div class='chip'><div class='n'><span class='dot {'on' if r['above'] else 'off'}'></span>{name}</div>"
+                             f"<div class='v'>{r['price']:,.2f}</div>"
+                             f"<div class='g {sign_cls(r['gap'])}'>60일선 {r['gap']:+.1f}%</div></div>")
+            else:
+                chips.append(f"<div class='chip'><div class='n'>{name}</div><div class='v mut'>-</div></div>")
+        html("<div class='chips'>" + "".join(chips) + "</div>")
+        kr_rest = [n for n in ("KOSPI", "KOSDAQ") if (r := regime(n)) and not r["above"]]
+        if kr_rest:
+            html(f"<div class='notice warn'>{' · '.join(kr_rest)} 지수가 60일선 아래예요. 원칙상 신규 매수는 쉬는 구간입니다.</div>")
+    with c_board:
+        if not ROWS:
+            html("<div class='notice info'>아직 보유 종목이 없어요. 기록 탭에서 추가하거나, 설정 탭에서 엑셀 계좌일지를 가져오세요.</div>")
+        else:
+            cost = sum(r["pos"].avg * r["pos"].qty * r["fx"] for r in ROWS)
+            risk = sum(max(0.0, (r["pos"].avg - r["j"]["stop"])) * r["pos"].qty * r["fx"] for r in ROWS if r["j"])
+            n_act = sum(1 for r in ROWS if r["j"] and r["j"]["level"] in ("sell", "take"))
+            html("<div class='kpis'>"
+                 f"<div class='kpi'><div class='l'>지금 대응할 종목</div><div class='v {'up' if n_act else ''}'>{n_act}개</div>"
+                 f"<div class='d'>손절·청산·익절 신호</div></div>"
+                 f"<div class='kpi'><div class='l'>주식 비중</div><div class='v'>{cost / acc * 100:.0f}%</div>"
+                 f"<div class='d'>매입 {won(cost)}</div></div>"
+                 f"<div class='kpi'><div class='l'>걸린 위험</div><div class='v'>{risk / acc * 100:.2f}%</div>"
+                 f"<div class='d'>전부 손절 시 계좌 손실</div></div>"
+                 f"<div class='kpi'><div class='l'>보유 종목</div><div class='v'>{len(ROWS)} / {S['max_positions']}</div>"
+                 f"<div class='d'>1R = {won(acc * S['risk_pct'] / 100)}</div></div>"
+                 "</div>")
+
+            atr_popovers([r for r in ROWS if core.atr_status(r["h"]) != "applied"])
+            html("<div class='sec'>판단 보드</div><div class='sub'>손절·청산이 맨 위에, 근거가 된 내 원칙과 함께 나와요</div>")
+            items = sorted(ROWS, key=lambda r: LEVEL_ORDER[r["j"]["level"]] if r["j"] else 9)
+            out = ["<div class='brow bhead'><span></span><span>종목</span><span style='text-align:center'>판정</span><span>현재가</span>"
+                   "<span>평단 · 수익률</span><span class='rrh'><span>손절가 (−1R · 잠금)</span><span>3R 익절가</span></span>"
+                   "<span>이동평균선</span><span>수급 5일 (외·기)</span></div>"]
+            for r in items:
+                h, pos, ind, j = r["h"], r["pos"], r["ind"], r["j"]
+                mk = h["market"]
+                stt = core.atr_status(h)
+                sp_now = core.stop_pct_of(h, S)
+                if stt == "applied" and h.get("atr_pct"):
+                    a_ = float(h["atr_pct"])
+                    atr_lab = (f"<span class='mini ok'>ATR {a_:g}%</span>" if a_ >= S["stop_pct"]
+                               else f"<span class='mini ok'>ATR {a_:g}% → {S['stop_pct']:g}%</span>")
+                elif stt == "applied":
+                    atr_lab = "<span class='mini ok'>손절가 직접</span>"
+                elif stt == "check":
+                    atr_lab = "<span class='mini need'>ATR 확인</span>"
+                else:
+                    atr_lab = "<span class='mini need' title='ATR을 넣기 전이라 임시로 기본 손절폭 적용 중'>ATR 입력</span>"
+                # 비중: 계좌 대비 이 종목 매입금액 비중. 1R(1유닛) = 계좌의 7~8% (설정값). 그보다 작으면 정찰병
+                unit = float(S.get("unit_pct", 7.5))
+                wgt = pos.avg * pos.qty * r["fx"] / ACC["account"] * 100 if ACC["account"] else 0
+                units = wgt / unit if unit else 0
+                if units < 0.85:
+                    size_lab = f"<span class='mini scout' title='계좌의 {wgt:.1f}% (1R = {unit:g}%)'>정찰병 {wgt:.1f}%</span>"
+                else:
+                    u_lab = f"{round(units * 2) / 2:g}R"
+                    size_lab = f"<span class='mini full' title='계좌의 {wgt:.1f}% (1R = {unit:g}%)'>{u_lab} · {wgt:.1f}%</span>"
+                r3_now = ind is not None and ind["price"] >= j["target"] if j else False
+                r3_lab = ""
+                if r3_now:
+                    r3_lab = f"<span class='mini r3'>🎯 {S['target_r']:g}R 달성</span>"
+                elif h.get("r3_hit"):
+                    r3_lab = (f"<span class='mini r3past' title='{h['r3_hit']}에 익절가 도달'>"
+                              f"{S['target_r']:g}R 달성 {h['r3_hit'][5:].replace('-', '.')}</span>")
+                nm_e = escape(h['name'])
+                name = (f"<span class='bn' title='{nm_e}'><b>{nm_e}</b>"
+                        f"<small>{escape(h['code'])}</small><span class='tags'>{r3_lab}{size_lab}{atr_lab}</span></span>")
+                if not ind:
+                    out.append(f"<div class='brow l-warn'><span class='bar'></span>{name}"
+                               "<span class='bsig b-warn'>시세 없음</span><span class='bwide mut'>코드를 확인해 주세요</span></div>")
+                    continue
+                ma = [("5", "20", ind["ma5"], ind["ma20"]), ("20", "60", ind["ma20"], ind["ma60"]),
+                      ("60", "120", ind["ma60"], ind["ma120"])]
+                # 칸 고정: [정배열][5·20][20·60][60·120] — 없으면 빈칸으로 자리만 지킴
+                ma_html = ("<span class='mchip ok strong'>정배열</span>" if ind["aligned"] else "<span class='mslot'></span>")
+                ma_html += "".join(
+                    (f"<span class='mchip {'ok' if a_ > b_ else 'no'}'>{x}{'>' if a_ > b_ else '<'}{y}</span>"
+                     if not (np.isnan(a_) or np.isnan(b_)) else "<span class='mslot'></span>")
+                    for x, y, a_, b_ in ma)
+                fl = r.get("flows") or {}
+                if fl.get("ok"):
+                    def won_b(q):
+                        v = q * ind["price"] * r["fx"] / 1e8
+                        return f"{v:+,.0f}억" if abs(v) >= 1 else f"{v * 1e4:+,.0f}만"
+                    fl_html = (f"<span class='fchip {sign_cls(fl['frgn5'])}'>외 {won_b(fl['frgn5'])}</span>"
+                               f"<span class='fchip {sign_cls(fl['inst5'])}'>기 {won_b(fl['inst5'])}</span>")
+                else:
+                    fl_html = "<span class='fchip'>외 -</span><span class='fchip'>기 -</span>"
+                tmp = "" if stt == "applied" else "<i>임시</i>"
+                if h.get("stop_floor") and h.get("stop_floor_note") and j["stop"] >= pos.avg:
+                    tmp = f"<b class='lock'>🔒{escape(h['stop_floor_note'].split(' ')[0])}</b>"
+                note = ""
+                if j["level"] in ("sell", "take") and j["rules"]:
+                    note = (f"<span class='bnote'>{escape(SHORT.get(j['rules'][0]['key'], ''))}"
+                            f"<span class='nf'> — {escape(j['rules'][0]['fact'])}</span></span>")
+                px, st_, tg = ind["price"], j["stop"], j["target"]
+                ce = core.calc_explain(h, pos.avg, S)
+                to_stop = (st_ / px - 1) * 100            # 현재가 → −1R 손절가까지
+                to_tgt = (tg / px - 1) * 100              # 현재가 → 3R 익절가까지
+                lo_, hi_ = min(st_, px), max(tg, px)
+                pct = lambda v: max(0.0, min(100.0, (v - lo_) / (hi_ - lo_) * 100)) if hi_ > lo_ else 50.0
+                rr_cell = (
+                    "<span class='rr'>"
+                    f"<span class='rr-top'><b title='{escape(ce['stop'])}'>{fmt(st_, mk)}</b>"
+                    f"<b title='{escape(ce['target'])}'>{fmt(tg, mk)}</b></span>"
+                    f"<span class='rr-bar'><em style='left:{pct(pos.avg):.1f}%' title='평단'></em>"
+                    f"<i style='left:{pct(px):.1f}%' title='현재가'></i></span>"
+                    f"<span class='rr-bot'><small class='down'>{'이탈' if to_stop >= 0 else f'{to_stop:.1f}%'}{tmp}{raised(h)}</small>"
+                    + (f"<small class='r3txt'>🎯 달성 {abs(to_tgt):.1f}% 초과</small>" if to_tgt <= 0 else f"<small class='up'>+{to_tgt:.1f}%</small>")
+                    + "</span></span>")
+                vals = (f"<span class='bv' data-l='현재가'>{fmt(px, mk)}<small class='{sign_cls(ind['chg'])}'>{ind['chg']:+.1f}%</small></span>"
+                        f"<span class='bv' data-l='평단 · 수익률'>{fmt(pos.avg, mk)}"
+                        f"<small><b class='{sign_cls(j['pnl_pct'])}'>{j['pnl_pct']:+.1f}%</b> · {j['r_mult']:+.1f}R</small></span>"
+                        f"{rr_cell}")
+                out.append(
+                    f"<div class='brow l-{j['level']}{' r3row' if r3_now else ''}'><span class='bar'></span>{name}"
+                    f"<span class='bsig b-{j['level']}'>{escape(j['signal'])}</span>{vals}"
+                    f"<span class='mrow'>{vals}</span>"
+                    f"<span class='bmeta'><span class='bchips ma'>{ma_html}</span>"
+                    f"<span class='bchips fl'>{fl_html}</span></span>{note}</div>")
+            html("<div class='board'>" + "".join(out) + "</div>")
+            html("<div class='sub' style='margin-top:6px'><b>비중</b> = 매입금액 ÷ 계좌, 1R = 계좌의 "
+                 f"{S.get('unit_pct', 7.5):g}% ({won(ACC['account'] * S.get('unit_pct', 7.5) / 100)}) · 그보다 작으면 <b>정찰병</b> · "
+                 "손절가·익절가 아래 % = <b>지금 가격에서 그 가격까지 남은 등락률</b> "
+                 "(막대의 ● 현재가, | 평단) · 이동평균선: 초록 = 위, 빨강 = 아래 · "
+                 "수급: 최근 5거래일 외국인·기관 순매수 금액(주수 × 현재가) · 자세한 근거는 판단 탭</div>")
+            with st.expander("손절가 · 익절가 계산식 보기 (숫자 검산용)", icon=":material/calculate:"):
+                lines = []
+                for r in items:
+                    if not r["j"]:
+                        continue
+                    ce = core.calc_explain(r["h"], r["pos"].avg, S)
+                    lines.append(f"<div class='ck' style='grid-template-columns:120px 1fr'><span class='k'>{escape(r['h']['name'])}</span>"
+                                 f"<span class='t'>손절가: {escape(ce['stop'])}<br>익절가: {escape(ce['target'])}</span></div>")
+                html("<div class='checks'>" + "".join(lines) + "</div>")
+                st.caption("익절가는 평단이 아니라 '첫 매수가' 기준으로 고정이에요(추가 매수해도 그대로). "
+                           "사진·엑셀로 넣은 종목은 그때의 평단이 첫 매수가로 들어가 있어서, 실제 첫 매수가와 다르면 "
+                           "아래 표의 '익절 기준가'를 고쳐 주세요. 한국 주식은 호가 단위로 손절가는 올림, 익절가는 내림해요.")
+            quick_trade([r for r in ROWS if r["j"]])
+
+            html("<div class='sec'>종목별 ATR · 손절가 · 3R</div>"
+                 f"<div class='sub'>'내 ATR %'나 '직접 손절가'를 <b>직접 넣어야</b> 적용돼요 (자동으로 채우지 않아요). "
+                 f"손절률 = MAX({S['stop_pct']:g}%, ATR). 오른쪽 참고 ATR(20)은 입력할 때 보는 용도예요.</div>")
+            atr_editor(ROWS)
+
+
+# ─────────────────────────── 기록 (넣기·수정) ───────────────────────────
+with tab_edit:
+    # ── 사진으로 한 번에 넣기 ──
+    html("<div class='sec'>사진으로 한 번에 넣기</div>"
+         "<div class='sub'>증권사 앱 잔고 화면을 캡처해서 올리면 계좌 금액과 보유 종목을 읽어 앱에 맞춰 줘요</div>")
+    with st.container(border=True):
+        if not AI.get("anthropic_key") and not AI.get("gemini_key"):
+            html("<div class='notice warn'>사진 읽기를 쓰려면 Streamlit Secrets에 <b>GEMINI_API_KEY</b>(무료) 또는 "
+                 "<b>ANTHROPIC_API_KEY</b>를 넣어 주세요.</div>")
+        html("<div class='dropnote'>캡처 사진을 아래 칸으로 <b>끌어다 놓으세요</b> · 여러 장 한 번에 가능 · "
+             "카톡·캡처 도구에서 복사했다면 <b>붙여넣기</b> 버튼</div>")
+        imgs = st.file_uploader("잔고 화면 캡처", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True,
+                                label_visibility="collapsed", key="img_up")
+        pasted = st.session_state.setdefault("pasted_imgs", [])
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            try:
+                from streamlit_paste_button import paste_image_button
+                pr = paste_image_button("붙여넣기 (복사한 사진)", background_color="#0f172a",
+                                        hover_background_color="#334155", key=f"paste_{len(pasted)}")
+                if pr.image_data is not None:
+                    buf = io.BytesIO()
+                    pr.image_data.convert("RGB").save(buf, format="JPEG", quality=90)
+                    pasted.append(buf.getvalue())
+                    st.rerun()
+            except ImportError:
+                pass
+        with c2:
+            if pasted and st.button(f"붙여넣은 사진 {len(pasted)}장 지우기", icon=":material/close:"):
+                st.session_state.pasted_imgs = []
+                st.rerun()
+        if pasted:
+            st.image(pasted, width=120)
+        all_imgs = [f.getvalue() for f in (imgs or [])] + pasted
+        if all_imgs and st.button(f"사진 {len(all_imgs)}장 읽기", type="primary", icon=":material/document_scanner:",
+                                  disabled=not (AI.get("anthropic_key") or AI.get("gemini_key"))):
+            with st.spinner("사진을 읽는 중... (10~30초)"):
+                try:
+                    parsed = core.read_holdings_image(all_imgs, AI)
+                    for r_ in parsed["holdings"]:
+                        if not r_.get("code") and r_["market"] == "KR":
+                            found = search(r_["name"])
+                            if found:
+                                r_["code"] = found[0]["code"]
+                        elif not r_.get("code"):
+                            r_["code"] = r_["name"].upper()
+                    st.session_state.img_parsed = parsed
+                    st.session_state.pasted_imgs = []
+                except Exception as e:
+                    st.error(f"사진을 못 읽었어요: {e}")
+
+        parsed = st.session_state.get("img_parsed")
+        if parsed:
+            acc_p = parsed["account"]
+            if any(v is not None for v in acc_p.values()):
+                html("<div class='kpis'>"
+                     + "".join(f"<div class='kpi'><div class='l'>{lab}</div><div class='v'>"
+                               f"{(f'{acc_p[k]:+.2f}%' if k == 'total_ret' else f'{acc_p[k]:,.0f}원') if acc_p.get(k) is not None else '-'}"
+                               "</div></div>"
+                               for k, lab in (("total_asset", "총자산"), ("cash", "예수금"),
+                                              ("total_eval", "주식 평가금액"), ("total_ret", "총수익률")))
+                     + "</div>")
+            st.caption("읽은 내용이에요. 틀린 칸은 눌러서 고치세요.")
+            pdf = pd.DataFrame(parsed["holdings"], columns=["name", "code", "qty", "avg_price", "price", "market", "check"])
+            if (pdf["check"].fillna("") != "").any():
+                html("<div class='notice warn'>사진에서 읽은 수량이 매입·평가금액과 맞지 않는 종목이 있어 금액 기준으로 고쳤어요. "
+                     "'확인' 칸을 보고 실제 잔고와 같은지 꼭 봐 주세요.</div>")
+            ed = st.data_editor(pdf, hide_index=True, width="stretch", num_rows="dynamic", key="img_ed",
+                                column_config={
+                                    "name": st.column_config.TextColumn("종목명", required=True),
+                                    "code": st.column_config.TextColumn("코드"),
+                                    "qty": st.column_config.NumberColumn("수량", format="%,.0f"),
+                                    "avg_price": st.column_config.NumberColumn("평단", format="%,.2f"),
+                                    "price": st.column_config.NumberColumn("현재가", format="%,.2f"),
+                                    "market": st.column_config.SelectboxColumn("시장", options=["KR", "US"]),
+                                    "check": st.column_config.TextColumn("확인", disabled=True)})
+            rows_in = [{k: (None if pd.isna(v) else v) for k, v in r_.items()} for r_ in ed.to_dict("records")
+                       if r_.get("name") and not pd.isna(r_.get("qty"))]
+            plan = core.reconcile(book, rows_in)
+            if plan:
+                st.caption("앱에 이렇게 반영돼요. 빼고 싶은 줄은 체크를 끄세요.")
+                pl = pd.DataFrame([{"반영": p_["action"] not in ("변동 없음", "사진에 없음", "평단만 다름 (확인)"),
+                                    "할 일": p_["action"], "종목": p_["name"], "코드": p_.get("code") or "",
+                                    "수량": p_["trade_qty"], "가격": p_["trade_price"]} for p_ in plan])
+                pl_ed = st.data_editor(pl, hide_index=True, width="stretch", key="img_plan",
+                                       disabled=["할 일", "종목", "코드"],
+                                       column_config={"반영": st.column_config.CheckboxColumn("반영"),
+                                                      "수량": st.column_config.NumberColumn("수량", format="%,.0f"),
+                                                      "가격": st.column_config.NumberColumn("가격", format="%,.2f",
+                                                                                          help="사진에 없는 종목 매도가는 비우면 현재가")})
+                a, b = st.columns(2)
+                tdate = a.date_input("매매 날짜", value=date.today(), format="YYYY.MM.DD", key="img_date",
+                                     help="신규 종목은 실제 매수일로 바꾸면 수익률 그래프가 더 정확해요")
+                sync_cap = b.checkbox("사진의 총자산에 맞춰 계좌 금액 조정", value=acc_p.get("total_asset") is not None,
+                                      disabled=acc_p.get("total_asset") is None,
+                                      help="앱의 계좌 총액(초기 자본금 + 실현 + 평가손익)이 증권사 총자산과 같아지도록 초기 자본금을 맞춰요")
+                if st.button("앱에 반영하기", type="primary", icon=":material/done_all:", width="stretch"):
+                    n_done = 0
+                    for p_, (_, row) in zip(plan, pl_ed.iterrows()):
+                        if not row["반영"] or not p_["side"] or not row["수량"]:
+                            continue
+                        price = row["가격"] if not pd.isna(row["가격"]) else None
+                        if p_["hid"]:
+                            h = next(x for x in book["holdings"] if x["id"] == p_["hid"])
+                        else:
+                            h = core.new_holding(p_.get("code") or p_["name"], p_["name"], p_.get("market", "KR"))
+                            if h["market"] == "KR":
+                                found = search(h["name"])
+                                if found and "KOSDAQ" in str(found[0].get("market", "")).upper():
+                                    h["index"] = "KOSDAQ"
+                            book["holdings"].append(h)
+                        if price is None:
+                            df_h, _ = hist(h["code"], h["market"])
+                            price = float(df_h["Close"].iloc[-1]) if not df_h.empty else core.position(h).avg
+                        h["trades"].append({"date": tdate.isoformat(), "side": p_["side"], "price": float(price),
+                                            "qty": float(row["수량"]), "memo": "사진 반영"})
+                        n_done += 1
+                    if any(v is not None for v in acc_p.values()):
+                        book.setdefault("snapshots", []).append({"date": date.today().isoformat(), **acc_p})
+                    if sync_cap and acc_p.get("total_asset"):
+                        fx_now = fx_rate() or S["fx"]
+                        realized = sum(core.position(h).realized * (fx_now if h["market"] == "US" else 1)
+                                       for h in book["holdings"])
+                        unreal = 0.0
+                        for h in book["holdings"]:
+                            p0 = core.position(h)
+                            if p0.qty <= 0:
+                                continue
+                            df_h, _ = hist(h["code"], h["market"])
+                            if df_h.empty:
+                                continue
+                            unreal += (float(df_h["Close"].iloc[-1]) - p0.avg) * p0.qty * (fx_now if h["market"] == "US" else 1)
+                        S["equity"] = round(acc_p["total_asset"] - realized - unreal)
+                    save(f"photo sync {n_done}")
+                    st.session_state.pop("img_parsed", None)
+                    st.rerun()
+
+    html("<div class='sec'>새 종목 추가</div>")
+    with st.container(border=True):
+        mkt_label = st.segmented_control("시장", ["한국", "미국"], default="한국", key="new_mkt",
+                                         label_visibility="collapsed")
+        market = "US" if mkt_label == "미국" else "KR"
+        code_default, name_default = "", ""
+        if market == "KR":
+            q = st.text_input("종목 검색", key="q", placeholder="종목명으로 검색 (예: 삼성전자)",
+                              label_visibility="collapsed")
+            if q.strip():
+                found = search(q.strip())
+                if found:
+                    pick = st.selectbox("검색 결과", found, label_visibility="collapsed",
+                                        format_func=lambda x: f"{x['name']}  ·  {x['code']}  ·  {x['market']}")
+                    code_default, name_default = pick["code"], pick["name"]
+                else:
+                    st.caption("검색 결과가 없어요. 아래에 6자리 코드를 직접 넣어 주세요.")
+        with st.form("new_holding", clear_on_submit=True, border=False):
+            a, b = st.columns(2)
+            code = a.text_input("종목코드", value=code_default, placeholder="005930 / NVDA")
+            name = b.text_input("종목명", value=name_default, placeholder="비우면 자동으로 채워요")
+            a, b, c = st.columns(3)
+            idx_opts = ["KOSPI", "KOSDAQ"] if market == "KR" else ["NASDAQ", "S&P500"]
+            index_name = a.selectbox("비교 지수", idx_opts)
+            sector = b.text_input("섹터", placeholder="선택")
+            bdate = c.date_input("매수일", value=date.today(), format="YYYY.MM.DD")
+            a, b, c = st.columns(3)
+            price = a.number_input("매수 단가", min_value=0.0, value=None, placeholder="0",
+                                   step=100.0 if market == "KR" else 0.01, format="%.2f")
+            qty = b.number_input("수량", min_value=0.0, value=None, placeholder="0", step=1.0, format="%.0f")
+            atr_in = c.number_input("ATR %", min_value=0.0, max_value=50.0, value=None, step=0.5, format="%.1f",
+                                    placeholder="직접 입력 (비우면 나중에 입력 필요 표시)",
+                                    help="손절률 = MAX(기본 손절폭, ATR%) — 엑셀 계좌일지와 같은 공식")
+            a, b = st.columns([1, 2])
+            stop = a.number_input("손절가 (선택)", min_value=0.0, value=None, placeholder="비우면 ATR로 자동",
+                                  format="%.2f")
+            memo = b.text_input("매수 이유", placeholder="메모 (선택)")
+            if st.form_submit_button("추가하기", type="primary", width="stretch", icon=":material/add:"):
+                code = code.strip().upper()
+                if not code or not price or not qty:
+                    st.error("코드, 단가, 수량을 넣어 주세요.")
+                else:
+                    df, auto_name = hist(code, market)
+                    if df.empty:
+                        st.warning("시세를 못 찾았어요. 코드가 맞는지 확인해 주세요 (일단 저장은 해요).")
+                    h = core.new_holding(code, name or auto_name or code, market, sector)
+                    h["index"] = index_name
+                    h["stop"] = stop or None
+                    h["memo"] = memo
+                    h["trades"].append({"date": bdate.isoformat(), "side": "buy", "price": price,
+                                        "qty": qty, "memo": memo})
+                    if core.implied_atr(price, stop) is not None:
+                        h["atr_pct"], h["atr_src"] = core.implied_atr(price, stop), "stop"
+                    elif atr_in:
+                        h["atr_pct"], h["atr_src"] = round(float(atr_in), 2), "manual"
+                    core.reset_target(h, S)
+                    book["holdings"].append(h)
+                    save(f"add {code}")
+                    st.rerun()
+
+    html("<div class='sec'>보유 종목 고치기</div>")
+    if not book["holdings"]:
+        html("<div class='notice info'>아직 종목이 없어요.</div>")
+    else:
+        labels = {h["id"]: f"{h['name']}  ·  {h['code']}" + ("" if core.position(h).qty > 0 else "  ·  청산")
+                  for h in book["holdings"]}
+        hid = st.selectbox("종목", list(labels), format_func=labels.get, key="edit_pick",
                            label_visibility="collapsed")
-    q = c3.text_input("종목·코드 검색", key="nhc_q", placeholder="🔍 종목·코드 검색", label_visibility="collapsed")
-    v = cand if pick in (None, "전체") else cand[cand["nh_state"] == pick]
-    if q:
-        v = v[v["name"].str.contains(q, case=False, na=False) | v["code"].str.contains(q, na=False)]
-    key = {"등락률": "change", "거래대금 배수": "tv_ratio", "RS": "rs", "ATR%": "atr_pct"}.get(sort_by)
-    if key:
-        v = v.sort_values(key, ascending=False, na_position="last")
-    if v.empty:
-        st.info("해당 종목이 없어요.")
-        return
-    rows = []
-    for i, (_, r) in enumerate(v.head(150).iterrows(), 1):
-        val, lab = _dist_html(r)
-        brk = r["nh_state"] == "돌파"
-        rows.append(
-            f'<tr><td class="c rk hide-m">{i}</td>'
-            f'<td class="l nm"><a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>'
-            f'<small>{r["code"]}</small></td>'
-            f'<td class="l hide-m">{html.escape(str(r["group"]))}</td>'
-            f'<td class="c"><span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></td>'
-            f'<td class="sp"><div class="sp-lab">{val}<span>{lab}</span></div>'
-            f'{_spark_svg(r["spark"], r["ref_high"], brk)}</td>'
-            f'<td class="hide-m">{_pct(r["atr_pct"])}</td>'
-            f'<td><b class="px">{r["price"]:,.0f}원</b><small>{r["ref_high"]:,.0f}원</small></td>'
-            f'<td><b>{_chg_html(r["change"])}</b></td>'
-            f'<td><b class="px">{_tv_eok(r["tv_today"])}</b><small>20평균 '
-            f'{"-" if pd.isna(r["tv_ratio"]) else format(r["tv_ratio"], ".1f") + "배"}</small></td>'
-            f'<td><b class="rs">{_n(r["rs"])}</b><small>1M {_n(r["rs_1m"])}</small></td></tr>')
-    head = ('<tr><th class="c hide-m">순위</th><th class="l">종목</th><th class="l hide-m">섹터</th><th class="c">상태</th>'
-            '<th>고가까지</th><th class="hide-m">ATR%</th><th>현재가 / 52주고가</th><th>등락률</th><th>거래대금</th><th>RS</th></tr>')
-    st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>',
-                unsafe_allow_html=True)
-    if len(v) > 150:
-        st.caption(f"앞 150개만 보여줘요(전체 {len(v)}개). 상태 필터나 검색으로 좁혀 보세요.")
-    st.caption("52주고가 = 오늘을 뺀 직전 250거래일 최고가(돌파 판정 기준가) · 스파크라인은 최근 120거래일 종가, 점선이 기준가")
+        h = next(x for x in book["holdings"] if x["id"] == hid)
+        pos = core.position(h)
+        mk = h["market"]
+        lv_e = core.levels(h, pos.avg, S) if pos.qty > 0 else None
+        rr_e = ((lv_e["target"] - pos.avg) / (pos.avg - lv_e["stop"])) if lv_e and pos.avg > lv_e["stop"] else None
+        html("<div class='kpis k3'>"
+             f"<div class='kpi'><div class='l'>보유 · 평단</div><div class='v'>{pos.qty:,.0f}주</div>"
+             f"<div class='d'>평단 {fmt(pos.avg, mk)}</div></div>"
+             f"<div class='kpi'><div class='l'>손절가</div><div class='v'>{fmt(lv_e['stop'], mk) if lv_e else '-'}</div>"
+             f"<div class='d'>{escape(lv_e['note']) if lv_e else ''}</div></div>"
+             f"<div class='kpi'><div class='l'>익절가 ({S['target_r']:g}R 고정)</div><div class='v'>{fmt(lv_e['target'], mk) if lv_e else '-'}</div>"
+             f"<div class='d'>{f'손익비 {rr_e:.1f} : 1' if rr_e else ''} · 실현 {fmt(pos.realized, mk)}</div></div>"
+             "</div>")
+
+        t_trade, t_hist, t_rule, t_del = st.tabs(["매매 추가", "매매 내역", "판단 기준", "삭제"])
+        with t_trade:
+            nk = f"{hid}_{st.session_state.get(f'trade_nonce_{hid}', 0)}"   # 기록 후 입력칸 비우기용
+            side = st.segmented_control("구분", ["추가 매수", "매도"], default="추가 매수", key=f"side_{nk}")
+            a, b, c = st.columns(3)
+            tdate = a.date_input("날짜", value=date.today(), format="YYYY.MM.DD", key=f"tdate_{nk}")
+            tprice = b.number_input("단가", min_value=0.0, value=None, placeholder="0", format="%.2f", key=f"tprice_{nk}")
+            tqty = c.number_input("수량", min_value=0.0, value=None, placeholder="0", step=1.0, format="%.0f",
+                                  key=f"tqty_{nk}")
+            tmemo = st.text_input("메모", placeholder="불타기 / 3R 절반 익절 / 손절 …", key=f"tmemo_{nk}")
+            side_k = "sell" if side == "매도" else "buy"
+            if tprice and tqty:
+                if side_k == "sell" and tqty > pos.qty:
+                    html(f"<div class='notice warn'>보유 수량({pos.qty:,.0f}주)보다 많이 팔 수 없어요.</div>")
+                else:
+                    pv = core.trade_preview(h, side_k, float(tprice), float(tqty), S, ACC["account"])
+                    b0, a1 = pv["before"], pv["after"]
+
+                    def cell(v0, v1, kind):
+                        if v0 is None or v1 is None:
+                            return "<td>-</td><td>-</td>"
+                        if kind == "qty":
+                            f0, f1 = f"{v0:,.0f}주", f"{v1:,.0f}주"
+                        elif kind == "pct":
+                            f0, f1 = f"{v0:.2f}%", f"{v1:.2f}%"
+                        elif kind == "rr":
+                            f0, f1 = f"{v0:.1f} : 1", f"{v1:.1f} : 1"
+                        else:
+                            f0, f1 = fmt(v0, mk), fmt(v1, mk)
+                        if abs(v1 - v0) < 1e-9:
+                            tag = "<span class='mut'> (그대로)</span>"
+                        else:
+                            tag = f" <span class='{'up' if v1 > v0 else 'down'}'>{'▲' if v1 > v0 else '▼'}</span>"
+                        return f"<td>{f0}</td><td><b>{f1}</b>{tag}</td>"
+                    stop_lab = f"손절가 (평단 −{core.levels(h, max(a1['avg'], 1), S)['stop_pct']:g}%)"
+                    rows_ = [("수량", "qty", "qty"), ("평단", "avg", "px"), (stop_lab, "stop", "px"),
+                             (f"익절가 ({S['target_r']:g}R, 고정)", "target", "px"), ("손익비 (새 평단 기준)", "rr", "rr"),
+                             ("손절 시 계좌 손실", "loss_pct", "pct")]
+                    body = "".join(f"<tr><th>{lab}</th>{cell(b0[k], a1[k], kind)}</tr>" for lab, k, kind in rows_)
+                    html("<div class='pv'><div class='pv-h'>미리보기 — 기록하면 이렇게 바뀌어요</div>"
+                         f"<table><tr><th></th><th>지금</th><th>{'추가 매수 후' if side_k == 'buy' else '매도 후'}</th></tr>"
+                         f"{body}</table>"
+                         + "".join(f"<div class='notice warn'>{escape(w)}</div>" for w in pv["warn"])
+                         + "".join(f"<div class='notice info'>{escape(i)}</div>" for i in pv["info"])
+                         + "</div>")
+            if st.button("기록하기", type="primary", width="stretch", key=f"rec_{nk}"):
+                if not tprice or not tqty:
+                    st.error("단가와 수량을 넣어 주세요.")
+                elif side_k == "sell" and tqty > pos.qty:
+                    st.error(f"보유 수량({pos.qty:,.0f}주)보다 많이 팔 수 없어요.")
+                else:
+                    core.apply_trade(h, side_k, tdate.isoformat(), float(tprice), float(tqty), tmemo, S, ACC["account"])
+                    save(f"trade {h['code']}")
+                    st.session_state[f"trade_nonce_{hid}"] = st.session_state.get(f"trade_nonce_{hid}", 0) + 1
+                    st.rerun()
+        with t_hist:
+            if h.get("stop_log"):
+                html("<div class='sub' style='margin:4px 0 6px'>손절가 변경 기록</div><div class='checks'>" + "".join(
+                    f"<div class='ck' style='grid-template-columns:90px 1fr auto'><span class='t'>{escape(x['date'][5:].replace('-', '.'))}</span>"
+                    f"<span class='k'>{escape(x['event'])}</span><span class='t'>"
+                    + (f"손절가 {fmt(x['from'], mk)} → <b>{fmt(x['to'], mk)}</b> · " if x.get("from") is not None else "")
+                    + f"익절가 {fmt(x['target'], mk)}</span></div>"
+                    for x in reversed(h["stop_log"])) + "</div>")
+            st.caption("칸을 눌러 바로 고칠 수 있어요. 맨 아래 줄에서 추가, 왼쪽 체크 후 삭제.")
+            tdf = pd.DataFrame(h["trades"] or [], columns=["date", "side", "price", "qty", "memo"])
+            if len(tdf):
+                tdf["date"] = pd.to_datetime(tdf["date"]).dt.date
+            tdf["side"] = tdf["side"].map({"buy": "매수", "sell": "매도"})
+            edited = st.data_editor(
+                tdf, num_rows="dynamic", width="stretch", key=f"ed_{hid}", hide_index=True,
+                column_config={
+                    "date": st.column_config.DateColumn("날짜", required=True, format="YYYY.MM.DD"),
+                    "side": st.column_config.SelectboxColumn("구분", options=["매수", "매도"], required=True),
+                    "price": st.column_config.NumberColumn("단가", min_value=0.0, required=True, format="%,.2f"),
+                    "qty": st.column_config.NumberColumn("수량", min_value=0.0, required=True, format="%,.0f"),
+                    "memo": st.column_config.TextColumn("메모")})
+            if st.button("내역 저장", key=f"sv_{hid}", icon=":material/save:"):
+                ed = edited.dropna(subset=["date", "side", "price", "qty"])
+                h["trades"] = [{"date": pd.Timestamp(r["date"]).date().isoformat(),
+                                "side": "buy" if r["side"] == "매수" else "sell",
+                                "price": float(r["price"]), "qty": float(r["qty"]),
+                                "memo": "" if pd.isna(r["memo"]) else str(r["memo"])}
+                               for _, r in ed.iterrows()]
+                save(f"edit trades {h['code']}")
+                st.rerun()
+        with t_rule:
+            with st.form(f"meta_{hid}", border=False):
+                a, b = st.columns(2)
+                new_name = a.text_input("종목명", value=h["name"])
+                new_code = b.text_input("종목코드", value=h["code"])
+                a, b = st.columns(2)
+                new_sector = a.text_input("섹터", value=h.get("sector", ""))
+                new_atr = b.number_input("ATR %", min_value=0.0, max_value=50.0,
+                                         value=float(h["atr_pct"]) if h.get("atr_pct") else None, step=0.5,
+                                         format="%.1f", placeholder="비우면 기본 손절폭",
+                                         help=f"손절률 = MAX({S['stop_pct']:g}%, ATR%). 목표가 = 평단 × (1 + {S['target_r']:g} × 손절률)")
+                a, b, c = st.columns(3)
+                new_stop = a.number_input("손절가 직접", min_value=0.0, value=float(h["stop"]) if h.get("stop") else None,
+                                          placeholder="비우면 ATR로 자동", format="%.2f",
+                                          help="불타기·본전 이동 때 올려 주세요. 넣으면 ATR 계산보다 우선")
+                tm_opts = ["자동", "5", "20", "50"]
+                new_tm = b.selectbox("추세 기준선", tm_opts, index=tm_opts.index(str(h.get("trend_ma", "자동"))),
+                                     format_func=lambda x: x if x == "자동" else f"{x}일선",
+                                     help="자동: 최근 20일 +30% 이상 5일선, +8% 이상 20일선, 그 외 50일선")
+                fo_opts = {"자동 (실적 표)": None, "증가 맞음": True, "증가 아님": False}
+                cur = next(k for k, v in fo_opts.items() if v == h.get("fund_override"))
+                new_fo = c.selectbox("영업이익 판단", list(fo_opts), index=list(fo_opts).index(cur))
+                idx_opts = ["KOSPI", "KOSDAQ"] if h["market"] == "KR" else ["NASDAQ", "S&P500"]
+                new_idx = st.selectbox("비교 지수", idx_opts,
+                                       index=idx_opts.index(h["index"]) if h.get("index") in idx_opts else 0)
+                new_memo = st.text_area("메모", value=h.get("memo", ""), placeholder="매수 이유, 시나리오")
+                if st.form_submit_button("저장", type="primary", width="stretch"):
+                    imp = core.implied_atr(pos.avg, new_stop)
+                    if (new_atr or None) != (h.get("atr_pct") or None) or imp is not None:
+                        h["atr_src"] = "stop" if imp is not None else ("manual" if new_atr else None)
+                    h.update(name=new_name, code=new_code.strip().upper() or h["code"], sector=new_sector,
+                             atr_pct=imp if imp is not None else (round(float(new_atr), 2) if new_atr else None),
+                             stop=new_stop or None, trend_ma=new_tm,
+                             fund_override=fo_opts[new_fo], index=new_idx, memo=new_memo)
+                    h["stop_floor"] = None
+                    core.reset_target(h, S)
+                    save(f"meta {h['code']}")
+                    st.rerun()
+        with t_del:
+            st.caption("매매 기록까지 모두 지워져요. 청산한 종목은 지우지 않아도 설정 탭 기록에 남아요.")
+            if st.checkbox("이 종목을 지울게요", key=f"del_ck_{hid}") and \
+                    st.button("삭제", key=f"del_{hid}", icon=":material/delete:"):
+                book["holdings"] = [x for x in book["holdings"] if x["id"] != hid]
+                save(f"delete {h['code']}", allow_empty=True)
+                st.rerun()
 
 
-# ─────────────────────────── 💥 거래량 폭발 ───────────────────────────
-def _vol_svg(vol, close, split: int | None, recent: int, mult_line: float | None = None, w: int = 220, hgt: int = 44) -> str:
-    """거래량 막대(최근 구간 빨강, 조용한 구간 회색 배경) + 종가 선."""
-    vol = [x or 0 for x in (vol or [])]
-    close = [x for x in (close or [])]
-    n = len(vol)
-    if n < 10:
-        return ""
-    vmax = max(vol) or 1
-    bw = w / n
-    parts = [f'<svg width="{w}" height="{hgt}" viewBox="0 0 {w} {hgt}" style="display:block">']
-    if split is not None:
-        s = max(0, split)
-        parts.append(f'<rect x="{s * bw:.1f}" y="0" width="{(n - recent - s) * bw:.1f}" height="{hgt}" fill="#EEF1F3"/>')
-    for i, x in enumerate(vol):
-        bh = (hgt - 2) * x / vmax
-        col = "#D6333B" if i >= n - recent else "#9AA9B3"
-        parts.append(f'<rect x="{i * bw:.2f}" y="{hgt - bh:.1f}" width="{max(bw - 0.4, 0.6):.2f}" height="{bh:.1f}" fill="{col}"/>')
-    cl = [c for c in close if c == c]
-    if len(cl) >= 2:
-        lo, hi = min(cl), max(cl)
-        rng = (hi - lo) or 1
-        pts = " ".join(f"{(i + 0.5) * bw:.1f},{2 + (hgt * 0.55) * (1 - (c - lo) / rng):.1f}"
-                       for i, c in enumerate(close) if c == c)
-        parts.append(f'<polyline points="{pts}" fill="none" stroke="#16212B" stroke-width="1.1" opacity="0.8"/>')
-    parts.append("</svg>")
-    return "".join(parts)
+# ─────────────────────────── 판단 ───────────────────────────
+def chart(df, h, pos, j):
+    d = df.tail(130)
+    fig = go.Figure(go.Candlestick(
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="",
+        increasing_line_color="#e5484d", decreasing_line_color="#2f6fed",
+        increasing_fillcolor="#e5484d", decreasing_fillcolor="#2f6fed", showlegend=False))
+    for n, colr in ((5, "#f59e0b"), (20, "#10b981"), (50, "#8b5cf6")):
+        fig.add_trace(go.Scatter(x=d.index, y=df["Close"].rolling(n).mean().tail(130), mode="lines",
+                                 line=dict(width=1.3, color=colr), name=f"{n}일선", hoverinfo="skip"))
+    for y, label, colr in ((pos.avg, "평단", "#64748b"), (j["stop"], "손절", "#dc2626"),
+                           (j["target"], f"{S['target_r']:g}R", "#16a34a")):
+        fig.add_hline(y=y, line_dash="dot", line_width=1, line_color=colr,
+                      annotation_text=f"{label} {fmt(y, h['market'])}", annotation_position="top left",
+                      annotation_font=dict(size=11, color=colr))
+    fig.update_layout(template="plotly_white", height=400, margin=dict(l=4, r=4, t=28, b=4),
+                      xaxis_rangeslider_visible=False, dragmode=False, hovermode="x unified",
+                      paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                      font=dict(family="Pretendard Variable, Pretendard, sans-serif", size=11, color="#64748b"),
+                      legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)))
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], showgrid=False, linecolor="#e8ebf0")
+    fig.update_yaxes(gridcolor="#f1f3f6", side="right", tickformat=",")
+    return fig
 
 
-def _vs_chart(hist: pd.DataFrame, name: str, recent: int, quiet: int):
-    """일진전기 화면처럼: 위 캔들 + 이동평균, 아래 거래량(상승 빨강·하락 파랑)."""
-    h = hist.tail(250).copy()
-    h["date"] = pd.to_datetime(h["date"])
-    for n_ in (5, 20, 60, 120):
-        h[f"MA{n_}"] = hist["close"].rolling(n_).mean().tail(250).values
-    h["up"] = h["close"] >= h["open"]
-    base = alt.Chart(h).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, grid=False)))
-    color = alt.condition("datum.up", alt.value(UP), alt.value(DOWN))
-    wick = base.mark_rule().encode(y=alt.Y("low:Q", title=None, scale=alt.Scale(zero=False)), y2="high:Q", color=color)
-    body = base.mark_bar(width=2.4).encode(y="open:Q", y2="close:Q", color=color,
-                                           tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("close:Q", format=",.0f"),
-                                                    alt.Tooltip("volume:Q", format=",.0f")])
-    ma = alt.Chart(h.melt("date", value_vars=["MA5", "MA20", "MA60", "MA120"], var_name="선", value_name="값").dropna()) \
-        .mark_line(strokeWidth=1.2).encode(
-            x="date:T", y="값:Q",
-            color=alt.Color("선:N", scale=alt.Scale(domain=["MA5", "MA20", "MA60", "MA120"],
-                                                    range=["#1FA75A", "#D6333B", "#F29A18", "#8E5CC4"]),
-                            legend=alt.Legend(orient="top", title=None)))
-    top = (wick + body + ma).properties(height=240, width="container", title=name)
-    qstart = h["date"].iloc[max(0, len(h) - recent - quiet)]
-    rstart = h["date"].iloc[max(0, len(h) - recent)]
-    band = alt.Chart(pd.DataFrame({"s": [qstart], "e": [rstart]})).mark_rect(color="#EEF1F3", opacity=0.9) \
-        .encode(x="s:T", x2="e:T")
-    vol = base.mark_bar(width=2.4).encode(y=alt.Y("volume:Q", title=None, axis=alt.Axis(format="~s")), color=color)
-    bottom = (band + vol).properties(height=110, width="container")
-    st.altair_chart(top)
-    st.altair_chart(bottom)
-
-
-def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
-    st.markdown(NHC_CSS, unsafe_allow_html=True)
-    st.markdown('<div class="nh-head"><b>💥 거래량 폭발</b><span>몇 달 조용하던 거래량이 갑자기 터진 국내 종목</span></div>',
-                unsafe_allow_html=True)
-    d = data.VS_DEFAULTS
-    c1, c2, c3, c4 = st.columns(4)
-    quiet = c1.segmented_control("조용했던 기간", [60, 90, 120], default=int(d["quiet"]), key="vs_quiet",
-                                 format_func=lambda x: f"{x}일")
-    recent = c2.segmented_control("최근 며칠 안에 터졌나", [1, 3, 5, 10], default=int(d["recent"]), key="vs_recent",
-                                  format_func=lambda x: "오늘" if x == 1 else f"{x}일")
-    mult = c3.slider("폭발 배수(평소 거래량의 몇 배)", 2.0, 10.0, float(d["mult"]), 0.5, key="vs_mult")
-    min_tv = c4.number_input("폭발일 거래대금 최소(억)", 0, 5000, int(d["min_tv"] / 1e8), 5, key="vs_mintv")
-    with st.expander("⚙️ 조용함 기준 · 추가 필터"):
-        e1, e2, e3 = st.columns(3)
-        quiet_cap = e1.slider("조용함: 5일 평균 거래량이 평소의 몇 배를 안 넘었나", 1.3, 4.0, float(d["quiet_cap"]), 0.1,
-                              key="vs_qcap", help="낮출수록 더 '말라 있던' 종목만 남아요. 하루 이틀 튄 날은 5일 평균이라 괜찮아요.")
-        only_quiet = e1.toggle("조용함 조건 적용", value=True, key="vs_onlyq")
-        only_up = e2.toggle("폭발일이 양봉인 종목만", value=True, key="vs_up",
-                            help="거래량이 터진 날 종가가 시가 위(빨간 봉)인 경우만. 대량 음봉(투매)은 빼요.")
-        only_above = e2.toggle("최근 수익률 플러스만", value=False, key="vs_pos")
-        max_to_high = e3.slider("신고가까지 % 이내만 (100=전체)", 5, 100, 100, 5, key="vs_toh")
-    quiet, recent = quiet or int(d["quiet"]), recent or int(d["recent"])
-    p = {"quiet": quiet, "recent": recent, "mult": mult, "quiet_cap": quiet_cap, "min_tv": min_tv * 1e8}
-    res = data.volume_surges(df, histories, quotes, p, only_quiet=only_quiet)
-    if not res.empty:
-        if only_up:
-            res = res[res["vs_peak_up"] == True]  # noqa: E712
-        if only_above:
-            res = res[pd.to_numeric(res["vs_ret"], errors="coerce") > 0]
-        if max_to_high < 100:
-            res = res[pd.to_numeric(res["to_high"], errors="coerce") <= max_to_high]
-    if res.empty:
-        st.info("지금 조건에 맞는 종목이 없어요. 폭발 배수를 낮추거나 기간을 늘려 보세요.")
-        return
-    today = data.now_kst().date()
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("찾은 종목", f"{len(res)}")
-    k2.metric("오늘 터짐", f"{int((res['vs_since'] == 0).sum())}")
-    k3.metric("2일 이상 연속·반복", f"{int((res['vs_days'] >= 2).sum())}")
-    k4.metric("신고가 10% 이내", f"{int((pd.to_numeric(res['to_high'], errors='coerce') <= 10).sum())}")
-
-    sort_by = st.segmented_control("정렬", ["폭발 배수", "최근 수익률", "말라 있던 정도", "RS", "신고가까지"],
-                                   default="폭발 배수", key="vs_sort", label_visibility="collapsed")
-    key, asc = {"최근 수익률": ("vs_ret", False), "말라 있던 정도": ("vs_dry", True), "RS": ("rs", False),
-                "신고가까지": ("to_high", True)}.get(sort_by or "", ("vs_mult", False))
-    res = res.sort_values(key, ascending=asc, na_position="last").reset_index(drop=True)
-
-    rows = []
-    for i, r in res.head(120).iterrows():
-        tag = ""
-        if r["vs_days"] >= 2:
-            tag = f'<span class="vs-tag multi">{int(r["vs_days"])}일 폭발</span>'
-        elif r["vs_days"] == 1:
-            tag = '<span class="vs-tag first">1회 폭발</span>'
-        if r["vs_peak_up"] is False:
-            tag += '<span class="vs-tag dn">음봉</span>'
-        pk = r["vs_peak_date"]
-        pk_txt = "오늘" if pk == today else f"{pk:%m/%d}"
-        dry = "-" if pd.isna(r["vs_dry"]) else f"{r['vs_dry']:.2f}"
-        rows.append(
-            f'<tr><td class="c rk hide-m">{i + 1}</td>'
-            f'<td class="l nm"><a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>{tag}'
-            f'<small>{r["code"]} · {html.escape(str(r["group"]))}</small></td>'
-            f'<td class="sp">{_vol_svg(r["vs_vol"], r["vs_close"], r["vs_split"], recent)}</td>'
-            f'<td><b class="rs" style="color:{UP}">{r["vs_mult"]:.1f}배</b><small>{pk_txt} · 평균 {r["vs_avg_mult"]:.1f}배</small></td>'
-            f'<td><b class="px">{_tv_eok(r["vs_peak_tv"])}</b><small>폭발일 거래대금</small></td>'
-            f'<td>{_chg_html(r["vs_ret"])}<small>오늘 {_chg_html(r["change"])}</small></td>'
-            f'<td class="hide-m"><b>{dry}</b><small>횡보폭 {_pct(r["vs_range"])}</small></td>'
-            f'<td><b>{"-" if pd.isna(r["to_high"]) else format(r["to_high"], ".1f") + "%"}</b>'
-            f'<small>{"정배열" if r.get("aligned") == True else ""}</small></td>'  # noqa: E712
-            f'<td><b class="rs">{_n(r["rs"])}</b><small>1M {_n(r["rs_1m"])}</small></td></tr>')
-    head = ('<tr><th class="c hide-m">순위</th><th class="l">종목</th>'
-            f'<th class="l">거래량 {len(res.iloc[0]["vs_vol"] or [])}일 (회색=조용한 {quiet}일)</th>'
-            f'<th>폭발 배수</th><th>거래대금</th><th>최근 {recent}일</th><th class="hide-m">거래 수준</th>'
-            '<th>신고가까지</th><th>RS</th></tr>')
-    st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>',
-                unsafe_allow_html=True)
-    st.caption(f"폭발 배수 = 최근 {recent}거래일 중 가장 큰 거래량 ÷ 그 앞 {quiet}거래일 거래량 중앙값 · "
-               "평균 = 최근 구간 평균 배수 · 거래 수준 = 조용한 기간 중앙값 ÷ 그 앞 1년 중앙값(1보다 작을수록 평소보다 말라 있었음) · "
-               "횡보폭 = 조용한 기간 종가 최고/최저 차이")
-
-    labels = {r.code: f"{r.name} ({r.code}) · {r.vs_mult:.1f}배" for r in res.head(120).itertuples()}
-    code = st.selectbox("차트로 보기", list(labels), format_func=labels.get, key="vs_chart_code")
-    hist = (histories.get(code) or (None, data.empty_frame(), None))[1]
-    if hist is not None and not hist.empty:
-        _vs_chart(hist, labels[code], recent, quiet)
-    with st.expander("ℹ️ 이 탭을 쓰는 법"):
-        st.markdown(
-            "- 일진전기처럼 **몇 달 동안 거래량이 말라 있다가** 최근 며칠 사이 평소의 몇 배가 터진 종목을 찾아요.\n"
-            "- 조용함 조건: 조용한 기간 동안 **5일 평균 거래량**이 평소(중앙값)의 N배를 넘은 적이 없어야 해요. "
-            "하루 튄 날은 괜찮지만, 며칠씩 거래가 붙었던 종목은 빠져요.\n"
-            "- 거래량 폭발 자체는 매수 신호가 아니에요. 폭발 뒤 **고가 근처에서 버티는지(눌림 거래량 감소)**, "
-            "신고가 돌파로 이어지는지를 🏁 신고가 후보 · 🎯 매수 후보 탭과 같이 보세요.\n"
-            "- 보드에 넣은 종목(stocks.py) 안에서만 찾아요. 오늘 봉은 실시간 누적 거래량이라 장중엔 계속 커져요.")
-
-
-_QUOTES: dict = {}
-VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
-_GC = {"n": 0, "mb": 0.0}
-
-
-def render_board():
-    quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
-    _QUOTES.clear()
-    _QUOTES.update(quotes)
-    shares_store = load_shares()
-    core_info = None
-    small_hi_set = set()
-    if scope_core:
-        core, small_hi, core_info = core_view(quotes, shares_store["data"])
-        small_hi_set = set(small_hi)
-        keep = core | small_hi | set(OS_CODES)
-        stocks_use = []
-        for x in STOCKS_VIEW:
-            if x["code"] in keep:
-                if x["code"] in small_hi and x["code"] not in core:
-                    x = dict(x, tags=list(x.get("tags") or []) + ["🆕 소형 신고가"])
-                stocks_use.append(x)
-        core_info.update(core=len(core), small_hi=len(small_hi))
+with tab_judge:
+    ok_rows = sorted([r for r in ROWS if r["j"]], key=lambda r: LEVEL_ORDER[r["j"]["level"]])
+    if not ok_rows:
+        html("<div class='notice info'>판단할 보유 종목이 없어요.</div>")
     else:
-        stocks_use = STOCKS_VIEW
-    view_kr = tuple(sorted({x["code"] for x in stocks_use if data.is_kr(x["code"])}))
-    view_os = tuple(sorted({x["code"] for x in stocks_use if not data.is_kr(x["code"])}))
-    histories = get_histories(view_kr + view_os, wait=True,
-                              label="일봉을 불러오는 중이에요. 처음 켤 때 한 번만 조금 걸리고, 이후엔 바뀐 종목만 받아요.")
-    if scope_core:
-        _hist_drop(set(view_kr + view_os) | set(KR_CODES))
-    VIEW_CODES["kr"], VIEW_CODES["all"] = view_kr, view_kr + view_os
-    kr_board = tuple(c for c in view_kr if c in set(KR_CODES))
-    # (메모리) 역대 신고가용 월봉·수급·실적은 공부 자료 종목 + 작은 신고가 종목만(전체 1,000종목이면 서버 메모리 초과)
-    heavy = tuple(sorted(set(kr_board) | (small_hi_set if scope_core else set()))) + view_os
-    VIEW_CODES["heavy"] = tuple(c for c in heavy if data.is_kr(c))
-    df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
-                          monthlies=load_monthlies(heavy), official52=load_official_52w(kr_board))
-    df = mark_sector_first(df, histories)
-    _GC["n"] += 1
-    if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
-        gc.collect()
-    _GC["mb"] = mem_guard(set(view_kr + view_os) | set(KR_CODES))
-    _mem_log(len(df))
-    if core_info:
-        bg = core_info["bg"]
-        st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
-                   f"{core_info['small_hi']}종목"
-                   + (f" · 작은 종목 일봉 뒤에서 받는 중 {bg['done']:,}/{bg['total']:,}" if bg.get("running") else
-                      f" · 작은 종목 {core_info['loaded']:,}/{core_info['rest']:,} 확인 완료")
-                   + " · 모두 보려면 사이드바 '전체'")
-    df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
-    df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
+        names = {r["h"]["id"]: f"{r['h']['name']}  —  {r['j']['signal']}" for r in ok_rows}
+        pick = st.selectbox("종목", list(names), format_func=names.get, key="judge_pick",
+                            label_visibility="collapsed")
+        r = next(x for x in ok_rows if x["h"]["id"] == pick)
+        h, pos, ind, j = r["h"], r["pos"], r["ind"], r["j"]
+        mk = h["market"]
 
-    interval = REFRESH[refresh_label]
-    refresh_text = f"{refresh_label}마다 새로 불러와요." if interval else "자동 새로고침은 꺼져 있어요."
-    st.markdown(
-        f'<div class="status">{data.now_kst():%m/%d %H:%M:%S} · {data.market_status(quotes)} · {refresh_text}</div>',
-        unsafe_allow_html=True,
-    )
-    if data.MOCK:
-        st.info("가짜 데이터로 보여주는 테스트 모드예요. 실제 시세를 보려면 STOCK_MOCK 설정 없이 실행하세요.")
+        r0 = j["rules"][0] if j["rules"] else None
+        acts = "".join(f"<span class='act'>{escape(a)}</span>" for a in j["actions"])
+        html(f"<div class='verdict v-{j['level']}'><div class='word'>{escape(j['signal'])}</div>"
+             f"<div class='one'><div class='nm'>{escape(h['name'])} <span style='font-weight:500;font-size:.8rem'>{escape(h['code'])}</span></div>"
+             f"<span>{escape(r0['fact']) if r0 else ''}</span>"
+             + (f"<div class='acts'>{acts}</div>" if acts else "") + "</div></div>")
 
-    leaders_now = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
-    trends_all, fins_all = load_trends_all(), load_fins_all()
-    _TRENDS_BG["v"] = trends_all
-    render_market(df)
-    render_radar(df[df["code"].map(_mkt) == market])
-    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"]
-    with st.container(key="main_tabs"):
-        # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
-        try:
-            tabs = st.tabs(names, key="main_tab_sel", on_change="rerun")
-            lazy = True
-        except TypeError:          # 예전 Streamlit
-            tabs = st.tabs(names)
-            lazy = False
-    t_list, t_hold, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = tabs
+        html("<div class='sec'>왜 이런 판단인가요</div><div class='sub'>내 매매 원칙 → 지금 이 종목의 상태</div>")
+        cards = []
+        for rr in j["rules"]:
+            cards.append(f"<div class='rc l-{rr['level']}'><div class='t'>{escape(rr['title'])}</div>"
+                         f"<div class='p'>{escape(rr['principle'])}</div>"
+                         f"<div class='f'>{escape(rr['fact'])}</div></div>")
+        html("<div class='rules'>" + "".join(cards) + "</div>")
 
-    def is_open(t) -> bool:
-        return (not lazy) or bool(getattr(t, "open", True))
+        html("<div class='sec'>숫자</div>")
+        stop_gap = (j["stop"] / ind["price"] - 1) * 100
+        tgt_gap = (j["target"] / ind["price"] - 1) * 100
+        atr_set = h.get("atr_pct")
+        stt_j = core.atr_status(h)
+        if stt_j != "applied":
+            ref_ = core.auto_atr(h, r["df"])
+            html("<div class='notice warn'><b>" + ("ATR 입력 필요" if stt_j == "missing" else "ATR 확인 필요") + "</b>&nbsp;— "
+                 + ("아직 내가 정한 ATR이 없어 임시로 기본 8%로 계산 중이에요. " if stt_j == "missing"
+                    else f"예전에 들어간 {float(atr_set):g}%를 아직 확인하지 않았어요. ")
+                 + (f"참고로 진입일 ATR(20)은 {ref_:g}%예요. " if ref_ else "")
+                 + "아래 '내 ATR %'나 '직접 손절가'를 넣고 저장해 주세요.</div>")
+        html("<div class='kpis k3'>"
+             f"<div class='kpi'><div class='l'>현재가</div><div class='v'>{fmt(ind['price'], mk)}</div>"
+             f"<div class='d {sign_cls(ind['chg'])}'>{ind['chg']:+.2f}%</div></div>"
+             f"<div class='kpi'><div class='l'>수익률</div><div class='v {sign_cls(j['pnl_pct'])}'>{j['pnl_pct']:+.2f}%</div>"
+             f"<div class='d'>{j['r_mult']:+.2f}R · 1R = {fmt(j['r_unit'], mk)}</div></div>"
+             f"<div class='kpi'><div class='l'>평가손익</div>"
+             f"<div class='v {sign_cls(ind['price'] - pos.avg)}'>{(ind['price'] - pos.avg) * pos.qty * r['fx']:+,.0f}원</div>"
+             f"<div class='d'>{pos.qty:,.0f}주 · 평단 {fmt(pos.avg, mk)}</div></div>"
+             "</div>"
+             "<div class='kpis k3'>"
+             f"<div class='kpi'><div class='l'>내 ATR</div><div class='v'>"
+             f"{(f'{float(atr_set):g}%' if atr_set else '직접 손절가') if stt_j == 'applied' else ('확인 필요' if stt_j == 'check' else '입력 필요')}</div>"
+             f"<div class='d'>손절률 {j['stop_pct']:g}%{'' if stt_j == 'applied' else ' (임시)'}"
+             f" · 지금 ATR(20) {ind['atr_pct']:.1f}%</div></div>"
+             f"<div class='kpi'><div class='l'>손절가</div><div class='v'>{fmt(j['stop'], mk)}</div>"
+             f"<div class='d'>{stop_gap:+.1f}% · {escape(j['stop_note'])}</div></div>"
+             f"<div class='kpi'><div class='l'>익절가 ({S['target_r']:g}R 고정)</div><div class='v'>{fmt(j['target'], mk)}</div>"
+             f"<div class='d'>{tgt_gap:+.1f}% · 첫 매수 때 정한 값 (추가 매수해도 고정)</div></div>"
+             "</div>")
+        with st.form(f"jatr_{h['id']}", border=False):
+            a_, b_, c_ = st.columns([1, 1, 1], vertical_alignment="bottom")
+            new_atr = a_.number_input("내 ATR % (20일)", min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
+                                      value=float(atr_set) if atr_set and stt_j != "missing" else None,
+                                      placeholder=f"직접 입력 (지금 ATR20 {ind['atr_pct']:.1f})")
+            new_stop = b_.number_input("또는 직접 손절가", min_value=0.0, format="%.2f",
+                                       value=float(h["stop"]) if h.get("stop") else None, placeholder="적으면 ATR 자동 계산")
+            if c_.form_submit_button("저장", type="primary", width="stretch"):
+                h["stop"] = float(new_stop) if new_stop else None
+                imp = core.implied_atr(pos.avg, h["stop"])
+                h["atr_pct"] = imp if imp is not None else (round(float(new_atr), 2) if new_atr else None)
+                h["atr_src"] = "stop" if imp is not None else ("manual" if new_atr else None)
+                h["stop_floor"] = None
+                core.reset_target(h, S)
+                save(f"atr {h['code']}")
+                st.rerun()
+        if h.get("stop"):
+            imp_ = core.implied_atr(pos.avg, float(h["stop"]))
+            html(f"<div class='notice info'>직접 넣은 손절가 {fmt(float(h['stop']), mk)} 기준"
+                 + (f" → ATR {imp_:g}%로 계산, {S['target_r']:g}R 목표가 {fmt(j['target'], mk)}" if imp_ is not None
+                    else " (평단 이상 — 수익 보호용, R·3R은 원래 ATR 기준)")
+                 + ". 손절가를 비우면 내 ATR%로 계산해요.</div>")
+        if atr_set and ind["atr_pct"] > float(atr_set) * 1.3:
+            html(f"<div class='notice warn'>지금 ATR(20)이 {ind['atr_pct']:.1f}%로 설정값 {float(atr_set):g}%보다 많이 커졌어요. "
+                 "변동성이 커진 구간이니 손절폭을 다시 볼 만해요 (기록 → 판단 기준).</div>")
 
-    jobs = [
-        (t_list, lambda: render_list(df, histories, quote_error, shares_store, fins_all)),
-        (t_hold, lambda: render_holdings_tab(df, quotes)),
-        (t_chart, lambda: render_chart_tab(df, quotes)),
-        (t_rep, lambda: render_reports_tab()),
-        (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
-        (t_vs, lambda: render_volume_surge(df, histories, quotes)),
-        (t_buy, lambda: render_buy(df, quotes)),
-        (t_money, lambda: render_money(df)),
-        (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),
-        (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
-        (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
-    ]
-    for tab, job in jobs:
-        if is_open(tab):
-            with tab:
-                job()
+        html("<div class='sec'>원칙 점검</div>")
+        rows_html = []
+        for k, v, t in j["checks"]:
+            mark = "<span class='mk y'>✓</span>" if v else ("<span class='mk n'>✕</span>" if v is False
+                                                             else "<span class='mk z'>–</span>")
+            rows_html.append(f"<div class='ck'>{mark}<span class='k'>{escape(k)}</span><span class='t'>{escape(t)}</span></div>")
+        html("<div class='checks'>" + "".join(rows_html) + "</div>")
+
+        html("<div class='sec'>차트</div>")
+        st.plotly_chart(chart(r["df"], h, pos, j), width="stretch", config={"displayModeBar": False})
+
+        f = r.get("fund") or {}
+        fl = r.get("flows") or {}
+        html("<div class='sec'>실적 · 수급 · 리포트 · 뉴스</div>")
+        t_f, t_s, t_r, t_n = st.tabs(["영업이익", "수급", "리포트", "뉴스"])
+        with t_f:
+            html(f"<div class='box'>{escape(f.get('detail') or '실적 자료를 못 가져왔어요.')}"
+                 + ("<br><span class='mut'>기록 → 판단 기준에서 직접 판단값 사용 중</span>" if h.get("fund_override") is not None else "")
+                 + "</div>")
+            ser = (f.get("series") or {}).get("quarter") or []
+            if ser:
+                fig = go.Figure(go.Bar(
+                    x=[x[0] + (" (E)" if x[2] else "") for x in ser], y=[x[1] for x in ser],
+                    marker_color=["#cbd5e1" if x[2] else ("#e5484d" if x[1] >= 0 else "#2f6fed") for x in ser],
+                    text=[f"{x[1]:,.0f}" for x in ser], textposition="outside",
+                    hovertemplate="%{x}<br>영업이익 %{y:,.0f}억<extra></extra>"))
+                fig.update_layout(template="plotly_white", height=240, margin=dict(l=4, r=4, t=16, b=4),
+                                  paper_bgcolor="#fff", plot_bgcolor="#fff", dragmode=False,
+                                  font=dict(family="Pretendard Variable, Pretendard, sans-serif", size=11, color="#64748b"))
+                fig.update_yaxes(gridcolor="#f1f3f6", ticksuffix="억", tickformat=",")
+                st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                st.caption("분기 영업이익(억원). 회색은 증권사 컨센서스(추정치).")
+        with t_s:
+            if fl.get("ok"):
+                html("<div class='kpis'>"
+                     f"<div class='kpi'><div class='l'>5일 기관</div><div class='v {sign_cls(fl['inst5'])}'>{fl['inst5']:+,.0f}주</div></div>"
+                     f"<div class='kpi'><div class='l'>5일 외국인</div><div class='v {sign_cls(fl['frgn5'])}'>{fl['frgn5']:+,.0f}주</div></div>"
+                     f"<div class='kpi'><div class='l'>20일 기관</div><div class='v {sign_cls(fl['inst20'])}'>{fl['inst20']:+,.0f}주</div></div>"
+                     f"<div class='kpi'><div class='l'>20일 외국인</div><div class='v {sign_cls(fl['frgn20'])}'>{fl['frgn20']:+,.0f}주</div></div>"
+                     "</div>")
+                daily = fl.get("daily") or []
+                if daily:
+                    dd = pd.DataFrame(daily[:20])
+                    dd["date"] = dd["date"].astype(str).str[-4:].str[:2] + "." + dd["date"].astype(str).str[-2:]
+                    dd = dd.iloc[::-1]
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=dd["date"], y=dd["frgn"], name="외국인", marker_color="#0f172a"))
+                    fig.add_trace(go.Bar(x=dd["date"], y=dd["inst"], name="기관", marker_color="#94a3b8"))
+                    fig.update_layout(template="plotly_white", height=240, barmode="group", dragmode=False,
+                                      margin=dict(l=4, r=4, t=24, b=4), paper_bgcolor="#fff", plot_bgcolor="#fff",
+                                      legend=dict(orientation="h", y=1.15, x=0),
+                                      font=dict(family="Pretendard Variable, Pretendard, sans-serif", size=11, color="#64748b"))
+                    fig.update_yaxes(gridcolor="#f1f3f6", tickformat=",", zerolinecolor="#cbd5e1")
+                    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                    st.caption("일별 순매수(주). 원칙: 외국인·투신·연기금 수급이 받쳐주는지.")
+            else:
+                html("<div class='notice info'>수급 자료를 못 가져왔어요. 잠시 뒤 새로고침해 보세요.</div>")
+            html(f"<div class='box' style='margin-top:8px'>거래량 평소의 {ind['vol_ratio']:.1f}배 · 종가위치 {ind['dcr']:.0f}% · "
+                 f"52주 고점 대비 {ind['from_high']:+.1f}% · {'정배열' if ind['aligned'] else '정배열 아님'}</div>")
+        with t_r:
+            reps = reports(h["code"]) if mk == "KR" else []
+            if reps:
+                html("<div class='checks'>" + "".join(
+                    f"<div class='ck' style='grid-template-columns:1fr auto'><a href='{escape(x['url'])}' target='_blank' "
+                    f"style='color:var(--ink);font-weight:600;text-decoration:none'>{escape(x['title'])}</a>"
+                    f"<span class='t'>{escape(x['broker'])} · {escape(x['date'])}</span></div>" for x in reps) + "</div>")
+            else:
+                html("<div class='notice info'>최근 증권사 리포트가 없거나 못 가져왔어요.</div>")
+        with t_n:
+            nws = news(h["code"]) if mk == "KR" else []
+            if nws:
+                html("<div class='checks'>" + "".join(
+                    f"<div class='ck' style='grid-template-columns:1fr auto'><a href='{escape(x['url'])}' target='_blank' "
+                    f"style='color:var(--ink);text-decoration:none'>{escape(x['title'])}</a>"
+                    f"<span class='t'>{escape(x['office'])} · {escape(x['date'])}</span></div>" for x in nws) + "</div>")
+            else:
+                html("<div class='notice info'>뉴스를 못 가져왔어요.</div>")
+
+        if h.get("memo"):
+            html(f"<div class='callout'><div class='h'>메모</div><div class='b'>{escape(h['memo'])}</div></div>")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if mk == "KR":
+                st.link_button("네이버 증권에서 뉴스·리포트", icon=":material/open_in_new:", width="stretch",
+                               url=f"https://finance.naver.com/item/main.naver?code={h['code']}")
+        with c2:
+            with st.popover("불타기하면 몇 주?", icon=":material/add_chart:", width="stretch"):
+                new_stop = ind["price"] * (1 - j["stop_pct"] / 100)
+                sz = core.size_for(ind["price"], new_stop, {**S, "equity": ACC["account"]}, r["fx"])
+                st.markdown(f"현재가 {fmt(ind['price'], mk)}, 손절 {j['stop_pct']:g}% ({fmt(new_stop, mk)}) 기준  \n"
+                            f"1유닛 = **{sz['qty']:,}주** · 약 {won(sz['value'])} · 계좌의 {sz['weight']:.1f}%")
+                st.caption(f"추가 후 손절가는 최소 평단 {fmt(pos.avg, mk)} 이상으로")
+
+    bad = [r for r in ROWS if not r["j"]]
+    if bad:
+        html("<div class='notice warn'>시세를 못 가져온 종목: "
+             + ", ".join(f"{escape(r['h']['name'])}({escape(r['h']['code'])})" for r in bad) + "</div>")
 
 
-def _attach_flows(f: pd.DataFrame) -> pd.DataFrame:
-    """지금 화면에 보이는 종목(쪽)의 수급 열을 채워요. 뒤에서 받아 둔 전 종목 수급이 있으면 그걸 먼저 써요."""
-    flow_keys = list(data.trend_summary(None))
-    if not len(f):
-        return f.assign(**{k: [] for k in flow_keys})
-    trends = {}
-    if show_flow:
-        bg = _TRENDS_BG.get("v") or {}
-        need = tuple(c for c in f["code"] if data.is_kr(c) and (bg.get(c) is None or bg[c].empty))
-        trends = {**bg, **(load_trends(need) if need else {})}
-    _TRENDS_BG["page"] = trends
-    summ = [data.trend_summary(trends.get(c)) for c in f["code"]]
-    return f.assign(**{k: [x[k] for x in summ] for k in flow_keys})
+# ─────────────────────────── 계산기 ───────────────────────────
+with tab_calc:
+    html("<div class='sec'>몇 주 살까</div>"
+         f"<div class='sub'>계좌 {won(ACC['account'])} × 위험 {S['risk_pct']:g}% = 한 번에 잃어도 되는 돈(1R) "
+         f"<b>{won(ACC['account'] * S['risk_pct'] / 100)}</b></div>")
+    with st.container(border=True):
+        a, b = st.columns(2)
+        cm = a.segmented_control("시장", ["한국", "미국"], default="한국", key="calc_m")
+        how = b.segmented_control("손절 기준", ["%", "가격"], default="%", key="calc_how")
+        a, b = st.columns(2)
+        entry = a.number_input("매수가", min_value=0.0, value=None, placeholder="0", format="%.2f", key="calc_e")
+        if how == "가격":
+            stop_v = b.number_input("손절가", min_value=0.0, value=None, placeholder="0", format="%.2f") or 0.0
+        else:
+            sp = b.number_input("손절 % (= MAX(기본, ATR))", min_value=0.5, value=float(S["stop_pct"]), step=0.5)
+            stop_v = (entry or 0) * (1 - sp / 100)
+    if entry and 0 < stop_v < entry:
+        fxm = FX if cm == "미국" else 1.0
+        sz = core.size_for(entry, stop_v, {**S, "equity": ACC["account"]}, fxm)
+        html("<div class='kpis k3'>"
+             f"<div class='kpi'><div class='l'>살 수량</div><div class='v'>{sz['qty']:,}주</div>"
+             f"<div class='d'>손절가 {stop_v:,.2f}</div></div>"
+             f"<div class='kpi'><div class='l'>매수 금액</div><div class='v'>{won(sz['value'])}</div>"
+             f"<div class='d'>계좌의 {sz['weight']:.1f}%</div></div>"
+             f"<div class='kpi'><div class='l'>{S['target_r']:g}R 목표가</div>"
+             f"<div class='v'>{entry + (entry - stop_v) * S['target_r']:,.2f}</div>"
+             f"<div class='d'>+{(entry - stop_v) / entry * S['target_r'] * 100:.1f}%</div></div>"
+             "</div>")
+        if sz["weight"] > 100 / max(1, S["max_positions"] - 1) * 1.5:
+            html("<div class='notice warn'>비중이 커요. 손절폭이 너무 좁지 않은지 확인해 주세요.</div>")
+        if cm == "미국":
+            st.caption(f"환율 {FX:,.1f}원 적용")
 
 
-_TRENDS_BG: dict = {}
-
-
-def render_list(df, histories, quote_error, shares_store, fins_all=None):
-    f = apply_filters(df)
-    if only_earn:
-        fins = load_financials(tuple(c for c in f["code"] if data.is_kr(c)))
-        f = add_earnings(f, fins)
-        f = f[f["earn_ok"] == True]  # noqa: E712
-    n_hot = int((f["days_since_high"] <= recent_days).sum())
-    n_near = int((f["to_high"] <= 10).sum())
-    n_aligned = int((f["aligned"] == True).sum())  # noqa: E712
-    n_holding = int((f["bo_status"] == "유지").sum())
-    n_first = int(((f["bo_status"] == "유지") & (pd.to_numeric(f["bo_nth"], errors="coerce") == 1)).sum())
-
-    with st.container(key="desk_kpis"):
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("종목", f"{len(f)}")
-        c2.metric(f"최근 {recent_days}일 신고가", f"{n_hot}")
-        c3.metric("돌파 유지", f"{n_holding}", f"⭐ 첫 돌파 {n_first}", delta_color="off")
-        c4.metric("신고가까지 10% 이내", f"{n_near}")
-        c5.metric("정배열", f"{n_aligned}")
-
-    if f.empty:
-        st.info("조건에 맞는 종목이 없어요. 왼쪽 필터를 넓혀 보세요.")
+# ─────────────────────────── 설정 ───────────────────────────
+with tab_set:
+    html("<div class='sec'>청산한 종목</div>")
+    closed = []
+    for h in book["holdings"]:
+        pos = core.position(h)
+        if pos.qty <= 0 and h["trades"]:
+            last = max(t["date"] for t in h["trades"])
+            cost = sum(float(t["price"]) * float(t["qty"]) for t in h["trades"] if t["side"] == "buy")
+            closed.append({"종목": h["name"], "첫 매수": pos.first_date, "마지막 매도": last,
+                           "실현손익": round(pos.realized),
+                           "수익률": round(pos.realized / cost * 100, 2) if cost else 0})
+    if closed:
+        wins = sum(1 for c in closed if c["실현손익"] > 0)
+        total = sum(c["실현손익"] for c in closed)
+        html("<div class='kpis k3'>"
+             f"<div class='kpi'><div class='l'>청산</div><div class='v'>{len(closed)}건</div></div>"
+             f"<div class='kpi'><div class='l'>승률</div><div class='v'>{wins / len(closed) * 100:.0f}%</div>"
+             f"<div class='d'>{wins}승 {len(closed) - wins}패</div></div>"
+             f"<div class='kpi'><div class='l'>실현손익 합계</div><div class='v {sign_cls(total)}'>{total:+,.0f}</div>"
+             f"<div class='d'>미국 종목은 달러 기준</div></div></div>")
+        st.dataframe(pd.DataFrame(closed).sort_values("마지막 매도", ascending=False), hide_index=True,
+                     width="stretch",
+                     column_config={"수익률": st.column_config.NumberColumn(format="%+.2f%%"),
+                                    "실현손익": st.column_config.NumberColumn(format="%,d")})
     else:
-        if len(f) > 300:        # (속도) 전체 종목이면 표를 나눠서 그려요
-            c1, c2, c3 = st.columns([1.3, 1, 2])
-            sort_by = c1.selectbox("정렬", ["신고가 가까운 순", "등락률 높은 순", "거래대금 많은 순", "평소 대비 거래 많은 순",
-                                          "RS 높은 순", "시가총액 큰 순"], key="list_sort")
-            size = c2.selectbox("한 번에", [100, 200, 300], index=0, key="list_size")
-            col, asc = {"신고가 가까운 순": ("to_high", True), "등락률 높은 순": ("change", False),
-                        "거래대금 많은 순": ("tv_live", False), "평소 대비 거래 많은 순": ("tv_x", False),
-                        "RS 높은 순": ("rs", False), "시가총액 큰 순": ("cap_krw", False)}[sort_by]
-            f = f.assign(_k=pd.to_numeric(f[col], errors="coerce")).sort_values("_k", ascending=asc,
-                                                                                 na_position="last").drop(columns="_k")
-            pages = max(1, -(-len(f) // size))
-            page = c3.number_input(f"쪽 (전체 {len(f):,}종목 · {pages}쪽)", 1, pages, 1, key="list_page")
-            f = f.iloc[(page - 1) * size: page * size]
-        f = _attach_flows(f)
-        with st.container(key="desk_table"):
-            render_table(f)
-            st.caption("노란 줄 = 최근 신고가 · 신고가까지 빨강 3% 이내, 주황 10% 이내 · 수급은 억원(추정) · 해외는 현지 통화, 15분 지연")
-        with st.container(key="mobile_view"):
-            render_cards(f, n_hot, n_near, n_aligned, fins_all)
-        render_detail(f, histories, _TRENDS_BG.get("page") or _TRENDS_BG.get("v") or {})
-    render_checks(df, quote_error, shares_store)
+        html("<div class='notice info'>아직 청산한 종목이 없어요.</div>")
 
+    html("<div class='sec'>계좌 금액 · 매매 원칙 숫자</div>")
+    with st.form("settings"):
+        a, b, c = st.columns(3)
+        eq = a.number_input("초기 자본금 (원)", min_value=0, value=int(S["equity"]), step=1_000_000, format="%d",
+                            help="계좌를 시작한 원금, 또는 기준일의 계좌 총액. 이후 계좌 총액 = 이 값 + 실현손익 + 평가손익")
+        sd0 = pd.to_datetime(S.get("start_date")).date() if S.get("start_date") else None
+        sd = b.date_input("기준일", value=sd0, format="YYYY.MM.DD", help="비우면 첫 매매일부터 그래프를 그려요")
+        rp = c.number_input("1회 위험 (계좌 대비 %)", min_value=0.1, max_value=2.0, value=float(S["risk_pct"]), step=0.1,
+                            help="2% 초과 금지")
+        a, b, c = st.columns(3)
+        spct = a.number_input("기본 손절폭 %", min_value=1.0, value=float(S["stop_pct"]), step=0.5,
+                              help="손절률 = MAX(이 값, 종목별 ATR%)")
+        mp = b.number_input("최대 종목 수", min_value=1, value=int(S["max_positions"]))
+        fxv = c.number_input("예비 환율", min_value=0.0, value=float(S["fx"]))
+        unit_v = st.number_input("1R 비중 (계좌 대비 %)", min_value=1.0, max_value=50.0,
+                                 value=float(S.get("unit_pct", 7.5)), step=0.5,
+                                 help="이 비중만큼 들어가 있으면 1R(1유닛). 이보다 작으면 판단 보드에 '정찰병'으로 표시")
+        a, b = st.columns(2)
+        tr = a.number_input("절반 익절 R", min_value=1.0, value=float(S["target_r"]), step=0.5)
+        be = b.number_input("본전 손절가 이동 R", min_value=0.5, value=float(S["breakeven_r"]), step=0.5)
+        if st.form_submit_button("저장", type="primary", width="stretch"):
+            S.update(unit_pct=float(unit_v))
+            S.update(equity=eq, start_date=sd.isoformat() if sd else "", risk_pct=rp, stop_pct=spct,
+                     max_positions=int(mp), fx=fxv,
+                     target_r=tr, breakeven_r=be)
+            save("settings")
+            st.rerun()
 
-st.title("밸류체인 신고가 보드")
-st.fragment(render_board, run_every=REFRESH[refresh_label])()
+    html("<div class='sec'>엑셀 계좌일지 가져오기</div>"
+         "<div class='sub'>추세추종_돌파매매_계좌일지(.xlsx)의 설정·매매일지 시트를 읽어요. 1차·2차 청산도 매도로 들어가요.</div>")
+    with st.container(border=True):
+        xf = st.file_uploader("계좌일지 엑셀", type=["xlsx"], label_visibility="collapsed")
+        if xf:
+            try:
+                parsed = core.parse_journal_xlsx(xf)
+            except Exception as e:
+                parsed = None
+                st.error(f"엑셀을 못 읽었어요: {e}")
+            if parsed:
+                prev = pd.DataFrame([{"종목": t["name"], "진입일": t["date"], "진입가": t["entry"], "수량": t["qty"],
+                                      "ATR%": t["atr_pct"], "청산": len(t["sells"])} for t in parsed["trades"]])
+                st.dataframe(prev, hide_index=True, width="stretch")
+                ps = parsed["settings"]
+                if ps:
+                    lab = {"equity": "초기 자본금", "risk_pct": "리스크 %", "target_r": "목표 R", "stop_pct": "기본 손절폭 %"}
+                    st.caption("엑셀 설정도 함께 반영: " + " · ".join(f"{lab.get(k, k)} {v:,.1f}".replace(".0", "")
+                                                                  for k, v in ps.items()))
+                replace = st.checkbox("기존 종목을 지우고 엑셀 내용으로 새로 채우기")
+                if st.button(f"{len(parsed['trades'])}건 가져오기", type="primary", icon=":material/upload_file:"):
+                    if replace:
+                        book["holdings"] = []
+                    S.update({k: v for k, v in ps.items() if k in ("equity", "risk_pct", "target_r", "stop_pct")})
+                    miss = []
+                    for t in parsed["trades"]:
+                        found = search(t["name"])
+                        code = found[0]["code"] if found else ""
+                        if not code:
+                            miss.append(t["name"])
+                        idx = "KOSDAQ" if found and "KOSDAQ" in str(found[0].get("market", "")).upper() else "KOSPI"
+                        h = core.new_holding(code or t["name"], t["name"], "KR")
+                        h.update(index=idx, atr_pct=t["atr_pct"], atr_src="manual" if t["atr_pct"] else None, memo=t["memo"])
+                        h["trades"].append({"date": t["date"], "side": "buy", "price": t["entry"], "qty": t["qty"],
+                                            "memo": "엑셀 일지"})
+                        for sl in t["sells"]:
+                            if sl["qty"] > 0:
+                                h["trades"].append({"date": sl["date"], "side": "sell", "price": sl["price"],
+                                                    "qty": sl["qty"], "memo": "엑셀 일지 청산"})
+                        book["holdings"].append(h)
+                    save("import journal xlsx")
+                    if miss:
+                        st.warning("코드를 못 찾은 종목: " + ", ".join(miss) + " — 기록 → 판단 기준에서 코드를 넣어 주세요.")
+                    else:
+                        st.rerun()
+
+    html("<div class='sec'>백업 · 한꺼번에 넣기</div>")
+    with st.container(border=True):
+        st.download_button("백업 파일 받기", json.dumps(book, ensure_ascii=False, indent=2),
+                           file_name=f"portfolio_{date.today():%Y%m%d}.json", mime="application/json",
+                           icon=":material/download:")
+        up = st.file_uploader("백업 파일로 되돌리기", type="json")
+        if up and st.button("이 파일로 덮어쓰기", icon=":material/restore:"):
+            st.session_state.book = core.normalize_book(json.load(up))
+            book = st.session_state.book
+            save("restore backup")
+            st.rerun()
+        csv_txt = st.text_area("CSV로 한꺼번에 넣기", height=110,
+                               placeholder="코드,이름,시장(KR/US),매수일,단가,수량\n005930,삼성전자,KR,2026-09-01,72000,100")
+        if st.button("넣기", icon=":material/playlist_add:") and csv_txt.strip():
+            df = pd.read_csv(io.StringIO(csv_txt), header=None,
+                             names=["code", "name", "market", "date", "price", "qty"], dtype={"code": str})
+            added = 0
+            for _, rr in df.iterrows():
+                code = str(rr["code"]).strip().upper()
+                mkt = str(rr["market"]).strip().upper()
+                code = code.zfill(6) if mkt == "KR" and code.isdigit() else code
+                h = next((x for x in book["holdings"] if x["code"] == code and core.position(x).qty > 0), None)
+                if h is None:
+                    h = core.new_holding(code, str(rr["name"]), mkt)
+                    book["holdings"].append(h)
+                h["trades"].append({"date": str(rr["date"]), "side": "buy", "price": float(rr["price"]),
+                                    "qty": float(rr["qty"]), "memo": "CSV"})
+                added += 1
+            save(f"csv import {added}")
+            st.rerun()
+
+    html("<div class='sec'>저장 상태</div>")
+    html(f"<div class='notice {'info' if STORE_OK else 'warn'}'>{'✓ ' if STORE_OK else ''}{escape(STORE_MSG)}"
+         f" · 마지막 저장 {escape(book.get('updated') or '-')}</div>")
+    if STORE_OK:
+        st.caption("종목 기록은 저장소의 data 브랜치에 따로 저장돼요. 앱 파일(main)을 고쳐 올려도 기록은 그대로이고, "
+                   "저장할 때마다 GitHub에 기록이 남아 예전 상태로 되돌릴 수도 있어요.")
+    inf = store.info
+    html("<div class='checks'>"
+         f"<div class='ck'><span></span><span class='k'>불러온 곳</span><span class='t'>{escape(str(inf['loaded_from']))}"
+         f" · 종목 {inf['loaded_count'] if inf['loaded_count'] is not None else '-'}개</span></div>"
+         f"<div class='ck'><span></span><span class='k'>마지막 저장</span><span class='t'>{escape(str(inf['saved_to']))}"
+         f" · 종목 {inf['saved_count'] if inf['saved_count'] is not None else '-'}개 · "
+         f"{'다시 읽어 확인 ✓' if inf['verified'] else ('확인 실패 ✕' if inf['verified'] is False else '이번 접속에서 저장 안 함')}"
+         "</span></div>"
+         f"<div class='ck'><span></span><span class='k'>지금 화면</span><span class='t'>종목 {len(book['holdings'])}개</span></div>"
+         "</div>")
+    c1, c2 = st.columns(2)
+    if c1.button("저장 연결 다시 확인", icon=":material/sync:", width="stretch"):
+        st.session_state.store_status = store.check()
+        st.rerun()
+    if c2.button("GitHub에서 다시 불러오기", icon=":material/cloud_download:", width="stretch",
+                 help="앱을 새로 켰을 때와 똑같이 저장소에서 읽어 와요. 여기서 종목이 보이면 제대로 저장된 거예요."):
+        st.session_state.book = store.load()
+        st.rerun()
+    a, b = st.columns([3, 1], vertical_alignment="center")
+    if b.button("잠그기", icon=":material/lock:", width="stretch"):
+        st.session_state.authed = False
+        st.query_params.clear()
+        st.rerun()

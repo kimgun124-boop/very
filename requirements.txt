@@ -1,6 +1,9 @@
-streamlit>=1.45
-pandas>=2.1
-requests>=2.31
-yfinance>=0.2.50
-plotly>=5.20
-pypdf>=4
+streamlit>=1.50
+pandas
+numpy
+requests
+lxml
+plotly
+yfinance
+openpyxl
+streamlit-paste-button
