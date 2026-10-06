@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-09-30-mem2"
+DATA_VERSION = "2026-10-06-b60"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -454,7 +454,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     res = {
         "price": None, "prev": None, "change": None, "high52": None, "low52": None,
         "gap": None, "to_high": None, "pos": None, "days_since_high": None,
-        "aligned": None, "source": None,
+        "aligned": None, "above60": None, "source": None,
         "high52_calc": None, "low52_calc": None, "h52_diff": None, "h52_fixed": False, "h52_src": None,
         "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
         **{k: None for k in BO_KEYS},
@@ -539,6 +539,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         if q_low:
             ll[-1] = min(ll[-1], float(q_low))
     aligned = None
+    above60 = bool(price > float(cc[-60:].mean())) if len(cc) >= 60 else None   # 60일선 위 종목 비율(시장 카드)용
     if len(cc) >= 120:
         ma20, ma60, ma120 = (float(cc[-n:].mean()) for n in (20, 60, 120))
         aligned = bool(price > ma20 > ma60 > ma120)
@@ -554,6 +555,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         pos=((price - low52) / (high52 - low52) * 100) if high52 > low52 else 100.0,
         days_since_high=days_since,
         aligned=aligned,
+        above60=above60,
         source=source,
         high52_calc=high52_calc,
         low52_calc=low52_calc,

@@ -17,13 +17,16 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-REPORTS_VERSION = "2026-09-30-sync"
+REPORTS_VERSION = "2026-10-06-autolearn"
 REPORTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_reports.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0"}
 KIND_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-sonnet-5-5"
+# 모델 이름이 바뀌어 404가 나면 차례로 시도해요.
+FALLBACK_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5-20251001")
+RECENT_DAYS = 30          # 이 기간 안에 넣은 리포트는 리포트별 태그도 보여줘요. 지난 건 테마 태그로만 묶여요.
 
 
 def now_kst() -> datetime:
@@ -32,14 +35,18 @@ def now_kst() -> datetime:
 
 # ─────────────────────────── 저장 · 불러오기 ───────────────────────────
 def empty_store() -> dict:
-    return {"reports": []}
+    return {"reports": [], "learned": {}, "themes": {}}
 
 
 def load_local() -> dict:
     try:
         with open(REPORTS_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        return d if isinstance(d, dict) and isinstance(d.get("reports"), list) else empty_store()
+        if not (isinstance(d, dict) and isinstance(d.get("reports"), list)):
+            return empty_store()
+        d.setdefault("learned", {})
+        d.setdefault("themes", {})
+        return d
     except (OSError, ValueError):
         return empty_store()
 
@@ -91,10 +98,23 @@ def fetch_github_json(path: str, token: str, repo: str, branch: str | None = Non
         return None
 
 
-def new_report(title: str, broker: str, date: str, summary: str, stocks: list[dict], source: str) -> dict:
+def new_report(title: str, broker: str, date: str, summary: str, stocks: list[dict], source: str,
+               theme: str = "") -> dict:
     return {"id": uuid.uuid4().hex[:10], "title": title.strip(), "broker": broker.strip(), "date": date.strip(),
             "summary": summary.strip(), "source": source, "added_at": now_kst().strftime("%Y-%m-%d %H:%M"),
-            "stocks": stocks}
+            "theme": (theme or "").strip(), "stocks": stocks}
+
+
+def theme_tag(theme: str) -> str:
+    return f"📥 테마 · {theme.strip()}"
+
+
+def _is_recent(rep: dict, days: int = RECENT_DAYS) -> bool:
+    try:
+        t = datetime.strptime(rep.get("added_at", "")[:10], "%Y-%m-%d").replace(tzinfo=KST)
+        return now_kst() - t <= timedelta(days=days)
+    except ValueError:
+        return True
 
 
 def tag_name(rep: dict) -> str:
@@ -112,7 +132,10 @@ def merge(stocks: list[dict], tags: dict, store: dict, fallback_sector: str = "�
     by_code = {s["code"]: s for s in out if s.get("code")}
     tags = {k: list(v) for k, v in tags.items()}
     for rep in store.get("reports", []):
+        # 자동 정리: 최근 리포트는 리포트별 태그 + 테마 태그, 지난 리포트는 테마 태그로만 묶어요(태그 목록이 끝없이 늘지 않게).
         tname = tag_name(rep)
+        rep_tags = ([tname] if (_is_recent(rep) or not rep.get("theme")) else []) + \
+                   ([theme_tag(rep["theme"])] if rep.get("theme") else [])
         codes = []
         for x in rep.get("stocks", []):
             code = str(x.get("code") or "").strip().upper()
@@ -124,18 +147,132 @@ def merge(stocks: list[dict], tags: dict, store: dict, fallback_sector: str = "�
             note = f"[{tname.replace('📥 ', '')}] {x['point']}" if x.get("point") else None
             if code in by_code:
                 s = by_code[code]
-                s["tags"] = list(s.get("tags") or []) + ([tname] if tname not in (s.get("tags") or []) else [])
-                if note:
+                have = list(s.get("tags") or [])
+                s["tags"] = have + [t for t in rep_tags if t not in have]
+                if note and note not in (s.get("notes") or []):
                     s["notes"] = list(s.get("notes") or []) + [note]
             else:
                 s = {"sector": x.get("sector") or fallback_sector, "group": x.get("group") or "리포트 추가",
                      "name": x.get("name") or code, "code": code, "desc": x.get("desc") or "",
-                     "tags": [tname], "notes": [note] if note else []}
+                     "tags": list(rep_tags), "notes": [note] if note else []}
                 out.append(s)
                 by_code[code] = s
         if codes:
-            tags[tname] = list(dict.fromkeys(tags.get(tname, []) + codes))
+            for t in rep_tags:
+                tags[t] = list(dict.fromkeys(tags.get(t, []) + codes))
     return out, tags
+
+
+# ─────────────────────────── 자동 분류 · 학습 ───────────────────────────
+# AI가 준 산업 이름을 보드 산업으로 맞춰요(앞에 있는 낱말이 먼저 맞으면 그 산업).
+SECTOR_SYNONYMS = [
+    ("반도체", ["반도체", "HBM", "파운드리", "메모리", "후공정", "전공정", "OSAT", "기판", "팹리스"]),
+    ("2차전지", ["2차전지", "이차전지", "배터리", "양극재", "음극재", "전해질", "분리막", "리튬이온", "슈퍼캡", "연료전지 부품"]),
+    ("데이터센터 전력", ["데이터센터", "AIDC", "IDC", "온사이트", "Co-location", "코로케이션"]),
+    ("전력·에너지", ["전력", "변압기", "전선", "원전", "SMR", "원자력", "에너지", "가스", "정유", "수소", "연료전지", "태양광", "ESS"]),
+    ("풍력", ["풍력", "타워", "하부구조물"]),
+    ("조선", ["조선", "해운", "LNG선", "기자재"]),
+    ("우주 데이터센터", ["우주", "위성", "발사체", "항공우주"]),
+    ("산업재", ["방산", "기계", "로봇", "산업재", "상사", "자동차", "철강"]),
+    ("바이오·헬스케어", ["바이오", "제약", "헬스", "의료", "의약"]),
+    ("화장품", ["화장품", "뷰티", "코스메틱", "ODM"]),
+    ("건설", ["건설", "건자재", "인프라", "시멘트"]),
+    ("AI·IT", ["AI", "소프트웨어", "인터넷", "플랫폼", "보안", "양자", "통신", "게임", "클라우드", "IT"]),
+    ("OLED", ["OLED", "디스플레이"]),
+    ("금융·지주", ["금융", "지주", "은행", "증권", "보험"]),
+    ("전략광물", ["희토류", "광물", "리튬", "니켈"]),
+]
+
+
+def map_sector(hint: str, sector_order: list[str], fallback: str = "기타(리포트 스크린)") -> str:
+    hint = (hint or "").strip()
+    if not hint:
+        return fallback
+    if hint in sector_order:
+        return hint
+    low = hint.lower()
+    for sec, words in SECTOR_SYNONYMS:
+        if sec in sector_order and any(w.lower() in low for w in words):
+            return sec
+    return fallback
+
+
+def map_group(group: str, sector: str, board: list[dict], group_order: list[str]) -> str:
+    """AI가 준 세부 분류를 보드에 이미 있는 분류에 맞춰요. 같은 산업 안의 분류 이름과 겹치면 그 분류로."""
+    g = (group or "").strip()
+    if not g:
+        return "리포트 추가"
+    if g in group_order:
+        return g
+    same = sorted({s["group"] for s in board if s.get("sector") == sector and s.get("group")})
+    toks = [t for t in re.split(r"[\s·/,()]+", g) if len(t) >= 2]
+    best, score = None, 0
+    for cand in same:
+        sc = sum(1 for t in toks if t in cand)
+        if sc > score:
+            best, score = cand, sc
+    return best if best else g
+
+
+def classify(row: dict, code: str, board_by_code: dict, learned: dict, themes: dict, theme: str,
+             board: list[dict], sector_order: list[str], group_order: list[str]) -> tuple[str, str, str]:
+    """(산업, 세부 분류, 한 줄 설명). 보드에 있으면 그대로 → 전에 배운 분류 → AI 힌트 → 같은 테마에서 배운 산업."""
+    on = board_by_code.get(code)
+    if on:
+        return on["sector"], on["group"], on.get("desc", "")
+    lv = learned.get(code)
+    if lv and lv.get("sector") in sector_order:
+        return lv["sector"], lv.get("group") or "리포트 추가", lv.get("desc") or row.get("desc") or ""
+    sector = map_sector(row.get("sector_hint") or row.get("sector") or "", sector_order, "")
+    if not sector and theme and themes.get(theme, {}).get("sector") in sector_order:
+        sector = themes[theme]["sector"]
+    sector = sector or "기타(리포트 스크린)"
+    return sector, map_group(row.get("group") or "", sector, board, group_order), row.get("desc") or ""
+
+
+def learn(store: dict, rep: dict) -> None:
+    """넣은 리포트에서 종목 분류·설명·테마를 배워 둬요. 다음 리포트에서 같은 종목이 나오면 같은 자리로 들어가요."""
+    learned = store.setdefault("learned", {})
+    for x in rep.get("stocks", []):
+        code = x.get("code")
+        if not code:
+            continue
+        d = learned.setdefault(code, {"seen": 0})
+        d.update({k: x[k] for k in ("name", "sector", "group", "desc") if x.get(k)})
+        d["seen"] = int(d.get("seen", 0)) + 1
+        d["last"] = rep.get("date") or rep.get("added_at", "")[:10]
+    th = rep.get("theme")
+    if th:
+        t = store.setdefault("themes", {}).setdefault(th, {"reports": 0, "sectors": {}})
+        t["reports"] = int(t.get("reports", 0)) + 1
+        for x in rep.get("stocks", []):
+            sec = x.get("sector")
+            if sec and not sec.startswith("기타"):
+                t["sectors"][sec] = int(t["sectors"].get(sec, 0)) + 1
+        if t["sectors"]:
+            t["sector"] = max(t["sectors"].items(), key=lambda kv: kv[1])[0]
+
+
+def _norm(t: str) -> str:
+    return re.sub(r"[\s\W_]+", "", (t or "").lower())
+
+
+def upsert(store: dict, rep: dict) -> str:
+    """같은 리포트(제목·출처·날짜가 같거나 같은 파일)를 또 넣으면 새로 쌓지 않고 바꿔 끼워요. 'added' / 'updated'"""
+    key = (_norm(rep.get("title")), _norm(rep.get("broker")), _norm(rep.get("date")))
+    for i, r in enumerate(store.get("reports", [])):
+        same_src = rep.get("source") and r.get("source") == rep.get("source") and rep["source"] != "붙여넣은 글"
+        if same_src or (key[0] and (_norm(r.get("title")), _norm(r.get("broker")), _norm(r.get("date"))) == key):
+            rep["id"] = r.get("id", rep["id"])
+            store["reports"][i] = rep
+            return "updated"
+    store.setdefault("reports", []).append(rep)
+    return "added"
+
+
+def known_themes(store: dict, limit: int = 40) -> list[str]:
+    th = store.get("themes", {})
+    return [k for k, _ in sorted(th.items(), key=lambda kv: -int(kv[1].get("reports", 0)))][:limit]
 
 
 # ─────────────────────────── 글자 뽑기 ───────────────────────────
@@ -229,6 +366,7 @@ AI_PROMPT = """너는 증권 리포트를 정리하는 애널리스트 보조야
 반드시 아래 JSON 하나만 출력해. 설명 문장·마크다운·코드블록 없이.
 {
  "title": "리포트 제목(짧게, 30자 이내)",
+ "theme": "리포트의 큰 투자 테마 한 단어~짧은 구(예: AIDC 전력, HBM, 원전, 우주항공, 보안). 아래 '이미 있는 테마'와 같은 주제면 그 이름을 그대로 써",
  "broker": "증권사·출처(모르면 빈칸)",
  "date": "YY.MM.DD 형식 발간일(모르면 빈칸)",
  "summary": "리포트 핵심 2~3문장",
@@ -243,11 +381,13 @@ AI_PROMPT = """너는 증권 리포트를 정리하는 애널리스트 보조야
    "importance": "상(리포트의 주인공) / 중 / 하(잠깐 언급)"}
  ]
 }
-표·차트 속 종목도 포함해. 같은 종목은 한 번만. 비상장·지수·ETF는 빼."""
+표·차트 속 종목도 포함해. 같은 종목은 한 번만. 비상장·지수·ETF는 빼.
+sector_hint는 가능하면 아래 '보드 산업' 중 하나를 그대로 고르고, group은 '보드 세부 분류' 중 맞는 게 있으면 그대로 써."""
 
 
 def ai_extract(api_key: str, files: list[tuple[str, bytes]], text: str = "", model: str | None = None,
-               timeout: int = 180) -> tuple[dict | None, str]:
+               timeout: int = 240, sectors: list[str] | None = None, groups: list[str] | None = None,
+               themes: list[str] | None = None) -> tuple[dict | None, str]:
     """Claude API로 리포트를 읽고 종목을 뽑아요. (결과, 오류메시지)"""
     content = []
     for name, raw in files:
@@ -266,14 +406,26 @@ def ai_extract(api_key: str, files: list[tuple[str, bytes]], text: str = "", mod
         content.append({"type": "text", "text": f"[붙여넣은 글]\n{text[:150000]}"})
     if not content:
         return None, "읽을 내용이 없어요."
-    content.append({"type": "text", "text": AI_PROMPT})
-    try:
-        r = requests.post(ANTHROPIC_URL, timeout=timeout, headers={
-            "x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": model or DEFAULT_MODEL, "max_tokens": 8000,
-                  "messages": [{"role": "user", "content": content}]})
-    except requests.RequestException as exc:
-        return None, f"AI 연결 실패: {exc.__class__.__name__}"
+    prompt = AI_PROMPT
+    if sectors:
+        prompt += "\n\n보드 산업: " + ", ".join(sectors)
+    if groups:
+        prompt += "\n보드 세부 분류: " + ", ".join(groups)
+    if themes:
+        prompt += "\n이미 있는 테마: " + ", ".join(themes)
+    content.append({"type": "text", "text": prompt})
+    tried = []
+    for mdl in dict.fromkeys([model or DEFAULT_MODEL, *FALLBACK_MODELS]):
+        tried.append(mdl)
+        try:
+            r = requests.post(ANTHROPIC_URL, timeout=timeout, headers={
+                "x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": mdl, "max_tokens": 12000, "messages": [{"role": "user", "content": content}]})
+        except requests.RequestException as exc:
+            return None, f"AI 연결 실패: {exc.__class__.__name__}"
+        if r.status_code == 404 or (r.status_code == 400 and "model" in r.text.lower() and "not" in r.text.lower()):
+            continue                      # 모델 이름이 없으면 다음 모델로
+        break
     if r.status_code != 200:
         try:
             msg = r.json().get("error", {}).get("message", "")
