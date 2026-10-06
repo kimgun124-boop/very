@@ -62,7 +62,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
-DATA_VERSION = "2026-10-06-b60"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-06-ath"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -4651,6 +4651,148 @@ def _nh_params() -> dict:
     return p
 
 
+# ─────────────────────────── 🏔️ 신고가 (역사적 신고가 · 계속 갱신) ───────────────────────────
+ATH_CSS = """<style>
+.ath-head { display:flex; align-items:baseline; gap:0.6rem; margin:0.2rem 0 0.6rem; }
+.ath-head b { font-size:1.25rem; color:#16212B; } .ath-head span { color:#8A979F; font-size:0.85rem; }
+.ath-tbl { border:1px solid #E2E8EB; border-radius:12px; overflow:hidden; background:#fff; margin-bottom:0.9rem; }
+.ath-th, .ath-row { display:grid; grid-template-columns: minmax(0,1fr) 72px 92px 46px; align-items:center; gap:0.4rem;
+  padding:0.55rem 0.9rem; }
+.ath-th { background:#F3F6F7; color:#51616C; font-size:0.8rem; font-weight:600; }
+.ath-th span:nth-child(n+2), .ath-row > span:nth-child(n+2) { text-align:right; }
+.ath-sec { display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0.9rem; background:#F7F9FA;
+  border-top:1px solid #E2E8EB; border-bottom:1px solid #EEF2F3; }
+.ath-sec b { font-size:0.95rem; color:#16212B; } .ath-sec small { color:#8A979F; margin-left:0.35rem; }
+.ath-avg { font-size:0.8rem; font-weight:700; padding:0.15rem 0.5rem; border-radius:6px; }
+.ath-row { border-top:1px solid #F0F3F4; text-decoration:none !important; color:#16212B !important; }
+.ath-row:hover { background:#FAFBFC; }
+.ath-nm { display:flex; align-items:center; gap:0.35rem; min-width:0; }
+.ath-nm b { font-weight:700; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ath-nm small { color:#8A979F; font-size:0.72rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ath-badge { flex:none; font-size:0.7rem; font-weight:700; padding:0.1rem 0.4rem; border-radius:5px; }
+.ath-badge.ath { background:#FBE3E4; color:#C0313A; } .ath-badge.wk { background:#FFF1D6; color:#A86A00; }
+.ath-badge.st { background:#E3EEF9; color:#2D5FA0; }
+.ath-chg { font-weight:700; font-size:0.92rem; } .ath-rs { color:#16212B; font-size:0.9rem; }
+.ath-sub { display:block; color:#8A979F; font-size:0.7rem; font-weight:500; }
+.ath-kpi { display:flex; gap:0.5rem; flex-wrap:wrap; margin:0 0 0.7rem; }
+.ath-kpi div { flex:1; min-width:100px; background:#F3F6F7; border-radius:10px; padding:0.45rem 0.7rem; }
+.ath-kpi em { display:block; font-style:normal; color:#51616C; font-size:0.75rem; } .ath-kpi b { font-size:1.15rem; }
+@media (max-width: 640px) { .ath-th, .ath-row { grid-template-columns: minmax(0,1fr) 62px 70px 34px; padding:0.5rem 0.6rem; }
+  .ath-nm small { display:none; } }
+</style>"""
+
+
+def _ath_candle(r) -> str:
+    """오늘 일봉 미니 캔들(저가~고가 꼬리, 시가~현재가 몸통). 빨강 양봉 · 파랑 음봉."""
+    lo, hi, op, px = (pd.to_numeric(r.get(k), errors="coerce") for k in ("day_low", "day_high", "day_open", "price"))
+    if not (pd.notna(lo) and pd.notna(hi) and pd.notna(px)) or hi <= lo:
+        return ""
+    op = op if pd.notna(op) else (pd.to_numeric(r.get("prev"), errors="coerce") if pd.notna(r.get("prev")) else px)
+    x = lambda v: 4 + (float(v) - lo) / (hi - lo) * 80  # noqa: E731
+    col = "#D9444C" if px >= op else "#3B6FD8"
+    a, b = sorted((x(op), x(px)))
+    return (f'<svg width="88" height="14" viewBox="0 0 88 14"><line x1="4" y1="7" x2="84" y2="7" stroke="{col}" stroke-width="1.2"/>'
+            f'<rect x="{a:.1f}" y="2" width="{max(b - a, 2.5):.1f}" height="10" rx="1.5" fill="{col}"/></svg>')
+
+
+def _ath_row(r, sub: str = "") -> str:
+    badges = ""
+    if r.get("ath_d") is True:
+        badges += '<span class="ath-badge ath">역사</span>'
+    elif r.get("ath_w") is True or r.get("ath_m") is True:
+        badges += '<span class="ath-badge wk">역사(' + ("주" if r.get("ath_w") is True else "월") + ')</span>'
+    stk = pd.to_numeric(r.get("nh_streak"), errors="coerce")
+    if pd.notna(stk) and stk >= 2:
+        badges += f'<span class="ath-badge st">{int(stk)}연속</span>'
+    chg = pd.to_numeric(r.get("change"), errors="coerce")
+    rs = pd.to_numeric(r.get("rs"), errors="coerce")
+    chg_txt = f"{chg:+.1f}%" if pd.notna(chg) else "-"
+    sub_html = f'<small>{html.escape(sub)}</small>' if sub else ""
+    return (f'<a class="ath-row" target="_self" href="?chart={html.escape(str(r["code"]))}">'
+            f'<span class="ath-nm"><b>{html.escape(str(r["name"]))}</b>{badges}{sub_html}</span>'
+            f'<span class="ath-chg" style="color:{_sign_color(chg)}">{chg_txt}</span>'
+            f'<span>{_ath_candle(r)}</span><span class="ath-rs">{"" if pd.isna(rs) else int(rs)}</span></a>')
+
+
+def _ath_table(f: pd.DataFrame, sub_fn=None, by_sector: bool = True, sort_col: str = "change") -> str:
+    head = '<div class="ath-th"><span>종목/섹터</span><span>등락률</span><span>오늘 봉</span><span>RS</span></div>'
+    if f.empty:
+        return f'<div class="ath-tbl">{head}<div class="ath-row" style="color:#8A979F !important">해당 종목이 없어요.</div></div>'
+    f = f.assign(_k=pd.to_numeric(f[sort_col], errors="coerce")).sort_values("_k", ascending=False, na_position="last")
+    body = ""
+    if by_sector:
+        f = f.assign(_sec=f["sector"].map(lambda x: SECTOR_SHORT.get(x, x)))
+        order = (f.groupby("_sec")["change"].agg(lambda v: pd.to_numeric(v, errors="coerce").mean())
+                 .sort_values(ascending=False))
+        cnt = f.groupby("_sec").size()
+        for sec in sorted(order.index, key=lambda s_: (-cnt[s_], -(order[s_] if pd.notna(order[s_]) else -99))):
+            g = f[f["_sec"] == sec]
+            avg = order[sec]
+            col = _sign_color(avg)
+            bg = "#FBE3E4" if (avg or 0) > 0 else ("#E3EEF9" if (avg or 0) < 0 else "#EEF2F3")
+            body += (f'<div class="ath-sec"><span><b>{html.escape(str(sec))}</b><small>{len(g)}종목</small></span>'
+                     f'<span class="ath-avg" style="color:{col};background:{bg}">평균 {avg:+.1f}%</span></div>'
+                     if pd.notna(avg) else f'<div class="ath-sec"><span><b>{html.escape(str(sec))}</b><small>{len(g)}종목</small></span></div>')
+            body += "".join(_ath_row(r, sub_fn(r) if sub_fn else r.get("group", "")) for _, r in g.iterrows())
+    else:
+        body = "".join(_ath_row(r, sub_fn(r) if sub_fn else r.get("group", "")) for _, r in f.iterrows())
+    return f'<div class="ath-tbl">{head}{body}</div>'
+
+
+@st.fragment
+def render_ath(df: pd.DataFrame, quotes: dict):
+    """🏔️ 신고가: 오늘 52주 신고가 · 역사적(상장 이후) 신고가 · 신고가를 계속 갱신 중인 종목."""
+    st.markdown(ATH_CSS, unsafe_allow_html=True)
+    st.markdown(f'<div class="ath-head"><b>🏔️ 신고가 주요종목</b><span>{data.now_kst():%m/%d %H:%M} · '
+                f'{data.market_status(quotes)} · 보드 종목 기준(누르면 차트)</span></div>', unsafe_allow_html=True)
+    c1, c2 = st.columns([3, 1.2])
+    view = c1.segmented_control("보기", ["오늘 52주 신고가", "역사적 신고가", "계속 갱신 중"], default="오늘 52주 신고가",
+                                required=True, key="ath_view")
+    kr_only = c2.toggle("국내만", value=True, key="ath_kr")
+    f = df[df["price"].notna()].copy()
+    if kr_only:
+        f = f[f["code"].map(data.is_kr)]
+    for k in ("nh52_d", "ath_d", "ath_w", "ath_m"):
+        f[k] = f[k].map(lambda v: v is True)
+    for k in ("nh_cnt20", "nh_cnt60", "nh_streak"):
+        f[k] = pd.to_numeric(f.get(k), errors="coerce")
+    today_nh = f[f["nh52_d"]]
+    ath_today = f[f["ath_d"]]
+    ath_period = f[(f["ath_w"] | f["ath_m"]) & ~f["ath_d"]]
+    renew = f[f["nh_cnt20"] >= 3]
+    st.markdown(
+        '<div class="ath-kpi">'
+        f'<div><em>오늘 52주 신고가</em><b>{len(today_nh)}</b></div>'
+        f'<div><em>오늘 역사적 신고가</em><b style="color:#C0313A">{len(ath_today)}</b></div>'
+        f'<div><em>이번 주·달 역사 신고가</em><b>{len(ath_period)}</b></div>'
+        f'<div><em>20일 중 3회↑ 갱신</em><b style="color:#2D5FA0">{len(renew)}</b></div></div>', unsafe_allow_html=True)
+
+    if view == "오늘 52주 신고가":
+        st.caption("오늘 장중 고가가 직전 52주 최고가를 넘은 종목을 섹터별로 묶었어요. '역사' = 상장 이후 최고가, 'N연속' = N거래일 연속 신고가.")
+        st.markdown(_ath_table(today_nh), unsafe_allow_html=True)
+    elif view == "역사적 신고가":
+        st.caption("상장 이후 전체(월봉) 최고가를 넘은 종목이에요. 위에 저항이 없는 자리라 추세가 가장 강한 구간이에요.")
+        st.markdown("**오늘 역사적 신고가**")
+        st.markdown(_ath_table(ath_today), unsafe_allow_html=True)
+        st.markdown("**이번 주·이번 달 역사적 신고가** (오늘은 아님)")
+        st.markdown(_ath_table(ath_period), unsafe_allow_html=True)
+        ap = pd.to_numeric(f["ath_price"], errors="coerce")
+        near = f[(~f["ath_d"]) & (~f["ath_w"]) & (~f["ath_m"]) & f["ath_ok"].map(lambda v: v is True) & ap.notna()
+                 & (f["price"] / ap >= 0.95)].copy()
+        near["_gap"] = (near["price"] / pd.to_numeric(near["ath_price"], errors="coerce") - 1) * 100
+        st.markdown("**역사적 신고가까지 5% 이내**")
+        st.markdown(_ath_table(near, sub_fn=lambda r: f"역사 고점까지 {-r['_gap']:.1f}%", by_sector=False, sort_col="_gap"),
+                    unsafe_allow_html=True)
+        st.caption("역사적 신고가는 월봉을 받아 둔 종목(공부 자료 종목 + 작은 신고가 종목)만 계산해요.")
+    else:
+        st.caption("최근 20거래일 중 52주 신고가를 3번 이상 쓴 종목 — 신고가를 '계속 갱신하는' 주도주 후보예요. 갱신 횟수 많은 순.")
+        sub = lambda r: (f"20일 중 {int(r['nh_cnt20'])}회 · 60일 {int(r['nh_cnt60']) if pd.notna(r['nh_cnt60']) else '-'}회"  # noqa: E731
+                         + (f" · {int(r['nh_streak'])}일 연속" if pd.notna(r['nh_streak']) and r['nh_streak'] >= 1 else ""))
+        renew = renew.assign(_k=renew["nh_cnt20"] * 1000 + renew["nh_streak"].fillna(0) * 10
+                             + pd.to_numeric(renew["rs"], errors="coerce").fillna(0) / 10)
+        st.markdown(_ath_table(renew, sub_fn=sub, by_sector=False, sort_col="_k"), unsafe_allow_html=True)
+
+
 def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     st.markdown(NHC_CSS, unsafe_allow_html=True)
     st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
@@ -4952,7 +5094,7 @@ def render_board():
     _TRENDS_BG["v"] = trends_all
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
-    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
+    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
@@ -4962,7 +5104,7 @@ def render_board():
         except TypeError:          # 예전 Streamlit
             tabs = st.tabs(names)
             lazy = False
-    t_list, t_hold, t_chart, t_rep, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = tabs
+    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -4972,6 +5114,7 @@ def render_board():
         (t_hold, lambda: render_holdings_tab(df, quotes)),
         (t_chart, lambda: render_chart_tab(df, quotes)),
         (t_rep, lambda: render_reports_tab()),
+        (t_ath, lambda: render_ath(df, quotes)),
         (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
         (t_vs, lambda: render_volume_surge(df, histories, quotes)),
         (t_buy, lambda: render_buy(df, quotes)),

@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-06-b60"
+DATA_VERSION = "2026-10-06-ath"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 session = requests.Session()
@@ -198,6 +198,7 @@ def parse_polling(text: str) -> dict[str, dict]:
                 "prev": to_num(item.get("pcv")) or to_num(item.get("sv")),
                 "high": to_num(item.get("hv")),
                 "low": to_num(item.get("lv")),
+                "open": to_num(item.get("ov")),
                 "volume": to_num(item.get("aq")),
                 "value": to_num(item.get("aa")),      # 누적 거래대금(단위가 응답마다 달라 쓸 때 점검)
                 "status": item.get("ms"),
@@ -455,6 +456,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         "price": None, "prev": None, "change": None, "high52": None, "low52": None,
         "gap": None, "to_high": None, "pos": None, "days_since_high": None,
         "aligned": None, "above60": None, "source": None,
+        "nh_cnt20": None, "nh_cnt60": None, "nh_streak": None, "day_open": None, "day_high": None, "day_low": None,
         "high52_calc": None, "low52_calc": None, "h52_diff": None, "h52_fixed": False, "h52_src": None,
         "atr_pct": None, "ret_1m": None, "ret_3m": None, "ret_6m": None, "rs_raw": None,
         **{k: None for k in BO_KEYS},
@@ -565,6 +567,24 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     )
 
     res["atr_pct"] = _atr_np(hh, ll, cc, ATR_DAYS)
+    # 신고가 갱신 흐름: 최근 20·60거래일 중 장중 고가가 직전 52주(250일) 최고가를 넘은 날 수, 최근부터 끊기지 않은 갱신 일수
+    if len(hh) >= 120:
+        prior = _rolling_prior_max(hh, 250, min(250, len(hh) - 20))
+        hit = np.nan_to_num(hh > prior, nan=0).astype(bool) & ~np.isnan(prior)
+        res["nh_cnt20"], res["nh_cnt60"] = int(hit[-20:].sum()), int(hit[-60:].sum())
+        k = 0
+        for v in hit[::-1]:
+            if not v:
+                break
+            k += 1
+        res["nh_streak"] = k
+    # 오늘(마지막 거래일) 봉: 미니 캔들용
+    try:
+        o = (quote or {}).get("open") if last_is_today else None
+        o = o or (float(hist["open"].iloc[-1]) if "open" in hist and last_is_today else None)
+        res.update(day_open=float(o) if o else None, day_high=float(hh[-1]), day_low=float(ll[-1]))
+    except (TypeError, ValueError):
+        pass
     rets = {}
     for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
         rets[key] = (price / float(cc[-1 - n]) - 1) * 100 if len(cc) > n else None
