@@ -23,6 +23,7 @@ import data
 import holdings
 import reports
 import stocks as stock_list
+import theme
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
@@ -745,6 +746,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+theme.apply()    # 🎨 디자인(색·카드·글꼴)만 덮어써요. 지우면 예전 모습
 _app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
 
 
@@ -1663,8 +1665,8 @@ def render_flows():
                     st.caption("기관 세부는 새 네이버 API에서만 받아와요. 지금은 불러오지 못했어요.")
                     continue
                 long = sub.melt("date", value_vars=series, var_name="투자자", value_name="순매수")
-                palette = ["#9AA9B3", "#2E6B6F", "#F2B134"] if len(series) == 3 else \
-                    ["#2E6B6F", "#7FA7A3", "#F2B134", "#9AA9B3", "#C77D4B", "#D6333B", "#51616C"]
+                palette = ["#9AA9B3", "#5B47F5", "#F2B134"] if len(series) == 3 else \
+                    ["#5B47F5", "#A59BFA", "#F2B134", "#9AA9B3", "#C77D4B", "#D6333B", "#51616C"]
                 chart = (
                     alt.Chart(long).mark_bar()
                     .encode(
@@ -1854,7 +1856,7 @@ def render_market(board: pd.DataFrame | None = None):
                     continue
                 h = df.set_index("date")["close"].astype(float)
                 chart = pd.DataFrame({idx["name"]: h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
-                price_chart(chart, ["#16212B", "#2E6B6F", "#F2B134"], height=240)
+                price_chart(chart, ["#111827", "#5B47F5", "#F2B134"], height=240)
         st.caption("시장신호: 단기 20일선 · 장기 60일선 — 🟢 선 위 + 선 상승 · 🟡 하나만 · 🔴 선 아래 + 선 하락. "
                    "지수 RS = 보드 종목과 같은 잣대의 1~99. 해외는 야후(15분 지연), 유가는 근월물.")
     render_flows()
@@ -2273,7 +2275,7 @@ def render_stock_flow(code: str, trends: dict):
             xOffset=alt.XOffset("투자자:N", sort=data.INVESTORS),
             y=alt.Y("순매수:Q", title="억원(추정)"),
             color=alt.Color("투자자:N", sort=data.INVESTORS,
-                            scale=alt.Scale(domain=data.INVESTORS, range=["#9AA9B3", "#2E6B6F", "#F2B134"]),
+                            scale=alt.Scale(domain=data.INVESTORS, range=["#9AA9B3", "#5B47F5", "#F2B134"]),
                             legend=alt.Legend(orient="bottom", title=None)),
             tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "투자자:N", alt.Tooltip("순매수:Q", format="+,.1f")],
         )
@@ -2373,13 +2375,13 @@ def candle_fig(b: pd.DataFrame, tf: str, n: int | None, show_ma: bool, show_vol:
         fig.update_yaxes(title_text=f"거래대금({unit})", title_font=dict(size=12, color="#7A8A94"), tickformat=",.0f",
                          row=r, col=1)
     fig.update_xaxes(type="category", nticks=8, showgrid=False, rangeslider_visible=False, tickangle=0,
-                     tickfont=dict(size=12), showspikes=True, spikemode="across", spikethickness=1, spikecolor="#9AA9B3")
+                     tickfont=dict(size=12), showspikes=True, spikemode="across", spikethickness=1, spikecolor="#A59BFA")
     fig.update_layout(height={1: 640, 2: 780, 3: 900}[len(panels)], margin=dict(l=4, r=4, t=36, b=6),
                       hovermode="x unified", dragmode="pan", plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
                       hoverlabel=dict(font_size=13),
                       legend=dict(orientation="h", y=1.05, x=0, font=dict(size=13)),
                       font=dict(family="Pretendard, Malgun Gothic, sans-serif", size=13))
-    return fig
+    return theme.style_fig(fig)
 
 
 def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, high52: float | None = None,
@@ -2979,40 +2981,17 @@ def _render_capital(store: dict, rows, stt: dict, ctx: dict | None = None):
             f'<div><em>지켜야 할 BEP</em><b style="color:{col}">{b["bep"]:,.0f}원</b>'
             f'<span style="color:{col}">여유 {dist:+.1f}%</span></div>'
             f'<div><em>절대 마지노선(원금 -10%)</em><b>{b["hard"]:,.0f}원</b></div></div>', unsafe_allow_html=True)
-        # 깡토 책: 한 번에 잃어도 되는 금액(계좌의 1.5%) ÷ 손절 폭(8%) = 한 종목 최대 투자금(≈19%)
-        # 내 원칙: 이 최대 비중을 3유닛으로 나눠 점진 배팅(1유닛 ≈6% → 2유닛 ≈12% → 3유닛 ≈18%).
-        # 성공하면 다음 매매를 한 칸 올리고, 실패(손절)하면 한 칸 내려요. 장세가 약하면 단계 상한을 낮춰요.
+        # 깡토 책: 한 번에 잃어도 되는 금액(계좌의 1~2%, 내 원칙 1.5%) ÷ 손절 폭(8%) = 한 종목 최대 투자금,
+        # 장세에 따라 유닛 수: 오르는 장 3 · 옆으로 2 · 내리는 장 1
         n_up = (ctx or {}).get("n_above60")
-        cap = {2: 3, 1: 2, 0: 1}.get(n_up, 3)
+        units = {2: 3, 1: 2, 0: 1}.get(n_up, 2)
         max_pos = equity * 0.015 / 0.08
-        unit_amt = max_pos / 3
-        level = min(max(int(acc.get("unit_level") or 1), 1), 3)
-        eff = min(level, cap)
         st.markdown(
-            f'<div class="cap-row"><div><em>한 종목 최대(위험 1.5% ÷ 손절 8%)</em><b>{max_pos:,.0f}원</b>'
-            f'<span>평가액의 {max_pos / equity * 100:.1f}% = 3유닛</span></div>'
-            f'<div><em>1유닛</em><b>{unit_amt:,.0f}원</b><span>평가액의 {unit_amt / equity * 100:.1f}%</span></div>'
-            f'<div><em>다음 매매 비중</em><b>{eff}유닛 · {unit_amt * eff:,.0f}원</b>'
-            f'<span>평가액의 {unit_amt * eff / equity * 100:.1f}% · 내 단계 {level}유닛'
-            + (f' → 장세 상한 {cap}유닛(지수 60일선 위 {n_up}/2)' if cap < level else '') + '</span></div></div>',
-            unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([1, 1, 2])
-        res_up = c1.button("✅ 성공 → 한 칸 올리기", key="unit_up", width="stretch", disabled=level >= 3)
-        res_dn = c2.button("❌ 손절 → 한 칸 내리기", key="unit_dn", width="stretch", disabled=level <= 1)
-        if res_up or res_dn:
-            new_lv = min(level + 1, 3) if res_up else max(level - 1, 1)
-            acc["unit_level"] = new_lv
-            log = list(acc.get("unit_log") or [])[-9:]
-            log.append({"day": today, "result": "성공" if res_up else "손절", "from": level, "to": new_lv})
-            acc["unit_log"] = log
-            ok, msg = _persist_holdings(store, stt)
-            (st.success if ok else st.error)(f"다음 매매는 {new_lv}유닛이에요. " + msg)
-            _rerun_frag()
-        log = acc.get("unit_log") or []
-        if log:
-            c3.caption("최근: " + " · ".join(f"{x['day'][5:]} {x['result']} {x['from']}→{x['to']}" for x in log[-4:]))
-        st.caption("점진 배팅: 1유닛(≈6%)으로 시작 → 성공하면 2유닛(≈12%) → 3유닛(≈18%). 손절하면 한 칸 내려요(2→1). "
-                   "지수가 60일선 아래로 가면 단계와 관계없이 상한이 낮아져요(둘 다 위 3 · 하나 2 · 둘 다 아래 1). 최대 8종목.")
+            f'<div class="cap-row"><div><em>한 종목 최대 투자금(위험 1.5% ÷ 손절 8%)</em><b>{max_pos:,.0f}원</b>'
+            f'<span>평가액의 {max_pos / equity * 100:.1f}%</span></div>'
+            f'<div><em>지금 장세 유닛</em><b>{units}유닛</b><span>지수 60일선 위 {n_up if n_up is not None else "-"}/2 → '
+            f'한 유닛 {max_pos / 4:,.0f}원(최대 비중을 4유닛으로)</span></div></div>', unsafe_allow_html=True)
+        st.caption("유닛은 이긴 뒤에만 한 칸 늘리고(목표 3R에 닿아야 이긴 것) 진 뒤에는 한 칸 줄여요. 최대 8종목.")
         if equity <= b["bep"]:
             st.error("🛑 계좌가 BEP에 닿았어요. 원칙: 욕심이 나도 전액 현금화하고 투자를 멈춘 뒤 시장을 다시 관찰하기.")
         else:
@@ -3750,16 +3729,7 @@ def _buy_params() -> dict:
                                help="끄면 첫 돌파를 맨 위에 두고 2번째 이상 돌파도 보여줘요. 켜면 첫 돌파만 통과.")
         equity = c6.number_input("계좌 평가금액(원, 수량 계산용)", 0, 10_000_000_000, 0, step=1_000_000,
                                  key="buy_equity", help="0이면 수량 계산을 안 해요. 이 값은 저장되지 않아요.")
-        try:
-            saved_lv = int((holdings.load().get("account") or {}).get("unit_level") or 1)
-        except Exception:
-            saved_lv = 1
-        unit_level = st.segmented_control(
-            "이번 매수 유닛 단계 (점진 배팅)", [1, 2, 3], default=min(max(saved_lv, 1), 3), required=True, key="buy_unit",
-            format_func=lambda u: f"{u}유닛 ≈{u * 6.25:.0f}%",
-            help="최대 비중(위험 1.5% ÷ 손절 8% ≈ 19%)을 3유닛으로 나눠요. 성공하면 한 칸 올리고 손절하면 한 칸 내려요. "
-                 "기본값은 💼 내 보유 탭에 저장한 단계예요.") or 1
-    return {**d, "unit_level": int(unit_level), "top_n": int(top_n), "first_only": bool(first_only), "fresh_days": int(fresh), "max_ext": float(ext), "min_cap": float(cap),
+    return {**d, "top_n": int(top_n), "first_only": bool(first_only), "fresh_days": int(fresh), "max_ext": float(ext), "min_cap": float(cap),
             "vol_mult": float(vol), "dcr_min": float(dcr), "earn_years": earn_years, "equity": float(equity or 0)}
 
 
@@ -3916,7 +3886,7 @@ def _score_bars(v: pd.DataFrame):
         y=alt.Y("종목:N", sort=order, title=None, axis=alt.Axis(labelLimit=140)),
         x=alt.X("점수:Q", title=None, scale=alt.Scale(domain=[0, 100])),
         color=alt.Color("구성:N", sort=list(parts), scale=alt.Scale(domain=list(parts),
-                        range=["#D6333B", "#F2B134", "#2E6B6F", "#7FA7C9"]), legend=alt.Legend(orient="top", title=None)),
+                        range=["#D6333B", "#F2B134", "#5B47F5", "#7FA7C9"]), legend=alt.Legend(orient="top", title=None)),
         order=alt.Order("구성:N"),
         tooltip=["종목:N", "구성:N", alt.Tooltip("점수:Q", format=".0f")],
     ).properties(height=max(160, 24 * len(order)), width="container")
@@ -4179,7 +4149,7 @@ def _daily_bars(A: dict, B: dict, a_name: str, b_name: str):
         x=alt.X("날짜:N", title=None, axis=alt.Axis(labelAngle=0)),
         xOffset=alt.XOffset("바스켓:N", sort=[a_name, b_name]),
         y=alt.Y("수익률:Q", title="%"),
-        color=alt.Color("바스켓:N", sort=[a_name, b_name], scale=alt.Scale(range=["#F2B134", "#2E6B6F"]),
+        color=alt.Color("바스켓:N", sort=[a_name, b_name], scale=alt.Scale(range=["#F2B134", "#5B47F5"]),
                         legend=alt.Legend(orient="top", title=None)),
         tooltip=["날짜:N", "바스켓:N", alt.Tooltip("수익률:Q", format="+.2f")],
     ).properties(height=200, width="container")
@@ -4427,12 +4397,6 @@ def render_buy(df: pd.DataFrame, quotes: dict):
         oks.append(ok)
         parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
     market_ok = None if None in oks else all(oks)
-    # 점진 배팅 상한: 지수 둘 다 60일선 위 3유닛 · 하나 2유닛 · 둘 다 아래 1유닛
-    if None not in oks:
-        cap_u = {2: 3, 1: 2, 0: 1}[sum(bool(o) for o in oks)]
-        if p["unit_level"] > cap_u:
-            st.caption(f"유닛 단계 {p['unit_level']} → 장세 상한 {cap_u}유닛으로 수량을 계산해요.")
-            p = {**p, "unit_level": cap_u}
     idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
               for name, sym in data.MARKETS.items()}
     market_text = " · ".join(parts)
@@ -4475,7 +4439,7 @@ def render_buy(df: pd.DataFrame, quotes: dict):
             "섹터 순위": c["top"][1].split(" (")[0].split("/")[0],
             "현재가": r["price"], "신고가까지": r.get("to_high"), "돌파": _bo_full(r.to_dict()),
             "손절가": plan["stop_price"], "3R 목표가": plan["target_price"],
-            "수량": plan["shares"], "매수금액": plan["amount"], "비중": plan["weight"],
+            "수량": plan["shares"], "매수금액": plan["amount"],
             "미충족": ", ".join(labels[k].split("(")[0] for k in x.fails) or "-",
             "등락률": r["change"], "RS": r.get("rs"), "ADX": r.get("adx"), "20일선 이격": r.get("dist_ma20"),
             "돌파일 거래량": r.get("bo_vol_ratio"), "DCR": r.get("bo_dcr"), "손절폭": plan["stop_pct"],
@@ -4484,14 +4448,14 @@ def render_buy(df: pd.DataFrame, quotes: dict):
         })
     view = pd.DataFrame(rows)
     base_cols = ["상태", "종목", "섹터 순위", "현재가", "신고가까지", "돌파", "손절가", "3R 목표가"] + \
-        (["수량", "매수금액", "비중"] if p["equity"] else []) + ["미충족"]
+        (["수량", "매수금액"] if p["equity"] else []) + ["미충족"]
     if not st.toggle("지표 자세히", key="buy_detail"):
         view = view[base_cols]
     elif not p["equity"]:
-        view = view.drop(columns=["수량", "매수금액", "비중"])
+        view = view.drop(columns=["수량", "매수금액"])
     fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}", "ADX": "{:.0f}",
            "20일선 이격": "{:+.1f}%", "돌파일 거래량": "{:.1f}배", "DCR": "{:.0f}%", "손절가": "{:,.0f}",
-           "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}", "비중": "{:.1f}%",
+           "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}",
            "외국인 5일(억)": _eok_num, "기관 5일(억)": _eok_num}
     sty = view.style.format({k: v for k, v in fmt.items() if k in view.columns}, na_rep="-") \
         .map(lambda v: f"color: {BUY_TIER_STYLE[v.split(' ', 1)[1]][0]}; font-weight: 700", subset=["상태"]) \
@@ -4513,8 +4477,7 @@ def render_buy(df: pd.DataFrame, quotes: dict):
                 st.caption("오늘 장중 돌파 — 종가가 직전 52주 최고가 위에서 마감하는지 확인.")
     with st.expander("ℹ️ 표 읽는 법"):
         st.markdown("- ⏳ 종가 확인 = 오늘 장중 돌파 · ⛔ 시장 대기 = 종목은 통과, 시장 미충족 · ⚠️ 1개 미충족 = 관심 종목(매수 대상 아님)\n"
-                    "- 손절가 = 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR) · 3R 목표가에서 절반 익절\n"
-                    "- 수량 = 계좌 1.5% 위험 기준 최대 수량(≈19%)을 3유닛으로 나눈 것 중 지금 단계만큼(1유닛 ≈6% · 2유닛 ≈12% · 3유닛 ≈18%)\n"
+                    "- 손절가 = 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR) · 수량 = 계좌 1.5% 위험 · 3R 목표가에서 절반 익절\n"
                     "- 해외 종목은 제외 · 종목별 수급의 연기금·투신은 기관 합계에 포함 · 마지막 확인은 HTS 차트로")
 
 
@@ -5300,5 +5263,5 @@ def render_list(df, histories, quote_error, shares_store, fins_all=None):
     render_checks(df, quote_error, shares_store)
 
 
-st.title("밸류체인 신고가 보드")
+theme.header("밸류체인 신고가 보드", "공부 자료 속 종목 · 52주 신고가 · 거래대금 흐름을 한눈에", "📈 실시간")
 st.fragment(render_board, run_every=REFRESH[refresh_label])()
