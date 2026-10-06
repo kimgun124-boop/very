@@ -2806,6 +2806,8 @@ BUY_DEFAULTS = {
     "stop_pct": 8.0,       # 원칙
     "risk_pct": 1.5,       # 원칙
     "max_pos": 8,          # 원칙
+    "units": 3,            # 원칙: 한 종목 최대 비중(위험 1.5% ÷ 손절 8% ≈ 19%)을 3유닛(약 6% · 12% · 18%)으로 나눠 점진 배팅
+    "unit_level": 1,       # 지금 단계: 성공하면 한 칸 올리고, 손절하면 한 칸 내려요(1~3)
 }
 
 BUY_RULES = [   # (키, 표시 이름)
@@ -2890,7 +2892,8 @@ def buy_checks(r, market_ok: bool | None, market_text: str, leaders: set, p: dic
 
 
 def position_plan(price: float, atr: float | None, equity: float | None, p: dict) -> dict:
-    """1R 손절(8%, ATR이 8% 이상이면 ATR), 계좌 1.5% 위험 기준 수량, 3R 목표가."""
+    """1R 손절(8%, ATR이 8% 이상이면 ATR), 3R 목표가, 수량.
+    수량: 계좌 1.5% 위험 기준 '최대' 수량(≈19%)을 3유닛으로 나눠, 지금 유닛 단계만큼만 사요(1유닛 ≈6%, 2유닛 ≈12%, 3유닛 ≈18%)."""
     stop_pct = p["stop_pct"]
     if atr is not None and atr == atr and atr >= p["stop_pct"]:
         stop_pct = float(atr)
@@ -2900,7 +2903,12 @@ def position_plan(price: float, atr: float | None, equity: float | None, p: dict
         risk_won = equity * p["risk_pct"] / 100
         shares = int(risk_won // (price * stop_pct / 100))
         shares = min(shares, int(equity // price))           # 계좌보다 크게는 못 사요
-        out.update(shares=shares, amount=shares * price, weight=shares * price / equity * 100)
+        units = max(1, int(p.get("units", 3)))
+        level = min(max(1, int(p.get("unit_level", units))), units)
+        full = shares
+        shares = int(full * level / units)
+        out.update(shares=shares, amount=shares * price, weight=shares * price / equity * 100,
+                   full_shares=full, full_weight=full * price / equity * 100, unit_level=level, units=units)
     return out
 
 
