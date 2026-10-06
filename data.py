@@ -45,7 +45,37 @@ HEADERS = {
 DATA_VERSION = "2026-10-06-ath"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
-session = requests.Session()
+class _GuardedSession(requests.Session):
+    """사이트가 아예 응답하지 않을 때(서버 IP 차단·장애) 수천 번 다시 두드리며 앱이 멈추지 않게,
+    한 사이트에서 연결 실패가 연달아 8번 나면 60초 동안은 바로 실패로 돌려요. 한 번이라도 되면 바로 풀려요."""
+    FAIL_LIMIT, COOL = 8, 60.0
+
+    def __init__(self):
+        super().__init__()
+        import threading
+        self._lock = threading.Lock()
+        self._fails: dict[str, list] = {}       # host → [연속 실패 수, 막은 시각]
+
+    def request(self, method, url, *args, **kwargs):
+        host = requests.utils.urlparse(url).hostname or ""
+        with self._lock:
+            n, since = self._fails.get(host, [0, 0.0])
+            if n >= self.FAIL_LIMIT and _time.time() - since < self.COOL:
+                raise requests.ConnectionError(f"{host} 연결이 계속 실패해 잠시 쉬는 중이에요")
+        kwargs.setdefault("timeout", 10)
+        try:
+            r = super().request(method, url, *args, **kwargs)
+        except (requests.ConnectionError, requests.Timeout):
+            with self._lock:
+                n = self._fails.get(host, [0, 0.0])[0] + 1
+                self._fails[host] = [n, _time.time()]
+            raise
+        with self._lock:
+            self._fails.pop(host, None)
+        return r
+
+
+session = _GuardedSession()
 session.headers.update(HEADERS)
 
 
@@ -358,8 +388,10 @@ def _yf_batch(tickers, period: str, interval: str) -> dict[str, pd.DataFrame]:
             raw = yf.download(part, period=period, interval=interval, group_by="ticker", auto_adjust=False,
                               threads=True, progress=False)
         except Exception:  # 야후 일시 오류·요청 제한 → 아래에서 하나씩 다시
-            continue
+            raw = None
         if raw is None or raw.empty:
+            if not out:      # 첫 묶음부터 하나도 못 받으면 야후가 막힌 것 → 나머지 묶음도 두드리지 않아요
+                break
             continue
         for t in part:
             if isinstance(raw.columns, pd.MultiIndex):
@@ -391,7 +423,7 @@ def fetch_histories(codes, workers: int = 12) -> dict[str, tuple]:
         # 한꺼번에 많이 받으면 네이버가 잠깐 막아서 빈 종목이 생겨요 → 빠진 종목만 천천히 두 번 더 받아요
         for wait, w in ((2.0, 4), (5.0, 2)):
             miss = [c for c in kr if out.get(c) is None or out[c][1] is None or out[c][1].empty]
-            if not miss or MOCK:
+            if not miss or MOCK or len(miss) == len(kr) > 20:      # 전부 실패 = 네이버 장애 → 다시 받기는 다음 새로고침에
                 break
             _time.sleep(wait)
             with ThreadPoolExecutor(max_workers=w) as pool:
@@ -402,10 +434,11 @@ def fetch_histories(codes, workers: int = 12) -> dict[str, tuple]:
         got = _yf_batch(os_, "26mo", "1d")
         out.update({t: (None, df, None) for t, df in got.items()})
         rest = [t for t in os_ if t not in got]
-        if rest:
+        # 야후가 아예 안 될 때(하나도 못 받음) 종목마다 다시 두드리면 수 분씩 멈춰요 → 몇 개만 빠졌을 때만 하나씩 다시
+        if rest and (got or len(rest) <= 10):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 out.update(zip(rest, pool.map(fetch_history_overseas, rest)))
-    return {c: out[c] for c in codes}
+    return {c: out.get(c) or (None, empty_frame(), "조회 실패") for c in codes}
 
 
 def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
@@ -1225,11 +1258,18 @@ def fetch_overseas_shares(tickers) -> tuple[dict[str, int], dict]:
                 result[t] = n
                 diag["네이버"] += 1
     missing = [t for t in tickers if t not in result]
+    # 야후는 클라우드에서 자주 막혀요: 먼저 3개만 해 보고 하나도 안 되면 나머지는 건너뛰어요(종목당 12초씩 멈추지 않게)
+    probe, rest = missing[:3], missing[3:]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for t, n in zip(missing, pool.map(_yahoo_shares, missing)):
+        for t, n in zip(probe, pool.map(_yahoo_shares, probe)):
             if n:
                 result[t] = n
                 diag["야후"] += 1
+        if diag["야후"] and rest:
+            for t, n in zip(rest, pool.map(_yahoo_shares, rest)):
+                if n:
+                    result[t] = n
+                    diag["야후"] += 1
     return result, diag
 
 
@@ -2267,6 +2307,10 @@ def build_table(stocks: list[dict], histories: dict, quotes: dict,
             "name_ok": name_matches(s["name"], naver_name),
             "error": error if metrics["price"] is None else None,
         })
+    # (메모리) 계산 기억에는 일봉 표가 같이 붙어 있어요. 화면에서 빠진 종목 것은 지워야 일봉 메모리가 실제로 비워져요
+    live = {s["code"] for s in stocks}
+    for c in [c for c in _metrics_memo if c not in live]:
+        _metrics_memo.pop(c, None)
     return add_leader_ranks(add_rs_ranks(pd.DataFrame(rows)))
 
 
@@ -2631,12 +2675,13 @@ def fetch_monthlies(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             out.update(zip(kr, pool.map(fetch_monthly, kr)))
     if os_:
-        out.update(_yf_batch(os_, "max", "1mo"))
+        got = _yf_batch(os_, "max", "1mo")
+        out.update(got)
         rest = [t for t in os_ if t not in out]
-        if rest:
+        if rest and (got or len(rest) <= 10):      # 야후가 아예 막혔으면 하나씩 다시 두드리지 않아요
             with ThreadPoolExecutor(max_workers=4) as pool:
                 out.update(zip(rest, pool.map(fetch_monthly, rest)))
-    return {c: out[c] for c in codes}
+    return {c: out.get(c) for c in codes}
 
 
 def _monthly_arrays(monthly: pd.DataFrame | None):

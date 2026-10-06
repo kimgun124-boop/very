@@ -1039,18 +1039,32 @@ def _first_high_ago(hist, lookback: int = 20) -> int | None:
     return (len(h) - 1 - hits[0]) if hits else None
 
 
+@st.cache_resource
+def _memo_store() -> dict:
+    """(속도) app.py는 새로고침마다 처음부터 다시 실행돼서 보통 변수는 사라져요 → 계산 기억은 여기에 둬요."""
+    return {"first": {}, "leader": {}}
+
+
 def mark_sector_first(df: pd.DataFrame, histories: dict) -> pd.DataFrame:
     """깡토: 변동성 장에선 섹터에서 '가장 먼저' 신고가를 쓴 종목을 우선 본다 → sector_first 표시."""
     if df.empty or "days_since_high" not in df:
         return df
+    _FIRST_MEMO = _memo_store()["first"]
     recent = df[pd.to_numeric(df["days_since_high"], errors="coerce") <= 20]
     ago = {}
     for c in recent["code"]:
         res = histories.get(c)
         if res and res[1] is not None:
-            a = _first_high_ago(res[1])
+            m = _FIRST_MEMO.get(c)                 # (속도) 일봉이 그대로면 지난 계산을 다시 써요
+            if m is not None and m[0] is res[1]:
+                a = m[1]
+            else:
+                a = _first_high_ago(res[1])
+                _FIRST_MEMO[c] = (res[1], a)
             if a is not None:
                 ago[c] = a
+    for c in [c for c in _FIRST_MEMO if c not in histories]:      # (메모리) 화면에서 빠진 종목은 정리
+        _FIRST_MEMO.pop(c, None)
     df = df.assign(nh_first_ago=df["code"].map(ago), sector_first=False)
     sub = df[df["nh_first_ago"].notna()]
     for _, g in sub.groupby("group"):
@@ -1087,7 +1101,8 @@ def load_histories(codes: tuple[str, ...]):
                "2년치 일봉을 불러오는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
-_UNI_RETRY = {"t": 0.0}
+# (주의) app.py 변수는 새로고침마다 0으로 돌아가서 '2분 뒤 다시' 같은 간격이 지켜지지 않았어요 → 서버에 기억
+_UNI_RETRY = _memo_store().setdefault("uni_retry", {"t": 0.0})
 
 
 def load_universe() -> list[dict]:
@@ -1132,9 +1147,50 @@ def load_official_52w(codes: tuple[str, ...]) -> dict:
                "네이버 공식 52주 최고·최저가와 대조하는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
 
+@st.cache_resource
+def _monthly_store():
+    return {"lock": threading.Lock(), "items": {}, "busy": False}
+
+
 def load_monthlies(codes: tuple[str, ...]):
-    """역대 최고가 계산용 월봉. 처음에도 기다리지 않아요(받는 동안은 '역대 신고가'만 잠깐 비어 있어요)."""
-    return swr(("monthly", codes), 21600, lambda: data.fetch_monthlies(codes), first_wait=False, empty={})
+    """역대 최고가 계산용 월봉(종목별로 6시간 기억).
+    예전엔 종목 구성이 조금만 바뀌어도(작은 신고가 종목 추가 등) 600종목 월봉을 처음부터 다시 받아서,
+    그동안 '역사적 신고가'가 비고 서버도 바빴어요 → 이제 없는 종목·오래된 종목만 뒤에서 더 받아요."""
+    ms = _monthly_store()
+    now = time.time()
+    with ms["lock"]:
+        items = ms["items"]
+        have = {c: items[c][1] for c in codes if c in items}
+        need = tuple(c for c in codes if c not in items or now - items[c][0] > 21600)
+        start = bool(need) and not ms["busy"] and rss_mb() <= MEM_SOFT
+        if start:
+            ms["busy"] = True
+        if len(items) > max(1500, len(codes) * 2):           # (메모리) 오래 안 본 종목은 정리
+            keep = set(codes)
+            for c in sorted((c for c in items if c not in keep), key=lambda c: items[c][0])[: len(items) - len(codes)]:
+                items.pop(c, None)
+
+    def work():
+        try:
+            for i in range(0, len(need), 120):                   # 120종목씩 나눠 받아서 받은 만큼 바로 쓰게
+                part = need[i:i + 120]
+                got = data.fetch_monthlies(part)
+                t = time.time()
+                with ms["lock"]:
+                    for c in part:
+                        df_ = got.get(c)
+                        if df_ is not None and not df_.empty:
+                            ms["items"][c] = (t, df_)
+                        elif c not in ms["items"]:
+                            ms["items"][c] = (t - 21600 + 1800, None)   # 못 받은 종목은 30분 뒤 다시
+        except Exception:
+            pass
+        finally:
+            ms["busy"] = False
+
+    if start:
+        threading.Thread(target=work, daemon=True).start()
+    return {c: v for c, v in have.items() if v is not None}
 
 
 @st.cache_resource
@@ -1480,10 +1536,12 @@ def _eok(v) -> str:
 
 def _breadth60(board: pd.DataFrame | None) -> dict:
     """코스피·코스닥별로 '60일선 위에 있는 종목 비율'. {'코스피': (비율%, 위 종목 수, 전체 수)}
-    빠른 화면이면 보드에 올라온 종목 기준, 사이드바 '전체'면 시장 전 종목 기준이에요."""
+    지금 보드에 올라온 종목(내 보드 / 주요500+신고가 / 전체) 기준이에요."""
     if board is None or board.empty or "above60" not in board.columns:
         return {}
-    mk = {x["code"]: x.get("market") for x in load_universe()}
+    # (속도) 전체 종목 목록을 기다리지 않아요 — 아직 없으면 이번엔 비율을 빼고, 뒤에서 받은 뒤부터 보여줘요
+    uni = swr(("krx_universe", "v2"), 86400, data.fetch_krx_universe, first_wait=False, empty=[]) or []
+    mk = {x["code"]: x.get("market") for x in uni}
     b = board[board["code"].map(data.is_kr)][["code", "above60"]].copy()
     b["mk"] = b["code"].map(mk)
     b = b[b["above60"].notna()]
@@ -1519,7 +1577,7 @@ def _market_card(name: str, sm: dict | None, hist_sm: dict | None, b60: tuple | 
         pct, up, tot60 = b60
         col = "#2E6B6F" if pct >= 60 else ("#C58A12" if pct >= 40 else "#A2343B")
         html_ += (f'<div class="mk-b60" title="60일 이동평균선 위에서 거래 중인 종목 비율 ({up:,}/{tot60:,}종목)">'
-                  f'<span>60일선 위 종목</span><span class="gauge"><i style="width:{pct:.0f}%;background:{col}"></i></span>'
+                  f'<span>60일선 위 종목<small style="color:#8A979F"> 보드</small></span><span class="gauge"><i style="width:{pct:.0f}%;background:{col}"></i></span>'
                   f'<b style="color:{col}">{pct:.0f}%</b><small>{up:,}/{tot60:,}</small></div>')
     b = sm.get("breadth")
     if b:
@@ -1803,10 +1861,15 @@ def render_market(board: pd.DataFrame | None = None):
 
 
 def _chip_leader(df: pd.DataFrame, group: str) -> str:
-    top = df[(df["group"] == group) & (df["lead_rank"] == 1) & (df["lead_ok"] == True)]  # noqa: E712
-    if top.empty:
-        return ""
-    return f'<b style="color:#F2B134">👑 대장 {html.escape(top["name"].iloc[0])}</b><br>'
+    _LEADER_MEMO = _memo_store()["leader"]
+    # (속도) 분류마다 표 전체를 다시 거르지 않고, 같은 표면 대장주 목록을 한 번만 만들어요
+    memo = _LEADER_MEMO.get("v")
+    if memo is None or memo[0] is not df:
+        top = df[(df["lead_rank"] == 1) & (df["lead_ok"] == True)]  # noqa: E712
+        memo = (df, dict(zip(top["group"], top["name"])) if len(top) else {})
+        _LEADER_MEMO["v"] = memo
+    name = memo[1].get(group)
+    return f'<b style="color:#F2B134">👑 대장 {html.escape(str(name))}</b><br>' if name else ""
 
 
 def render_radar(df: pd.DataFrame):
@@ -4695,12 +4758,17 @@ def _ath_candle(r) -> str:
             f'<rect x="{a:.1f}" y="2" width="{max(b - a, 2.5):.1f}" height="10" rx="1.5" fill="{col}"/></svg>')
 
 
+def _is_true(v) -> bool:
+    """True / numpy True만 참(None·NaN·False는 거짓). 표의 dtype이 바뀌어도 같은 결과가 나오게."""
+    return v is True or (isinstance(v, np.bool_) and bool(v))
+
+
 def _ath_row(r, sub: str = "") -> str:
     badges = ""
-    if r.get("ath_d") is True:
+    if _is_true(r.get("ath_d")):
         badges += '<span class="ath-badge ath">역사</span>'
-    elif r.get("ath_w") is True or r.get("ath_m") is True:
-        badges += '<span class="ath-badge wk">역사(' + ("주" if r.get("ath_w") is True else "월") + ')</span>'
+    elif _is_true(r.get("ath_w")) or _is_true(r.get("ath_m")):
+        badges += '<span class="ath-badge wk">역사(' + ("주" if _is_true(r.get("ath_w")) else "월") + ')</span>'
     stk = pd.to_numeric(r.get("nh_streak"), errors="coerce")
     if pd.notna(stk) and stk >= 2:
         badges += f'<span class="ath-badge st">{int(stk)}연속</span>'
@@ -4753,7 +4821,7 @@ def render_ath(df: pd.DataFrame, quotes: dict):
     if kr_only:
         f = f[f["code"].map(data.is_kr)]
     for k in ("nh52_d", "ath_d", "ath_w", "ath_m"):
-        f[k] = f[k].map(lambda v: v is True)
+        f[k] = f[k].map(_is_true)
     for k in ("nh_cnt20", "nh_cnt60", "nh_streak"):
         f[k] = pd.to_numeric(f.get(k), errors="coerce")
     today_nh = f[f["nh52_d"]]
@@ -4777,7 +4845,7 @@ def render_ath(df: pd.DataFrame, quotes: dict):
         st.markdown("**이번 주·이번 달 역사적 신고가** (오늘은 아님)")
         st.markdown(_ath_table(ath_period), unsafe_allow_html=True)
         ap = pd.to_numeric(f["ath_price"], errors="coerce")
-        near = f[(~f["ath_d"]) & (~f["ath_w"]) & (~f["ath_m"]) & f["ath_ok"].map(lambda v: v is True) & ap.notna()
+        near = f[(~f["ath_d"]) & (~f["ath_w"]) & (~f["ath_m"]) & f["ath_ok"].map(_is_true) & ap.notna()
                  & (f["price"] / ap >= 0.95)].copy()
         near["_gap"] = (near["price"] / pd.to_numeric(near["ath_price"], errors="coerce") - 1) * 100
         st.markdown("**역사적 신고가까지 5% 이내**")
@@ -5028,7 +5096,7 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
 
 _QUOTES: dict = {}
 VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
-_GC = {"n": 0, "mb": 0.0}
+_GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
 def render_board():
@@ -5076,7 +5144,7 @@ def render_board():
                    f"{core_info['small_hi']}종목"
                    + (f" · 작은 종목 일봉 뒤에서 받는 중 {bg['done']:,}/{bg['total']:,}" if bg.get("running") else
                       f" · 작은 종목 {core_info['loaded']:,}/{core_info['rest']:,} 확인 완료")
-                   + " · 모두 보려면 사이드바 '전체'")
+                   + ("" if IS_STREAMLIT_CLOUD else " · 모두 보려면 사이드바 '전체'"))
     df["cap_krw"] = pd.to_numeric(df["cap_krw"], errors="coerce")
     df["cap_local"] = pd.to_numeric(df["cap_local"], errors="coerce")
 
