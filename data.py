@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-06-ath"
+DATA_VERSION = "2026-10-10-pullback"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -3635,6 +3635,119 @@ def nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | Non
     cand["_o"] = cand["nh_state"].map(order)
     cand["_k"] = np.where(cand["nh_state"] == "돌파", -cand["nh_brk"], cand["nh_dist"])
     return cand.sort_values(["_o", "_k"]).drop(columns=["_o", "_k"]).reset_index(drop=True)
+
+
+PB_DEFAULTS = {"rs_min": 70, "depth_min": 3.0, "depth_max": 25.0, "retr_max": 0.5, "near_atr": 1.0,
+               "rr_min": 2.0, "min_tv": 20e8, "min_cap": 3000.0, "run_min": 15.0}
+
+
+def pullback_setup(d, o, h, l, c, v, p: dict | None = None) -> dict | None:
+    """눌림목 매수 자리 하나 판정 (일봉 배열, 마지막 칸 = 지금 세션).
+
+    추세: 60일선이 120일선 위에서 올라가는 중 + 20일선 > 60일선 (모멘텀 살아 있음)
+    눌림: 최근 20일 고점에서 2일 이상 지나 depth_min~depth_max% 쉬었고, 직전 상승폭의 절반 넘게 되돌리지 않음
+    지지: 아직 올라가는 10·20·50일선, 상승 전 매물대(돌파 자리) 중 지금가 바로 아래(ATR × near_atr 안) — 가장 가까운 것
+    손절: 지지선과 눌림 저점 중 낮은 것 − 0.5 ATR (구조 손절). 1차 목표: 전고점. 손익비 = (전고점−지금가) ÷ (지금가−손절)
+    """
+    p = {**PB_DEFAULTS, **(p or {})}
+    n = len(c)
+    if n < 130 or not (c[-1] > 0):
+        return None
+    cs = pd.Series(c)
+    ma = {k: cs.rolling(k).mean().to_numpy() for k in (10, 20, 50, 60, 120)}
+    if np.isnan(ma[120][-1]) or np.isnan(ma[60][-6]):
+        return None
+    trend = ma[60][-1] > ma[120][-1] and ma[60][-1] > ma[60][-6] and ma[20][-1] > ma[60][-1]
+    if not trend:
+        return None
+    win = 20
+    k_hi = int(np.argmax(h[-win:]))                    # 0 = 20일 전, win-1 = 오늘
+    days_since = win - 1 - k_hi
+    hi = float(h[-win:][k_hi])
+    if days_since < 2:                                 # 오늘·어제 고점이면 아직 눌림이 아님
+        return None
+    price = float(c[-1])
+    depth = (hi - price) / hi * 100
+    if not (p["depth_min"] <= depth <= p["depth_max"]):
+        return None
+    hi_idx = n - win + k_hi
+    base_lo = float(np.min(l[max(0, hi_idx - 60):hi_idx + 1]))   # 고점 전 60일 안 저점 = 이번 상승의 출발점
+    run = (hi / base_lo - 1) * 100 if base_lo > 0 else 0
+    if run < p["run_min"]:
+        return None
+    retr = (hi - price) / (hi - base_lo) if hi > base_lo else 1.0
+    if retr > p["retr_max"]:
+        return None
+    prev = np.r_[np.nan, c[:-1]]
+    tr = np.fmax(h, prev) - np.fmin(l, prev)
+    atr = float(np.nanmean(tr[-20:]))
+    if not atr > 0:
+        return None
+    pull_lo = float(np.min(l[hi_idx + 1:])) if hi_idx + 1 < n else float(l[-1])
+    # 지지 후보: 이평선 + 상승 전 매물대(고점 전 60~20일 구간의 최고가 = 돌파한 자리)
+    # 이평선은 아직 올라가는 중일 때만 지지로 봐요(꺾여 내려오는 이평선은 저항)
+    cands = [(f"{k}일선", ma[k][-1]) for k in (10, 20, 50) if ma[k][-1] >= ma[k][-6]]
+    seg = h[max(0, hi_idx - 60):max(0, hi_idx - 15)]
+    if len(seg):
+        cands.append(("돌파 자리", float(np.max(seg))))
+    near = [(nm, float(s)) for nm, s in cands
+            if s == s and s <= price * 1.01 and price - s <= p["near_atr"] * atr and s >= price - 2.0 * atr]
+    if not near:
+        return None
+    sup_name, sup = max(near, key=lambda x: x[1])      # 지금가 바로 아래 지지
+    stop = min(sup, pull_lo) - 0.5 * atr
+    risk = price - stop
+    if risk <= 0:
+        return None
+    rr = (hi - price) / risk
+    stop_pct = risk / price * 100
+    # 거래량: 눌리는 동안 줄었는지(최근 눌림 최대 5일 ÷ 50일 평균), 20일 오른 날 vs 내린 날 거래량
+    vol50 = float(np.nanmean(v[-51:-1])) if n > 51 else float(np.nanmean(v))
+    kk = min(days_since, 5)
+    dry = float(np.nanmean(v[-kk:]) / vol50) if vol50 else np.nan
+    up = c[-20:] > prev[-20:]
+    dn = c[-20:] < prev[-20:]
+    ud = float(np.nansum(v[-20:][up]) / np.nansum(v[-20:][dn])) if np.nansum(v[-20:][dn]) else np.nan
+    rng = h[-1] - l[-1]
+    dcr = (c[-1] - l[-1]) / rng * 100 if rng > 0 else 50.0
+    bounce = bool((c[-1] > o[-1] and dcr >= 60 and c[-1] > c[-2]) or c[-1] > h[-2])
+    return {"pb_support": sup_name, "pb_sup": sup, "pb_hi": hi, "pb_days": days_since, "pb_depth": depth,
+            "pb_retr": retr * 100, "pb_run": run, "pb_stop": stop, "pb_stop_pct": stop_pct, "pb_rr": rr,
+            "pb_t3": price + 3 * risk, "pb_dry": dry, "pb_ud": ud, "pb_dcr": dcr, "pb_bounce": bounce,
+            "pb_trigger": float(max(h[-1], h[-2])) if not bounce else price, "pb_atr": atr / price * 100,
+            "pb_low": pull_lo, "pb_ma20": float(ma[20][-1]), "pb_ma50": float(ma[50][-1])}
+
+
+def pullback_screen(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None) -> pd.DataFrame:
+    """보드 국내 종목 중 눌림 자리 (차트만 보는 1차 거르기 — 실적·수급은 화면에서 후보만 따로 받아요)."""
+    p = {**PB_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    rows = []
+    for _, r in df.iterrows():
+        code = r["code"]
+        if not is_kr(code) or r.get("halted"):
+            continue
+        rs = r.get("rs")
+        if not (rs == rs and rs is not None and rs >= p["rs_min"]):
+            continue
+        if (r.get("tv20") or 0) < p["min_tv"] or (r.get("cap_krw") or 0) / 1e8 < p["min_cap"]:
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        if hist is None or hist.empty:
+            continue
+        try:
+            d_, o_, h_, l_, c_, v_ = _session_bars(hist, quotes.get(code), today)
+            res = pullback_setup(d_, o_, h_, l_, c_, v_, p)
+        except Exception:
+            res = None
+        if res and res["pb_rr"] >= p["rr_min"]:
+            rows.append({"code": code, **res})
+    if not rows:
+        return pd.DataFrame(columns=["code"])
+    out = pd.DataFrame(rows)
+    keep = [k for k in ("name", "group", "sector", "price", "change", "rs", "rs_1m", "atr_pct", "cap_krw", "tv20",
+                        "lead_rank", "lead_ok", "url", "high52", "to_high") if k in df.columns]
+    return out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
 
 
 VS_DEFAULTS = {"quiet": 90, "recent": 5, "mult": 3.0, "quiet_cap": 2.0, "min_tv": 10e8}

@@ -62,8 +62,9 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
-            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted")
-DATA_VERSION = "2026-10-06-ath"   # data.py의 DATA_VERSION과 같아야 해요
+            "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
+            "pullback_screen", "pullback_setup", "PB_DEFAULTS")
+DATA_VERSION = "2026-10-10-pullback"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -4385,6 +4386,206 @@ def render_leaders(df: pd.DataFrame, leaders: set):
     )
 
 
+PB_TIER = {"지금 타점": ("#1B8A4B", "✅"), "반등 대기": ("#A87400", "⏳"), "손익비 2~3": ("#51616C", "△"),
+           "시장 대기": ("#C0262E", "⛔")}
+
+
+def _pb_fig(code: str, quote: dict | None, r: dict):
+    """눌림 후보 일봉 6개월 + 20·50일선 + 지지·손절·전고점·3R 선."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    bars = load_chart(code, "일봉")
+    if bars is None or bars.empty:
+        return None
+    b = data.chart_with_live(bars, quote, "일봉").copy().reset_index(drop=True)
+    for k in (20, 50):
+        b[f"ma{k}"] = b["close"].rolling(k).mean()
+    b = b.tail(125)
+    x = pd.to_datetime(b["date"]).dt.strftime("%Y-%m-%d")
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.78, 0.22])
+    fig.add_trace(go.Candlestick(x=x, open=b["open"], high=b["high"], low=b["low"], close=b["close"], name="일봉",
+                                 increasing=dict(line=dict(color=UP), fillcolor=UP),
+                                 decreasing=dict(line=dict(color=DOWN), fillcolor=DOWN), showlegend=False), 1, 1)
+    for k, col in ((20, "#F59E0B"), (50, "#16A34A")):
+        fig.add_trace(go.Scatter(x=x, y=b[f"ma{k}"], mode="lines", line=dict(width=1.4, color=col), name=f"{k}일선"), 1, 1)
+    vc = [UP if c_ >= o_ else DOWN for c_, o_ in zip(b["close"], b["open"])]
+    fig.add_trace(go.Bar(x=x, y=b["volume"], marker_color=vc, opacity=.45, showlegend=False, name="거래량"), 2, 1)
+    for y, lab, col, dash in ((r["pb_hi"], "전고점(1차 목표)", "#0F7B45", "dash"), (r["pb_t3"], "3R", "#7C3AED", "dot"),
+                              (r["pb_sup"], f"지지 · {r['pb_support']}", "#64748B", "dot"),
+                              (r["pb_stop"], "손절", "#DC2626", "dash")):
+        fig.add_hline(y=y, line=dict(color=col, width=1.2, dash=dash), row=1, col=1,
+                      annotation_text=f"{lab} {y:,.0f}", annotation_position="top right" if lab == "3R" else "top left",
+                      annotation_font=dict(size=11, color=col))
+    fig.update_layout(height=460, margin=dict(l=8, r=8, t=10, b=8), xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"), dragmode="pan")
+    fig.update_xaxes(type="category", nticks=8)
+    try:
+        fig = theme.style_fig(fig)
+    except Exception:
+        pass
+    return fig
+
+
+def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict):
+    """신고가 돌파가 아니라, 모멘텀·실적 좋은 종목이 지지선까지 쉬어 갈 때의 손익비 좋은 자리."""
+    _sec_h("🪃 눌림 타점", "모멘텀(RS)·실적(올해 영업이익↑) 종목이 지지선까지 쉬어 갈 때 — 거래량·수급·차트로 손익비 좋은 자리")
+    d = data.PB_DEFAULTS
+    with st.expander("⚙️ 기준 · 계좌 금액"):
+        st.caption("추세: 60일선 > 120일선 · 60일선 상승 · 20일선 > 60일선  |  눌림: 최근 20일 고점에서 2일 이상, 직전 상승의 절반 이내로 되돌림  |  "
+                   "지지: 10·20·50일선·돌파 자리 중 지금가 바로 아래  |  손절: 지지선·눌림 저점 아래 0.5 ATR  |  1차 목표: 전고점")
+        c1, c2, c3, c4 = st.columns(4)
+        rs_min = c1.number_input("RS 최소", 50, 99, d["rs_min"], key="pb_rs", help="원칙: RS 70 이상")
+        rr_min = c2.number_input("손익비 최소", 1.0, 6.0, d["rr_min"], step=0.5, key="pb_rr",
+                                 help="(전고점 − 지금가) ÷ (지금가 − 손절가). 3 이상이면 3R 원칙과 맞아요")
+        dmin, dmax = c3.slider("고점 대비 눌림(%)", 1.0, 40.0, (d["depth_min"], d["depth_max"]), step=1.0, key="pb_depth")
+        near = c4.number_input("지지선과 거리(ATR 배)", 0.3, 3.0, d["near_atr"], step=0.1, key="pb_near",
+                               help="지금가가 지지선 위 이 거리 안에 있어야 '지지 근처'")
+        c5, c6, c7 = st.columns(3)
+        min_tv = c5.number_input("20일 평균 거래대금 최소(억)", 0.0, 2000.0, d["min_tv"] / 1e8, step=10.0, key="pb_tv")
+        min_cap = c6.number_input("최소 시가총액(억)", 0.0, 100000.0, d["min_cap"], step=500.0, key="pb_cap")
+        equity = c7.number_input("계좌 평가금액(원, 수량 계산용)", 0, 10_000_000_000,
+                                 int(st.session_state.get("buy_equity") or 0), step=1_000_000, key="pb_equity")
+        need_op = st.toggle("올해(E) 영업이익이 늘어난 종목만", value=True, key="pb_op",
+                            help="원칙: 강해도 영업이익이 늘지 않으면 배제")
+    p = {**d, "rs_min": int(rs_min), "rr_min": float(rr_min), "depth_min": float(dmin), "depth_max": float(dmax),
+         "near_atr": float(near), "min_tv": float(min_tv) * 1e8, "min_cap": float(min_cap)}
+
+    hist = load_indexes()
+    sigs, oks = [], []
+    for name, sym in data.MARKETS.items():
+        idf = hist.get(sym, (data.empty_frame(), None))[0]
+        s20, s60 = data.ma_signal(idf, 20), data.ma_signal(idf, 60)
+        a60 = None if not s60 else s60.get("above")
+        oks.append(a60)
+        sigs.append((name, s20, s60))
+    market_ok = None if None in oks else all(oks)
+    idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
+              for name, sym in data.MARKETS.items()}
+
+    with st.spinner("눌림 자리 찾는 중…"):
+        pre = data.pullback_screen(df, histories, quotes, p)
+    fins, trends = {}, {}
+    if not pre.empty and "pb_rr" in pre:
+        codes = tuple(pre["code"])
+        with st.spinner(f"후보 {len(codes)}종목 실적·수급 확인 중…"):
+            fins = data.fetch_financials_many(codes)
+            trends = data.fetch_stock_trends(codes)
+    rows = []
+    ft = data._flow_table(trends) if trends else pd.DataFrame(columns=["code"])
+    ft = ft.set_index("code") if not ft.empty else ft
+    for r in (pre.to_dict("records") if "pb_rr" in pre else []):
+        og = data.op_growth(fins.get(r["code"]))
+        if need_op and og.get("op_up") is not True:
+            continue
+        f5 = ft["f5"].get(r["code"]) if "f5" in ft else np.nan
+        i5 = ft["i5"].get(r["code"]) if "i5" in ft else np.nan
+        f20 = ft["f20"].get(r["code"]) if "f20" in ft else np.nan
+        i20 = ft["i20"].get(r["code"]) if "i20" in ft else np.nan
+        fi5 = np.nansum([f5, i5]) if not (pd.isna(f5) and pd.isna(i5)) else np.nan
+        fi20 = np.nansum([f20, i20]) if not (pd.isna(f20) and pd.isna(i20)) else np.nan
+        flow_ok = None if pd.isna(fi20) else bool(fi20 >= 0 or (not pd.isna(fi5) and fi5 > 0))
+        dry_ok = bool(r["pb_dry"] == r["pb_dry"] and r["pb_dry"] <= 0.9)
+        rs_ok = all(v is None or (r.get("rs") or 0) > v for v in idx_rs.values())
+        if market_ok is False:
+            tier = "시장 대기"
+        elif r["pb_rr"] >= 3 and r["pb_bounce"] and flow_ok is not False:
+            tier = "지금 타점"
+        elif r["pb_rr"] >= 3:
+            tier = "반등 대기"
+        else:
+            tier = "손익비 2~3"
+        score = (min(r["pb_rr"], 6) / 6 * 40 + (15 if dry_ok else 0) + (15 if flow_ok else 0)
+                 + (10 if r["pb_bounce"] else 0) + (r.get("rs") or 0) / 99 * 10
+                 + (10 if (r.get("pb_ud") or 0) >= 1.2 else 0))
+        stop_pct = r["pb_stop_pct"]
+        shares = amount = None
+        if equity:
+            risk_won = equity * 1.5 / 100
+            shares = int(min(risk_won // (r["price"] * stop_pct / 100), equity * 0.19 // r["price"]))
+            amount = shares * r["price"]
+        rows.append({**r, "tier": tier, "score": score, "og": og, "fi5": fi5, "fi20": fi20, "f5": f5, "i5": i5,
+                     "flow_ok": flow_ok, "dry_ok": dry_ok, "rs_ok": rs_ok, "shares": shares, "amount": amount})
+    res = pd.DataFrame(rows)
+    order = {k: i for i, k in enumerate(PB_TIER)}
+    if not res.empty:
+        res = res.assign(_o=res["tier"].map(order)).sort_values(["_o", "score"], ascending=[True, False]).drop(columns="_o")
+    cnt = res["tier"].value_counts() if not res.empty else pd.Series(dtype=int)
+
+    def _sg(s):
+        return "?" if not s else {"G": "🟢", "Y": "🟡", "R": "🔴"}.get(s.get("code"), "?")
+    mk_txt = " · ".join(f"{n} 20{_sg(s20)} 60{_sg(s60)}" for n, s20, s60 in sigs)
+    tiles = [_tile(market_ok, "시장 20·60일선", mk_txt),
+             _tile(True if cnt.get("지금 타점", 0) else None, "✅ 지금 타점", f"{cnt.get('지금 타점', 0)}"),
+             _tile(None, "⏳ 반등 대기", f"{cnt.get('반등 대기', 0)}"),
+             _tile(None, "△ 손익비 2~3", f"{cnt.get('손익비 2~3', 0)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    if market_ok is False:
+        st.error("⛔ 코스피·코스닥 중 60일선 아래가 있어요. 원칙상 신규 매수는 쉬는 구간 — 아래는 공부·대기용이에요.")
+    if res.empty:
+        st.caption("지금은 조건에 맞는 눌림 자리가 없어요. ⚙️ 기준에서 손익비·눌림 폭을 조금 풀어 볼 수 있어요.")
+        return
+
+    view = pd.DataFrame([{
+        "상태": f"{PB_TIER[x['tier']][1]} {x['tier']}", "종목": x["name"], "분류": x.get("group"),
+        "현재가": x["price"], "손익비": x["pb_rr"], "지지": f"{x['pb_support']} {x['pb_sup']:,.0f}",
+        "손절가": x["pb_stop"], "손절폭": x["pb_stop_pct"], "1차 목표(전고점)": x["pb_hi"],
+        "목표까지": (x["pb_hi"] / x["price"] - 1) * 100, "3R": x["pb_t3"],
+        "눌림": f"-{x['pb_depth']:.1f}% · {x['pb_days']}일", "거래량(눌림/평균)": x["pb_dry"],
+        "외+기 5일(억)": x["fi5"], "외+기 20일(억)": x["fi20"], "RS": x.get("rs"),
+        "영업이익": x["og"].get("op_txt") or "-", "반등": "✓ 반등" if x["pb_bounce"] else f"대기 · {x['pb_trigger']:,.0f} 넘으면",
+        **({"수량": x["shares"], "매수금액": x["amount"]} if equity else {}),
+    } for x in res.to_dict("records")])
+    fmt = {"현재가": "{:,.0f}", "손익비": "{:.1f} : 1", "손절가": "{:,.0f}", "손절폭": "-{:.1f}%",
+           "1차 목표(전고점)": "{:,.0f}", "목표까지": "{:+.1f}%", "3R": "{:,.0f}", "거래량(눌림/평균)": "{:.2f}배",
+           "외+기 5일(억)": _eok_num, "외+기 20일(억)": _eok_num, "RS": "{:.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}"}
+
+    def _c_rr(v):
+        return f"color:{'#1B8A4B' if v >= 3 else '#A87400'};font-weight:700" if v == v else ""
+
+    def _c_dry(v):
+        return "color:#1B8A4B" if v == v and v <= 0.9 else ("color:#C0262E" if v == v and v >= 1.3 else "")
+
+    def _c_flow(v):
+        return "" if v is None or v != v else f"color:{UP if v > 0 else DOWN}"
+    sty = (view.style.format({k: v for k, v in fmt.items() if k in view.columns}, na_rep="-")
+           .map(_c_rr, subset=["손익비"]).map(_c_dry, subset=["거래량(눌림/평균)"])
+           .map(_c_flow, subset=["외+기 5일(억)", "외+기 20일(억)"]))
+    st.dataframe(sty, hide_index=True, width="stretch", column_config={"종목": st.column_config.Column(pinned=True)})
+    st.caption("✅ 지금 타점 = 손익비 3 이상 + 오늘 반등 캔들(양봉·고가권 마감 또는 전일 고가 돌파) + 수급 이탈 아님 · "
+               "⏳ 반등 대기 = 손익비 3 이상, 아직 반등 전(표의 가격을 넘으면 진입 검토) · "
+               "거래량(눌림/평균) 0.9배 이하 = 쉬는 동안 매물이 적음(좋음), 1.3배 이상 = 파는 힘 큼(주의). "
+               "손절은 지지선 아래라 신고가 매매(8%)보다 좁아요 — 같은 1.5% 위험이면 수량이 커지니 비중 상한(19%)도 같이 봐요.")
+
+    st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
+    names = [f"{PB_TIER[x['tier']][1]} {x['name']} · 손익비 {x['pb_rr']:.1f}" for x in res.to_dict("records")]
+    pick = st.selectbox("차트로 확인", range(len(names)), format_func=lambda i: names[i], key="pb_pick")
+    x = res.iloc[int(pick)].to_dict()
+    checks = [
+        _tile(market_ok, "시장 60일선", "위" if market_ok else ("아래" if market_ok is False else "?")),
+        _tile(x["pb_rr"] >= 3, "손익비", f"{x['pb_rr']:.1f} : 1"),
+        _tile(x["dry_ok"], "눌림 거래량", f"평균의 {x['pb_dry']:.2f}배"),
+        _tile(x["flow_ok"], "외+기 수급", f"5일 {_eok_num(x['fi5'])} · 20일 {_eok_num(x['fi20'])}억"),
+        _tile(x["pb_bounce"], "반등 캔들", f"DCR {x['pb_dcr']:.0f}%"),
+        _tile(x["og"].get("op_up"), "올해 영업이익", x["og"].get("op_txt") or "-"),
+        _tile(x["rs_ok"] and (x.get("rs") or 0) >= 70, "RS", f"{x.get('rs') or 0:.0f} (지수보다 {'위' if x['rs_ok'] else '아래'})"),
+        _tile((x.get("pb_ud") or 0) >= 1.0, "오른 날/내린 날 거래량", f"{x.get('pb_ud') or 0:.2f}배 (20일)"),
+    ]
+    st.markdown(f'<div class="tiles">{"".join(checks)}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='verdict'><b>{html.escape(str(x['name']))}</b> — 20일 고점 {x['pb_hi']:,.0f}에서 {x['pb_days']}일째 "
+        f"-{x['pb_depth']:.1f}% 쉬는 중(직전 상승 +{x['pb_run']:.0f}%의 {x['pb_retr']:.0f}% 되돌림). "
+        f"지금가 {x['price']:,.0f}는 <b>{x['pb_support']} {x['pb_sup']:,.0f}</b> 바로 위. "
+        f"손절 {x['pb_stop']:,.0f}(-{x['pb_stop_pct']:.1f}%) → 전고점 {x['pb_hi']:,.0f}까지 손익비 <b>{x['pb_rr']:.1f} : 1</b>, "
+        f"3R {x['pb_t3']:,.0f}." + ("" if x["pb_bounce"] else f" 아직 반등 전 — {x['pb_trigger']:,.0f} 위로 올라서면 진입 검토.")
+        + "</div>", unsafe_allow_html=True)
+    fig = _pb_fig(x["code"], quotes.get(x["code"]), x)
+    if fig is not None:
+        st.plotly_chart(fig, key="pb_fig", config={"displaylogo": False, "scrollZoom": True})
+    else:
+        st.info("차트를 받지 못했어요.")
+
+
+
 def render_buy(df: pd.DataFrame, quotes: dict):
     """내 매매 원칙을 모두 통과한 국내 종목. 산업·태그 필터와 관계없이 보드 전체에서 찾아요."""
     _sec_h("🎯 매수 후보", "내 원칙을 모두 통과한 국내 종목만")
@@ -5165,7 +5366,7 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오"]
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
         try:
@@ -5174,7 +5375,7 @@ def render_board():
         except TypeError:          # 예전 Streamlit
             tabs = st.tabs(names)
             lazy = False
-    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn = tabs
+    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -5192,6 +5393,7 @@ def render_board():
         (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),
         (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
         (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
+        (t_pb, lambda: render_pullback(df, histories, quotes)),
     ]
     for tab, job in jobs:
         if is_open(tab):
