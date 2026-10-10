@@ -911,20 +911,40 @@ def flows_kr(code: str) -> dict:
     return out
 
 
+def _rep_url(rid) -> str:
+    """리포트 상세 주소 (2026.9 네이버 개편 뒤 새 주소)."""
+    return f"https://stock.naver.com/research/company/{rid}"
+
+
+def _ymd(v) -> str:
+    s = re.sub(r"\D", "", str(v or ""))
+    return f"{s[2:4]}.{s[4:6]}.{s[6:8]}" if len(s) >= 8 else str(v or "")
+
+
 def reports_kr(code: str, n: int = 8) -> list[dict]:
-    """증권사 리포트 목록 [{title, broker, date, url}]."""
+    """증권사 리포트 목록 [{title, broker, date, url}].
+    네이버가 2026.9 예전 리서치 페이지(finance.naver.com/research)를 없애서 새 JSON 주소를 먼저 써요."""
     items = []
     try:
+        js = _mjson(f"https://m.stock.naver.com/api/research/stock/{code}", {"pageSize": n, "page": 1})
+        for d in _walk(js):
+            rid, t = d.get("researchId") or d.get("nid"), d.get("title") or d.get("tit")
+            if rid and t:
+                items.append({"title": str(t), "broker": str(d.get("brokerName") or d.get("bnm") or ""),
+                              "date": _ymd(d.get("writeDate") or d.get("wdt")), "url": _rep_url(rid)})
+    except Exception:
+        pass
+    if not items:
+      try:
         js = _mjson(f"https://m.stock.naver.com/api/stock/{code}/integration")
         for d in _walk(js.get("researches", js) if isinstance(js, dict) else js):
             t = _pick(d, "tit", "title")
             b = _pick(d, "bnm", "brokerName", "officeName")
             rid = _pick(d, "id", "nid", "researchId")
             if t and b:
-                items.append({"title": str(t), "broker": str(b), "date": str(_pick(d, "wdt", "writeDate", "date") or ""),
-                              "url": f"https://finance.naver.com/research/company_read.naver?nid={rid}" if rid else
-                              f"https://finance.naver.com/research/company_list.naver?searchType=itemCode&itemCode={code}"})
-    except Exception:
+                items.append({"title": str(t), "broker": str(b), "date": _ymd(_pick(d, "wdt", "writeDate", "date")),
+                              "url": _rep_url(rid) if rid else f"https://stock.naver.com/domestic/stock/{code}/research"})
+      except Exception:
         pass
     if not items:                            # PC 리서치 목록 페이지
         try:

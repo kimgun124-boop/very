@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-09-30-v2"
+HOLDINGS_VERSION = "2026-10-10-research"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -813,22 +813,23 @@ def google_news(query: str, n: int = 12) -> list[dict]:
 
 
 def naver_research(code: str, n: int = 8) -> list[dict]:
-    """네이버 증권 종목 리포트 목록(증권사·제목·날짜)."""
+    """네이버 증권 종목 리포트 목록(증권사·제목·날짜).
+    2026.9 네이버가 예전 리서치 페이지(finance.naver.com/research)를 없애서 새 JSON 주소를 써요."""
     out = []
     try:
-        r = requests.get("https://finance.naver.com/research/company_list.naver",
-                         params={"searchType": "itemCode", "itemCode": code}, headers=UA, timeout=8)
-        text = r.content.decode("cp949", errors="ignore")
-        for tr in re.findall(r"<tr>([\s\S]*?)</tr>", text):
-            m = re.search(r'href="(company_read\.naver\?[^"]+)"[^>]*>([^<]+)</a>', tr)
-            tds = [re.sub(r"<[^>]+>", "", t).strip() for t in re.findall(r"<td[^>]*>([\s\S]*?)</td>", tr)]
-            if not m or len(tds) < 5:
-                continue
-            out.append({"title": _html.unescape(m.group(2).strip()), "source": tds[2], "time": tds[4],
-                        "url": "https://finance.naver.com/research/" + _html.unescape(m.group(1)), "portal": "증권사 리포트"})
+        r = requests.get(f"https://m.stock.naver.com/api/research/stock/{code}", params={"pageSize": n, "page": 1},
+                         headers=UA, timeout=8)
+        js = r.json()
+        found = []
+        _walk(js, lambda d: found.append(d) if isinstance(d, dict) and d.get("researchId") and d.get("title") else None)
+        for d in found:
+            w = re.sub(r"\D", "", str(d.get("writeDate") or ""))
+            out.append({"title": _html.unescape(str(d["title"])), "source": str(d.get("brokerName") or ""),
+                        "time": f"{w[2:4]}.{w[4:6]}.{w[6:8]}" if len(w) >= 8 else str(d.get("writeDate") or ""),
+                        "url": f"https://stock.naver.com/research/company/{d['researchId']}", "portal": "증권사 리포트"})
             if len(out) >= n:
                 break
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         pass
     return out
 
