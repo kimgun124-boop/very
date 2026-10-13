@@ -61,12 +61,12 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "fetch_monthlies", "newhigh_flags", "ma_signal", "index_rs",
             "buy_screen", "buy_checks", "position_plan", "BUY_RULES", "BUY_DEFAULTS", "EXTRA_KEYS",
             "add_leader_ranks", "sector_leaders", "momentum_engine", "next_leader_sectors", "NEXT_DEFAULTS",
-            "nh_candidates", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
+            "nh_candidates", "nh_prefilter", "fetch_nxt_quotes", "fetch_official_52w", "NHC_DEFAULTS", "NHC_STATES", "volume_surges", "VS_DEFAULTS",
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS")
-DATA_VERSION = "2026-10-10-pullback"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-13-nh-nxt"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -1157,7 +1157,7 @@ def _monthly_store():
     return {"lock": threading.Lock(), "items": {}, "busy": False}
 
 
-def load_monthlies(codes: tuple[str, ...]):
+def load_monthlies(codes: tuple[str, ...], trim: bool = True):
     """역대 최고가 계산용 월봉(종목별로 6시간 기억).
     예전엔 종목 구성이 조금만 바뀌어도(작은 신고가 종목 추가 등) 600종목 월봉을 처음부터 다시 받아서,
     그동안 '역사적 신고가'가 비고 서버도 바빴어요 → 이제 없는 종목·오래된 종목만 뒤에서 더 받아요."""
@@ -1170,7 +1170,7 @@ def load_monthlies(codes: tuple[str, ...]):
         start = bool(need) and not ms["busy"] and rss_mb() <= MEM_SOFT
         if start:
             ms["busy"] = True
-        if len(items) > max(1500, len(codes) * 2):           # (메모리) 오래 안 본 종목은 정리
+        if trim and len(items) > max(1500, len(codes) * 2):  # (메모리) 오래 안 본 종목은 정리(후보 탭처럼 일부만 볼 땐 안 지워요)
             keep = set(codes)
             for c in sorted((c for c in items if c not in keep), key=lambda c: items[c][0])[: len(items) - len(codes)]:
                 items.pop(c, None)
@@ -5028,6 +5028,11 @@ NHC_CSS = """
 .nh-pill.s-터치 { background: #FFF1C9; color: #9A6A00; }
 .nh-pill.s-임박 { background: #FFE8D6; color: #C2570E; }
 .nh-pill.s-근접 { background: #E3F4EA; color: #1B6B3E; }
+.nh-pill.s-밀림 { background: #E4EDFA; color: #1F66C9; }
+.nh-kind { display: inline-block; font-size: 0.66rem; font-weight: 700; padding: 0.05rem 0.4rem; border-radius: 5px; margin-left: 0.25rem; vertical-align: 1px; }
+.nh-kind.ath { background: #FBE3E4; color: #C0313A; } .nh-kind.w52 { background: #FFF1D6; color: #A86A00; }
+.nh-kind.unk { background: #EEF1F3; color: #6B7A84; } .nh-kind.lag { background: #FFF4E5; color: #B45309; }
+.nh-c-why { font-size: 0.74rem; color: #3E4C55; margin: -0.25rem 0 0.45rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nh-pill.s-관찰 { background: #EEF1F3; color: #51616C; }
 .nh-tbl-wrap { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; overflow-x: auto; }
 table.nh-tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -5058,12 +5063,30 @@ table.nh-tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tab
 """
 
 NHC_SECTIONS = [
-    ("신선 후보", "✳️", "#1B8A4B", "최근 돌파 이력이 없고 거래대금과 RS가 살아난 후보예요."),
-    ("돌파권", "🎯", "#C27C0E", "신고가 기준가까지 가까워 관찰 우선순위가 높아요."),
-    ("돌파 중", "📈", "#D6333B", "현재가가 기준가(직전 52주 최고가) 위에 있어요."),
-    ("터치 후 밀림", "〰️", "#1F66C9", "오늘 신고가를 터치했지만 기준 아래로 밀린 재관찰 후보예요."),
+    ("신선 후보", "✳️", "#1B8A4B", "최근 60거래일 신고가 이력이 없고 거래대금·RS가 살아난 후보예요."),
+    ("돌파권", "🎯", "#C27C0E", "기준가(직전 52주 고가)까지 가깝고 거래대금·RS가 받쳐 주는 종목이에요."),
+    ("돌파 중", "📈", "#D6333B", "오늘 52주 고가를 새로 쓰고, 지금 가격(넥장 포함)도 기준가 위에 있어요."),
+    ("찍고 밀림", "〰️", "#1F66C9", "52주 고점을 찍었지만(오늘 또는 최근 10거래일) 지금은 그 아래예요."),
 ]
-NHC_LABEL = {"돌파": "돌파성공", "터치": "터치 후 밀림", "임박": "임박", "근접": "근접", "관찰": "관찰"}
+NHC_LABEL = {"돌파": "돌파 유지", "터치": "오늘 찍고 밀림", "밀림": "고점 후 밀림", "임박": "임박", "근접": "근접",
+             "관찰": "관찰"}
+NHC_KIND_CLS = {"역사적": "ath", "52주": "w52"}
+
+
+def _kind_badge(r) -> str:
+    k = r.get("nh_kind") or ""
+    cls = NHC_KIND_CLS.get(k, "unk")
+    txt = {"역사적": "역사적 신고가", "52주": "52주 신고가"}.get(k, "52주 · 역사 확인 중")
+    return f'<span class="nh-kind {cls}">{txt}</span>'
+
+
+def _md(v) -> str:
+    return "" if v is None or (isinstance(v, float) and v != v) or v is pd.NaT else f"{v:%m/%d}"
+
+
+def _s(v) -> str:
+    """None·NaN이면 빈 글자."""
+    return "" if v is None or (isinstance(v, float) and v != v) else str(v)
 
 
 def _spark_svg(vals, ref: float | None, up: bool, w: int = 160, hgt: int = 34) -> str:
@@ -5106,26 +5129,55 @@ def _tv_eok(v) -> str:
 
 
 def _dist_html(r, big: bool = False) -> tuple[str, str]:
-    """('10.40%', '돌파') / ('3.83%', '남음')"""
-    if r["nh_state"] == "돌파":
-        return f'<b style="color:{UP}">{r["nh_brk"]:.2f}%</b>', "돌파"
+    """상태별 핵심 숫자: 돌파 = 기준가 위 몇 % · 찍고 밀림 = 고점 대비 몇 % · 나머지 = 기준가까지 남은 %."""
+    s = r["nh_state"]
+    if s == "돌파":
+        return f'<b style="color:{UP}">+{r["nh_brk"]:.2f}%</b>', "기준 위"
+    if s in ("터치", "밀림"):
+        return f'<b style="color:{DOWN}">{r["peak_gap"]:.2f}%</b>', "고점 대비"
     return f'<b>{max(r["nh_dist"], 0):.2f}%</b>', "남음"
 
 
+_NH_FADE = [3.0]     # 돌파 중 경고 기준(설정값을 render에서 넣어요)
+
+
+def _nh_why(r) -> str:
+    """카드 한 줄 근거: 기준가(날짜·출처) · 지금 가격(출처) · 확정 여부."""
+    s = r["nh_state"]
+    ref = f'기준 {r["ref_high"]:,.0f}' + (f'({_md(r["ref_date"])})' if _md(r.get("ref_date")) else
+                                         ("(네이버 공식)" if r.get("ref_src") == "네이버 공식" else ""))
+    now = f'지금 {r["nh_price"]:,.0f}' + ("" if r.get("price_src") == "KRX" else f'·{r["price_src"]}')
+    if s == "돌파":
+        tail = _s(r.get("confirm"))
+        if r.get("fade") is not None and r["fade"] >= _NH_FADE[0]:
+            tail += f' · 고가 {r["day_high"]:,.0f}서 -{r["fade"]:.1f}%'
+        return f"{ref} · {now} · {tail}".strip(" ·")
+    if s == "터치":
+        return f'오늘 고가 {r["day_high"]:,.0f} 찍고 · {now}' + (f' · {_s(r["confirm"])}' if _s(r.get("confirm")) else "")
+    if s == "밀림":
+        ago = f'{int(r["peak_ago"])}거래일 전' if r.get("peak_ago") == r.get("peak_ago") and r.get("peak_ago") else ""
+        return f'{_md(r["peak_date"])} 고점 {r["peak"]:,.0f}({ago}) · {now}'
+    return f"{ref} · {now}"
+
+
 def _nh_card(r) -> str:
-    brk = r["nh_state"] == "돌파"
-    head, lab = ("고가에서", "돌파") if brk else ("고가까지", "남음")
-    num = f'<span style="color:{UP}">{r["nh_brk"]:.2f}%</span>' if brk else f'{max(r["nh_dist"], 0):.2f}%'
+    val, lab = _dist_html(r)
     tvr = "-" if pd.isna(r["tv_ratio"]) else f"{r['tv_ratio']:.1f}배"
     rs = "-" if pd.isna(r["rs"]) else f"{r['rs']:.0f}"
     rs1 = "-" if pd.isna(r["rs_1m"]) else f"{r['rs_1m']:.0f}"
+    head = {"돌파": "기준가 대비", "터치": "고점 대비", "밀림": "고점 대비"}.get(r["nh_state"], "기준가까지")
+    ath = ""
+    if r.get("nh_kind") == "52주" and r.get("ath_gap") == r.get("ath_gap") and r.get("ath_gap") is not None:
+        ath = f' · 역사 고점까지 {r["ath_gap"]:.1f}%'
+    lag = '<span class="nh-kind lag">⚠️ 일봉 지연</span>' if _is_true(r.get("data_lag")) else ""
     return (
         f'<a class="nh-card" href="?chart={html.escape(str(r["code"]))}" target="_self">'
         f'<div class="nh-c-top"><span class="nh-c-name">{html.escape(str(r["name"]))} '
         f'<span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></span>'
         f'<span class="nh-c-chg">{_chg_html(r["change"])}</span></div>'
-        f'<div class="nh-c-sub">{r["code"]} · {html.escape(str(r["group"]))}</div>'
-        f'<div class="nh-c-keys"><div>{head}<b>{num}<small>{lab}</small></b></div>'
+        f'<div class="nh-c-sub">{r["code"]} · {html.escape(str(r["group"]))} {_kind_badge(r)}{lag}</div>'
+        f'<div class="nh-c-why">{html.escape(_nh_why(r))}{html.escape(ath)}</div>'
+        f'<div class="nh-c-keys"><div>{head}{val[:-4]}<small>{lab}</small></b></div>'
         f'<div>거래대금 20일 평균대비<b>{tvr}</b></div><div>RS / RS1M<b>{rs} / {rs1}</b></div></div></a>'
     )
 
@@ -5143,6 +5195,10 @@ def _nh_params() -> dict:
         p["tv_min"] = c4.slider("돌파권·신선: 거래대금 20일 평균대비(배)", 1.0, 5.0, float(d["tv_min"]), 0.1, key="nhc_tv")
         p["rs_min"] = c5.slider("돌파권·신선: 종합 RS 이상", 50, 99, int(d["rs_min"]), 1, key="nhc_rs")
         p["fresh_days"] = c6.slider("신선: 최근 며칠간 신고가 없음(거래일)", 20, 120, int(d["fresh_days"]), 5, key="nhc_fresh")
+        c7, c8, _ = st.columns(3)
+        p["recent_peak"] = c7.slider("찍고 밀림: 고점이 최근 며칠 안(거래일)", 3, 30, int(d["recent_peak"]), 1, key="nhc_peak")
+        p["fade_warn"] = c8.slider("돌파 중 경고: 오늘 고가에서 몇 % 밀리면", 1.0, 10.0, float(d["fade_warn"]), 0.5,
+                                   key="nhc_fade")
     return p
 
 
@@ -5293,27 +5349,70 @@ def render_ath(df: pd.DataFrame, quotes: dict):
         st.markdown(_ath_table(renew, sub_fn=sub, by_sector=False, sort_col="_k"), unsafe_allow_html=True)
 
 
+@st.cache_data(ttl=15, show_spinner=False, max_entries=20)
+def load_nxt_quotes(codes: tuple[str, ...]):
+    return data.fetch_nxt_quotes(codes)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=20)
+def load_official_52w_cand(codes: tuple[str, ...]) -> dict:
+    return data.fetch_official_52w(codes)
+
+
+def _ago_txt(r) -> str:
+    a = r.get("peak_ago")
+    if a is None or a != a:
+        return ""
+    return " 오늘" if int(a) == 0 else f" · {int(a)}일 전"
+
+
+def _nxt_status(nxt: dict) -> str:
+    """넥장 상태 한 줄: 받은 시세 중 가장 최근 체결 시각과 세션."""
+    ts = [(v.get("nxt_time"), v.get("nxt_session"), v.get("nxt_status")) for v in nxt.values() if v.get("nxt_time")]
+    if not ts:
+        return "넥장 시세 없음(KRX 기준)"
+    t, sess, stt = max(ts, key=lambda x: x[0])
+    name = {"PRE_MARKET": "프리마켓", "AFTER_MARKET": "애프터마켓"}.get(str(sess).upper(), "넥장")
+    return f"넥장 {name} {'진행 중' if str(stt).upper() == 'OPEN' else '마감'} · 최근 체결 {t:%m/%d %H:%M}"
+
+
 def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     st.markdown(NHC_CSS, unsafe_allow_html=True)
-    st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
-                f'{data.market_status(quotes)} · 국내 종목 전체</span></div>', unsafe_allow_html=True)
-    with st.expander("읽는 법"):
-        st.markdown(
-            "- **기준가** = 오늘을 뺀 직전 52주(250거래일) 장중 최고가. 오늘 값은 실시간 시세로 계산해요.\n"
-            "- **돌파성공** 현재가 > 기준가 · **터치 후 밀림** 오늘 고가는 기준가를 넘었지만 현재가는 아래 · "
-            "**임박/근접/관찰** 기준가까지 남은 % (기본 2% / 7% / 15%)\n"
-            "- **거래대금 20일 평균대비** = 오늘 거래대금 ÷ 직전 20거래일 평균 거래대금 (장중엔 쌓이는 중이라 작게 나와요)\n"
-            "- **돌파권** = 임박·근접 중 거래대금 1.5배 이상 + RS 80 이상 · "
-            "**신선 후보** = 돌파·터치·임박·근접 중 같은 조건 + 최근 60거래일 동안 52주 신고가를 쓴 적 없음\n"
-            "- 카드를 누르면 네이버 증권이 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
     p = _nh_params()
-    cand = data.nh_candidates(df, histories, quotes, p)
+    _NH_FADE[0] = p["fade_warn"]
+    codes = data.nh_prefilter(df, p)
+    ctup = tuple(sorted(codes))
+    nxt, nxt_err = load_nxt_quotes(ctup) if ctup else ({}, None)
+    official = load_official_52w_cand(ctup) if ctup else {}
+    monthlies = load_monthlies(ctup, trim=False) if ctup else {}
+    st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
+                f'KRX {data.market_status(quotes)} · {_nxt_status(nxt)} · 국내 종목 전체</span></div>',
+                unsafe_allow_html=True)
+    with st.expander("읽는 법 · 판정 기준"):
+        st.markdown(
+            "- **기준가** = 오늘을 뺀 직전 52주(250거래일) 장중 최고가. 네이버 공식 52주 최고가가 더 높으면(오늘 쓴 값 제외) 공식값을 써요.\n"
+            "- **지금 가격** = KRX 실시간. 장 마감 뒤 넥스트레이드 애프터마켓(15:40~20:00)·개장 전 프리마켓(08:00~08:50) 체결이 "
+            "더 최근이면 **넥장 가격**으로 판정해요. 오늘 고가에도 넥장 고가를 넣어요.\n"
+            "- **돌파 유지** = 오늘 고가가 기준가를 넘었고 지금 가격도 위. 장 마감 뒤 KRX 종가도 위면 **종가 확정**, 장중이면 **미확정**. "
+            "오늘 고가에서 많이 밀리면 카드에 '고가서 -x%'가 붙어요.\n"
+            "- **오늘 찍고 밀림** = 오늘 고가는 넘었지만 지금은 기준가 아래(종가는 돌파했는데 넥장에서 밀린 경우 포함).\n"
+            "- **고점 후 밀림** = 최근 10거래일 안에 52주 고점을 찍었고 지금은 그 고점 아래. 다시 넘어야 진짜 돌파예요.\n"
+            "- **임박/근접/관찰** = 기준가까지 남은 % (기본 2% / 7% / 15%).\n"
+            "- **역사적 신고가** = 기준가가 상장 이후 최고가(월봉+일봉)와 같음 → 위에 매물대가 없는 자리. "
+            "**52주 신고가** = 1년 고점이지만 더 위에 예전 고점이 있음(카드에 '역사 고점까지 %'). "
+            "월봉을 아직 못 받은 종목은 '역사 확인 중'.\n"
+            "- **⚠️ 일봉 지연** = 시세의 전일 종가가 일봉과 안 맞아 하루 넘게 늦은 일봉 → 판정을 믿을 수 없어 위 네 칸에서 뺐어요.\n"
+            "- **돌파권** = 임박·근접 + 거래대금 1.5배↑ + RS 80↑ · **신선 후보** = 돌파·터치·임박·근접 + 같은 조건 + 최근 60거래일 신고가 없음.\n"
+            "- 카드를 누르면 앱 안 차트가 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
+    if nxt_err:
+        st.caption(f"⚠️ {nxt_err} — 이번엔 KRX 시세로만 판정했어요.")
+    cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, monthlies=monthlies, codes=codes)
     if cand.empty:
         st.info("지금 조건에 맞는 신고가 후보가 없어요.")
         return
 
     masks = {"신선 후보": cand["fresh"], "돌파권": cand["section"] == "돌파권",
-             "돌파 중": cand["nh_state"] == "돌파", "터치 후 밀림": cand["nh_state"] == "터치"}
+             "돌파 중": cand["section"] == "돌파 중", "찍고 밀림": cand["section"] == "찍고 밀림"}
     boxes = []
     for sec, icon, color, desc in NHC_SECTIONS:
         sub = cand[masks[sec]]
@@ -5324,20 +5423,31 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
             f'<span class="cnt" style="color:{color}">{len(sub)}</span></div><div class="nh-box-d">{desc}</div></div>'
             f'<div class="nh-box-b">{body}{more}</div></div>')
     st.markdown(f'<div class="nh-grid">{"".join(boxes)}</div>', unsafe_allow_html=True)
+    lag = cand[cand["data_lag"].map(_is_true)]
+    if len(lag):
+        st.caption(f"⚠️ 일봉이 늦게 들어온 {len(lag)}종목은 판정에서 뺐어요: "
+                   + ", ".join(lag["name"].astype(str).head(15)) + (" …" if len(lag) > 15 else "")
+                   + " (다음 새로고침에 일봉을 다시 받아요)")
 
     # ── 상세 후보 리스트 ──
     st.markdown('<div class="nh-head"><b style="font-size:1.15rem">상세 후보 리스트</b></div>', unsafe_allow_html=True)
     counts = cand["nh_state"].value_counts()
     opts = ["전체"] + list(data.NHC_STATES)
-    c1, c2, c3 = st.columns([4, 1.2, 1.4])
-    pick = c1.segmented_control("상태", opts, default="전체", key="nhc_pick", label_visibility="collapsed",
-                                format_func=lambda s: f"{s} {len(cand) if s == '전체' else int(counts.get(s, 0))}")
-    sort_by = c2.selectbox("정렬", ["고가까지", "등락률", "거래대금 배수", "RS", "ATR%"], key="nhc_sort",
+    c1, c2, c3, c4 = st.columns([4.2, 1.3, 1.2, 1.4])
+    pick = c1.segmented_control("상태", opts, default="전체", key="nhc_pick2", label_visibility="collapsed",
+                                format_func=lambda s: f"{NHC_LABEL.get(s, s)} {len(cand) if s == '전체' else int(counts.get(s, 0))}")
+    kind = c2.selectbox("구분", ["전체", "역사적", "52주"], key="nhc_kind", label_visibility="collapsed",
+                        format_func=lambda s: {"전체": "신고가 구분 전체", "역사적": "역사적 신고가만", "52주": "52주 신고가만"}[s])
+    sort_by = c3.selectbox("정렬", ["상태순", "등락률", "거래대금 배수", "RS", "ATR%"], key="nhc_sort2",
                            label_visibility="collapsed")
-    q = c3.text_input("종목·코드 검색", key="nhc_q", placeholder="🔍 종목·코드 검색", label_visibility="collapsed")
+    q = c4.text_input("종목·코드 검색", key="nhc_q", placeholder="🔍 종목·코드 검색", label_visibility="collapsed")
     v = cand if pick in (None, "전체") else cand[cand["nh_state"] == pick]
+    if kind == "역사적":
+        v = v[v["nh_kind"] == "역사적"]
+    elif kind == "52주":
+        v = v[v["nh_kind"] != "역사적"]
     if q:
-        v = v[v["name"].str.contains(q, case=False, na=False) | v["code"].str.contains(q, na=False)]
+        v = v[v["name"].str.contains(q, case=False, na=False, regex=False) | v["code"].str.contains(q, na=False, regex=False)]
     key = {"등락률": "change", "거래대금 배수": "tv_ratio", "RS": "rs", "ATR%": "atr_pct"}.get(sort_by)
     if key:
         v = v.sort_values(key, ascending=False, na_position="last")
@@ -5348,27 +5458,35 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     for i, (_, r) in enumerate(v.head(150).iterrows(), 1):
         val, lab = _dist_html(r)
         brk = r["nh_state"] == "돌파"
+        lag_b = '<span class="nh-kind lag">⚠️ 지연</span>' if _is_true(r.get("data_lag")) else ""
+        src = "" if r.get("price_src") == "KRX" else f'<small>{html.escape(str(r["price_src"]))}</small>'
+        ref_d = _md(r.get("ref_date")) if _md(r.get("ref_date")) else ("공식" if r.get("ref_src") == "네이버 공식" else "")
         rows.append(
             f'<tr><td class="c rk hide-m">{i}</td>'
             f'<td class="l nm"><a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>'
-            f'<small>{r["code"]}</small></td>'
-            f'<td class="l hide-m">{html.escape(str(r["group"]))}</td>'
-            f'<td class="c"><span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span></td>'
+            f'<small>{r["code"]} · {html.escape(str(r["group"]))}</small></td>'
+            f'<td class="c"><span class="nh-pill s-{r["nh_state"]}">{NHC_LABEL[r["nh_state"]]}</span>'
+            f'<small>{html.escape(_s(r.get("confirm")))}</small></td>'
+            f'<td class="c">{_kind_badge(r)}{lag_b}</td>'
             f'<td class="sp"><div class="sp-lab">{val}<span>{lab}</span></div>'
             f'{_spark_svg(r["spark"], r["ref_high"], brk)}</td>'
-            f'<td class="hide-m">{_pct(r["atr_pct"])}</td>'
-            f'<td><b class="px">{r["price"]:,.0f}원</b><small>{r["ref_high"]:,.0f}원</small></td>'
+            f'<td><b class="px">{r["nh_price"]:,.0f}원</b>{src}</td>'
+            f'<td><b class="px">{r["ref_high"]:,.0f}원</b><small>{ref_d}</small></td>'
+            f'<td class="hide-m"><b class="px">{r["peak"]:,.0f}원</b><small>{_md(r["peak_date"])}'
+            f'{_ago_txt(r)}</small></td>'
             f'<td><b>{_chg_html(r["change"])}</b></td>'
-            f'<td><b class="px">{_tv_eok(r["tv_today"])}</b><small>20평균 '
+            f'<td class="hide-m"><b class="px">{_tv_eok(r["tv_today"])}</b><small>20평균 '
             f'{"-" if pd.isna(r["tv_ratio"]) else format(r["tv_ratio"], ".1f") + "배"}</small></td>'
             f'<td><b class="rs">{_n(r["rs"])}</b><small>1M {_n(r["rs_1m"])}</small></td></tr>')
-    head = ('<tr><th class="c hide-m">순위</th><th class="l">종목</th><th class="l hide-m">섹터</th><th class="c">상태</th>'
-            '<th>고가까지</th><th class="hide-m">ATR%</th><th>현재가 / 52주고가</th><th>등락률</th><th>거래대금</th><th>RS</th></tr>')
+    head = ('<tr><th class="c hide-m">순위</th><th class="l">종목</th><th class="c">상태</th><th class="c">신고가 구분</th>'
+            '<th>기준·고점 대비</th><th>지금 가격</th><th>기준가(직전 52주)</th><th class="hide-m">52주 고점</th>'
+            '<th>등락률</th><th class="hide-m">거래대금</th><th>RS</th></tr>')
     st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>',
                 unsafe_allow_html=True)
     if len(v) > 150:
         st.caption(f"앞 150개만 보여줘요(전체 {len(v)}개). 상태 필터나 검색으로 좁혀 보세요.")
-    st.caption("52주고가 = 오늘을 뺀 직전 250거래일 최고가(돌파 판정 기준가) · 스파크라인은 최근 120거래일 종가, 점선이 기준가")
+    st.caption("기준가 = 오늘을 뺀 직전 250거래일 장중 최고가(돌파 판정선) · 52주 고점 = 오늘 포함 · "
+               "스파크라인은 최근 120거래일 종가, 점선이 기준가 · 등락률은 지금 가격(넥장 포함) 기준")
 
 
 # ─────────────────────────── 💥 거래량 폭발 ───────────────────────────
