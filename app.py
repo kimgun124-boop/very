@@ -25,6 +25,7 @@ import reports
 import stocks as stock_list
 import theme
 import chart_draw
+import recovery
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
@@ -4054,6 +4055,229 @@ def render_engine(df: pd.DataFrame, trends, leaders: set, fins=None):
                     "- 올해(E) 영업이익이 작년보다 늘지 않은 종목은 빼요. 매수 판단은 🎯 매수 후보 원칙으로.")
 
 
+# ─────────────────────────── 🌱 회복 리더 ───────────────────────────
+def _rmet(col, label, value, delta=None, help=None):
+    """화살표 없는 작은 설명 줄이 달린 숫자 칸."""
+    try:
+        col.metric(label, value, delta, delta_color="off", delta_arrow="off", help=help)
+    except TypeError:          # 예전 Streamlit
+        col.metric(label, value, delta, delta_color="off", help=help)
+
+
+def _rec_idx_chart(ph: dict):
+    """지수 최근 흐름 + 고점·저점 표시."""
+    c = ph["series"].tail(max(ph["since"] + 40, 90))
+    d = pd.DataFrame({"date": c.index, "close": c.values})
+    d["ma20"] = ph["series"].rolling(20).mean().reindex(c.index).values
+    base = alt.Chart(d).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0)))
+    line = base.mark_line(color="#5B47F5", strokeWidth=2).encode(
+        y=alt.Y("close:Q", title=None, scale=alt.Scale(zero=False)),
+        tooltip=[alt.Tooltip("date:T", title="날짜", format="%Y-%m-%d"), alt.Tooltip("close:Q", title="지수", format=",.2f")])
+    ma = base.mark_line(color="#2E9D5B", strokeDash=[4, 3], strokeWidth=1.3).encode(y="ma20:Q")
+    pts = pd.DataFrame({"date": [ph["high_date"], ph["low_date"]], "close": [ph["high"], ph["low"]],
+                        "lab": [f"고점 {ph['high']:,.0f}", f"저점 {ph['low']:,.0f}"]})
+    pts = pts[pts["date"] >= c.index[0]]
+    mk = alt.Chart(pts).mark_point(size=80, filled=True, color="#F2B134").encode(x="date:T", y="close:Q")
+    tx = alt.Chart(pts).mark_text(dy=-12, fontSize=12, fontWeight=700, color="#8A5A00").encode(x="date:T", y="close:Q", text="lab:N")
+    st.altair_chart((line + ma + mk + tx).properties(height=220, width="container"))
+
+
+def _rec_flow_chart(daily: pd.DataFrame, low_date):
+    d = daily.tail(20).melt(id_vars="date", value_vars=["외국인", "기관"], var_name="주체", value_name="억")
+    d["억"] = pd.to_numeric(d["억"], errors="coerce")
+    d["day"] = pd.to_datetime(d["date"]).dt.strftime("%m/%d")
+    order = list(dict.fromkeys(d.sort_values("date")["day"]))
+    bars = alt.Chart(d).mark_bar(cornerRadius=2).encode(
+        x=alt.X("day:O", title=None, sort=order, axis=alt.Axis(labelAngle=0, labelOverlap=True)),
+        xOffset="주체:N",
+        y=alt.Y("억:Q", title="순매수(억)"),
+        color=alt.Color("주체:N", scale=alt.Scale(domain=["외국인", "기관"], range=["#5B47F5", "#F2B134"]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("date:T", title="날짜", format="%m/%d"), "주체:N", alt.Tooltip("억:Q", format=",.0f")])
+    layers = [bars]
+    if low_date is not None and low_date >= pd.to_datetime(d["date"]).min():
+        after = [x for x, dt in zip(d["day"], pd.to_datetime(d["date"])) if dt >= low_date]
+        if after:
+            layers.append(alt.Chart(pd.DataFrame({"day": [after[0]]})).mark_rule(color="#C0262E", strokeDash=[4, 3], strokeWidth=2)
+                          .encode(x=alt.X("day:O", sort=order)))
+    st.altair_chart(alt.layer(*layers).properties(height=200, width="container"))
+
+
+def _rec_scatter(sec: pd.DataFrame, idx_fall: float | None):
+    d = sec.copy()
+    d["lab"] = ""
+    d.loc[d.index[:6], "lab"] = d["sector"].head(6)
+    kinds = ["🌱 덜 빠지고 먼저 오름", "🚀 많이 빠졌지만 빨리 회복", "🛡️ 버텼지만 회복은 느림", "🥀 많이 빠지고 회복도 느림"]
+    base = alt.Chart(d).encode(
+        x=alt.X("fall:Q", title="하락 구간 등락(%) → 오른쪽일수록 덜 빠짐", scale=alt.Scale(zero=False)),
+        y=alt.Y("excess:Q", title="저점 이후 지수 대비(%p) ↑ 빨리 회복", scale=alt.Scale(zero=False)))
+    pts = base.mark_circle(opacity=0.8, stroke="#fff", strokeWidth=1).encode(
+        size=alt.Size("n:Q", legend=None, scale=alt.Scale(range=[60, 600])),
+        color=alt.Color("kind:N", scale=alt.Scale(domain=kinds, range=["#1B8A4B", "#D6333B", "#7FA7C9", "#B8C2C9"]),
+                        legend=alt.Legend(orient="top", title=None, columns=2)),
+        tooltip=[alt.Tooltip("sector:N", title="섹터"), alt.Tooltip("score:Q", title="새싹 점수", format=".0f"),
+                 alt.Tooltip("fall:Q", title="하락 구간(%)", format="+.1f"), alt.Tooltip("reb:Q", title="저점 이후(%)", format="+.1f"),
+                 alt.Tooltip("excess:Q", title="지수 대비(%p)", format="+.1f"), alt.Tooltip("n:Q", title="종목 수"),
+                 alt.Tooltip("top:N", title="먼저 오른 종목")])
+    txt = base.mark_text(dy=-11, fontSize=11, fontWeight=600, color="#374151").encode(text="lab:N")
+    rules = [alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#9CA3AF", strokeDash=[3, 3]).encode(y="y:Q")]
+    if idx_fall is not None:
+        rules.append(alt.Chart(pd.DataFrame({"x": [idx_fall]})).mark_rule(color="#9CA3AF", strokeDash=[3, 3]).encode(x="x:Q"))
+    st.altair_chart(alt.layer(*rules, pts, txt).properties(height=420, width="container"))
+
+
+def render_recovery(df: pd.DataFrame, histories: dict, trends):
+    _sec_h("🌱 회복 리더", "물살이 빠진 자리에서 가장 먼저 싹트는 섹터·종목")
+    c1, c2, c3 = st.columns([1, 1.4, 1])
+    idx_name = c1.segmented_control("기준 지수", list(data.MARKETS), default="코스피", required=True,
+                                    key="rec_idx", width="stretch") or "코스피"
+    lb_lab = c2.segmented_control("저점 찾는 기간", list(recovery.LOOKBACKS), default="60거래일", required=True,
+                                  key="rec_lb", width="stretch") or "60거래일"
+    by_lab = c3.segmented_control("묶는 기준", ["세부 분류", "산업"], default="세부 분류", required=True,
+                                  key="rec_by", width="stretch") or "세부 분류"
+    sym = data.MARKETS[idx_name]
+    idx_df = load_indexes().get(sym, (data.empty_frame(), None))[0]
+    ph = recovery.market_phase(idx_df, recovery.LOOKBACKS[lb_lab])
+    if ph is None:
+        st.info("지수 일봉을 아직 못 받았어요. 잠시 뒤 다시 열어 주세요.")
+        return
+
+    # ① 시장 국면
+    st.markdown(f'<div style="border-left:5px solid {ph["color"]};background:#FAFAFD;border-radius:10px;padding:10px 14px;'
+                f'margin:4px 0 10px"><b style="font-size:18px;color:{ph["color"]}">{ph["label"]}</b>'
+                f'<span style="color:#6B7280;margin-left:10px">{idx_name} 기준</span>'
+                f'<div style="margin-top:4px;color:#374151">{html.escape(ph["advice"])}</div></div>', unsafe_allow_html=True)
+    m1, m2, m3, m4 = st.columns(4)
+    _rmet(m1, "하락 구간 낙폭", f"{ph['dd']:+.1f}%", f"{ph['high_date']:%m/%d} → {ph['low_date']:%m/%d}")
+    _rmet(m2, "저점 이후 반등", f"{ph['reb']:+.1f}%", f"저점 {ph['since']}거래일 전")
+    _rmet(m3, "하락분 회복률", f"{ph['recov']:.0f}%" if ph["recov"] is not None else "-",
+              f"고점까지 {-ph['now_vs_high']:.1f}% 남음" if ph["now_vs_high"] < 0 else "전고점 회복")
+    _rmet(m4, "이동평균선", ("20일선 위" if ph["above20"] else "20일선 아래"),
+              ("60일선 위" if ph["above60"] else "60일선 아래") if ph["above60"] is not None else None)
+    _rec_idx_chart(ph)
+
+    # ② 시장 수급: 외국인이 돌아오는가
+    _sec_h("🧲 수급이 돌아오는가", f"{idx_name} 시장 전체 외국인·기관 순매수(억원) · 빨간 점선 = 지수 저점")
+    fl = recovery.market_flow((load_flows() or {}).get(idx_name), ph["low_date"])
+    if fl is None:
+        st.info("시장 투자자별 순매수를 아직 못 받았어요.")
+    else:
+        f1, f2, f3, f4 = st.columns(4)
+        _rmet(f1, "외국인 최근 5일", f"{fl['외국인5']:+,.0f}억",
+                  f"그 전 5일 {fl['외국인5_prev']:+,.0f}억" if fl.get("외국인5_prev") is not None else None)
+        _rmet(f2, "기관 최근 5일", f"{fl['기관5']:+,.0f}억",
+                  f"그 전 5일 {fl['기관5_prev']:+,.0f}억" if fl.get("기관5_prev") is not None else None)
+        sd = fl.get("외국인_since_days", 0)
+        _rmet(f3, "저점 이후 외국인+기관", f"{fl.get('외국인_since', 0) + fl.get('기관_since', 0):+,.0f}억",
+                  f"{sd}거래일" + (" (최근 30일분)" if fl.get("since_partial") else ""))
+        fs, is_ = fl["외국인_streak"], fl["기관_streak"]
+        _rmet(f4, "연속 순매수", f"외국인 {fs:+d}일", f"기관 {is_:+d}일",
+                  help="+는 연속 순매수, −는 연속 순매도 일수")
+        sig = []
+        if fl["foreign_back"]:
+            sig.append("🟢 외국인이 돌아오는 신호(3일 연속 순매수 또는 5일 합 순매도→순매수 전환)")
+        if fl["inst_back"]:
+            sig.append("🟢 기관 순매수 전환")
+        if not sig:
+            sig.append("⚪ 아직 외국인·기관이 뚜렷하게 돌아오지 않았어요")
+        st.caption(" · ".join(sig))
+        _rec_flow_chart(fl["daily"], ph["low_date"])
+
+    # ③ 섹터: 누가 먼저 싹트나
+    kr = df[df["code"].map(data.is_kr) & df["price"].notna()]
+    closes = data._closes_frame(kr, histories, kr["code"])
+    idx_reb = recovery.index_ret(idx_df, ph["low_date"])
+    idx_fall = ph["dd"]
+    sdf = recovery.stock_recovery(kr, closes, trends, ph["high_date"], ph["low_date"], idx_reb)
+    if sdf.empty:
+        st.info("종목 일봉이 아직 부족해요. 잠시 뒤 다시 열어 주세요.")
+        return
+    by = "group" if by_lab == "세부 분류" else "sector"
+    sec = recovery.sector_recovery(sdf, by, min_n=2, idx_fall=idx_fall)
+    _sec_h("🌿 먼저 싹트는 섹터",
+           f"같은 날짜 기준 · 하락 구간 {ph['high_date']:%m/%d}→{ph['low_date']:%m/%d}, 회복 구간 {ph['low_date']:%m/%d}→오늘 · "
+           f"{idx_name} 저점 이후 {idx_reb:+.1f}%" if idx_reb is not None else "")
+    if trends is None:
+        st.caption("⏳ 종목별 외국인·기관 수급을 받는 중이에요(처음 1~2분). 받기 전엔 수급 점수는 중간값으로 계산해요.")
+    if sec.empty:
+        st.info("섹터로 묶을 종목이 부족해요.")
+    else:
+        lead = sec.iloc[0]
+        k1, k2, k3, k4 = st.columns(4)
+        _rmet(k1, "새싹 점수 1위", lead["sector"], f"점수 {lead['score']:.0f}")
+        n_g = int((sec["kind"] == "🌱 덜 빠지고 먼저 오름").sum())
+        _rmet(k2, "덜 빠지고 먼저 오른 섹터", f"{n_g}개", f"전체 {len(sec)}개 중")
+        _rmet(k3, "저점 이후 신고가 종목", f"{int(sdf['nh'].sum())}개", "직전 250일 최고 종가 돌파")
+        _rmet(k4, "지수보다 빨리 오른 종목", f"{(sdf['excess'] > 0).mean() * 100:.0f}%", f"{len(sdf)}종목 중")
+        _rec_scatter(sec, idx_fall)
+        st.caption("오른쪽 위 칸 = 지수보다 덜 빠지고 저점 이후 지수보다 빨리 오른 섹터(가장 먼저 싹트는 곳). "
+                   "세로 점선 = 지수 낙폭, 가로 점선 = 지수와 같은 반등. 원 크기 = 종목 수.")
+        show_all = st.toggle("모든 섹터 보기", value=False, key="rec_all")
+        v = sec if show_all else sec.head(20)
+        view = pd.DataFrame({
+            "섹터": v["sector"], "새싹 점수": v["score"], "유형": v["kind"],
+            "하락 구간": v["fall"], "저점 이후": v["reb"], "지수 대비": v["excess"], "하락 전 대비": v["vs_hi"],
+            "오른 종목": v["breadth"], "20일선 위": v["above20"], "저점 후 신고가": v["n_nh"],
+            "외+기 저점 후(억)": v["fi"], "외+기 사는 종목": v.apply(lambda r: f"{r['n_buy']}/{r['fi_n']}", axis=1),
+            "종목 수": v["n"], "먼저 오른 종목": v["top"],
+        })
+        sign = lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}; font-weight: 600"  # noqa: E731
+        st.dataframe(
+            view.style.format({"하락 구간": "{:+.1f}%", "저점 이후": "{:+.1f}%", "지수 대비": "{:+.1f}%p", "하락 전 대비": "{:+.1f}%",
+                               "오른 종목": "{:.0f}%", "20일선 위": "{:.0f}%", "외+기 저점 후(억)": _eok_num}, na_rep="-")
+            .map(sign, subset=["하락 구간", "저점 이후", "지수 대비", "하락 전 대비", "외+기 저점 후(억)"]),
+            hide_index=True, height=min(620, 36 * (len(view) + 1) + 4),
+            column_config={"섹터": st.column_config.Column(pinned=True),
+                           "새싹 점수": st.column_config.ProgressColumn("새싹 점수", min_value=0, max_value=100, format="%.0f"),
+                           "하락 전 대비": st.column_config.Column(help="지수 고점 날의 가격 대비 지금. 0% 이상이면 하락분을 다 되찾은 것"),
+                           "오른 종목": st.column_config.Column(help="저점 이후 오른 종목 비율(확산)")})
+
+    # ④ 종목: 누가 먼저 일어서나
+    _sec_h("🌱 먼저 일어서는 종목", "지수 대비 반등 · 저점 이후 외국인+기관 · 신고가 근접")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    opts = ["전체"] + (sec["sector"].tolist() if not sec.empty else [])
+    pick = c1.selectbox("섹터", opts, key="rec_pick", label_visibility="collapsed")
+    min_cap = c2.number_input("시총 최소(억)", 0, 100000, 3000, step=500, key="rec_cap")
+    only_buy = c3.toggle("외+기 순매수만", value=False, key="rec_buy")
+    t = sdf if pick == "전체" else sdf[sdf[by] == pick]
+    t = t[(t["cap"].isna()) | (t["cap"] >= min_cap * 1e8)]
+    if only_buy:
+        t = t[t["fi"] > 0]
+    t = t.sort_values("score", ascending=False).head(40)
+    if t.empty:
+        st.info("조건에 맞는 종목이 없어요.")
+    else:
+        view = pd.DataFrame({
+            "종목": t["name"] + t["nh"].map(lambda x: " 🌱" if x else ""), "점수": t["score"], "섹터": t[by],
+            "현재가": t["price"], "오늘": t["change"], "하락 구간": t["fall"], "저점 이후": t["reb"], "지수 대비": t["excess"],
+            "하락 전 대비": t["vs_hi"], "신고가까지": t["to_high"], "외+기 저점 후(억)": t["fi"],
+            "외국인 연속": t["streak_f"], "기관 연속": t["streak_i"],
+        })
+        sign = lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}; font-weight: 600"  # noqa: E731
+        st.dataframe(
+            view.style.format({"점수": "{:.0f}", "현재가": "{:,.0f}", "오늘": "{:+.2f}%", "하락 구간": "{:+.1f}%",
+                               "저점 이후": "{:+.1f}%", "지수 대비": "{:+.1f}%p", "하락 전 대비": "{:+.1f}%", "신고가까지": "{:+.1f}%",
+                               "외+기 저점 후(억)": _eok_num, "외국인 연속": "{:+d}일", "기관 연속": "{:+d}일"}, na_rep="-")
+            .map(sign, subset=["오늘", "하락 구간", "저점 이후", "지수 대비", "하락 전 대비", "외+기 저점 후(억)", "외국인 연속", "기관 연속"])
+            .map(_to_high_color, subset=["신고가까지"]),
+            hide_index=True, height=min(760, 36 * (len(view) + 1) + 4),
+            column_config={"종목": st.column_config.Column(pinned=True),
+                           "점수": st.column_config.ProgressColumn("점수", min_value=0, max_value=100, format="%.0f")})
+        st.caption("🌱 = 저점 이후 직전 250거래일 최고 종가를 넘은 종목(가장 먼저 고개 든 종목). "
+                   "외+기 저점 후 = 지수 저점 다음 날부터 오늘까지 외국인+기관 순매수 합(종목 수급은 최근 20거래일까지만 받아요).")
+    with st.expander("ℹ️ 계산 기준"):
+        st.markdown(
+            f"- **저점** = 최근 {lb_lab} 중 {idx_name} 최저 종가, **고점** = 그 저점 전 최고 종가. 모든 섹터·종목을 이 두 날짜로 똑같이 잘라 비교해요.\n"
+            "- **국면**: 낙폭 5% 미만 = 큰 하락 없음 · 저점이 2거래일 이내이고 20일선 아래 = 물살 빠지는 중 · "
+            "반등 3% 미만(또는 20일선 아래·회복률 30% 미만) = 바닥 다지기 · 회복하다 20일선 아래로 쉬면 = 숨 고르기 · "
+            "회복률 50%↑ & 60일선 위 = 회복 진행 · 나머지 = 새싹 돋는 중\n"
+            "- **섹터 새싹 점수** = 섹터끼리 백분위 가중 평균: 지수 대비 반등 40 · 저점 후 외+기 순매수(시총 대비) 25 · "
+            "하락 전 고점 대비 지금 20 · 오른 종목 비율 15. 수익률은 시총가중. (비중은 제가 정한 값)\n"
+            "- **종목 점수** = 지수 대비 반등 40 · 외+기 순매수(시총 대비) 30 · 저점 후 신고가(만점) 또는 신고가까지 가까운 정도 30\n"
+            "- 회복 초기엔 낙폭이 컸던 종목이 기술적 반등으로 위에 올 수 있어요. **유형**과 **신고가까지**를 같이 보고, "
+            "매수 판단은 🎯 매수 후보의 원칙으로 해요.")
+
+
 # ─────────────────────────── 🧭 시나리오 ───────────────────────────
 SCN_COLOR = {1: "#1B8A4B", 2: "#C27C0E", 2.5: "#A87400", 3: "#1B6FD6", 4: "#C0262E", 0: "#51616C", None: "#51616C"}
 
@@ -5371,7 +5595,7 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🧭 시나리오", "🪃 눌림 타점"]
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
         try:
@@ -5380,7 +5604,7 @@ def render_board():
         except TypeError:          # 예전 Streamlit
             tabs = st.tabs(names)
             lazy = False
-    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_scn, t_pb = tabs
+    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -5397,6 +5621,7 @@ def render_board():
         (t_money, lambda: render_money(df)),
         (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),
         (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
+        (t_rec, lambda: render_recovery(df, histories, trends_all)),
         (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
         (t_pb, lambda: render_pullback(df, histories, quotes)),
     ]

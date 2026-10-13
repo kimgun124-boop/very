@@ -275,6 +275,8 @@ def render(fig, code: str, tf: str, currency: str = "KRW", key: str = "cc") -> b
     try:
         import streamlit.components.v1 as components
     except Exception:
+        components = None
+    if components is None and not hasattr(st, "iframe"):
         return False
     dec = 0 if currency in ("KRW", "JPY") else 2
     cfg = {"code": str(code), "tf": tf, "dec": dec, "krx": currency == "KRW", "key": key}
@@ -289,7 +291,10 @@ def render(fig, code: str, tf: str, currency: str = "KRW", key: str = "cc") -> b
             .replace("__FIG__", fig_json))
     height = int((fig.layout.height or 640) + _TOOLBAR_H)
     try:
-        components.html(page, height=height, scrolling=False)
+        if components is not None and hasattr(components, "html"):
+            components.html(page, height=height, scrolling=False)
+        else:                               # components.html이 없어진 새 Streamlit
+            st.iframe(page, height=height)
     except Exception:
         return False
     return True
