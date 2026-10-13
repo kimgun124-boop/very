@@ -24,6 +24,7 @@ import holdings
 import reports
 import stocks as stock_list
 import theme
+import chart_draw
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
@@ -2406,9 +2407,13 @@ def candle_chart(code: str, currency: str = "KRW", quote: dict | None = None, hi
         return
     bars = data.chart_with_live(bars, quote, tf)
     fig = candle_fig(bars, tf, periods[per], "이동평균" in opts, "거래량" in opts, high52, currency, "거래대금" in opts)
-    st.plotly_chart(fig, key=f"{key}_fig", config={"displaylogo": False, "scrollZoom": True,
-                                                   "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
-    st.caption("드래그로 옮기고, 휠·두 손가락으로 확대해요. 더블클릭하면 원래대로. 거래대금은 평균가×거래량으로 계산한 추정치예요. "
+    # 차트 위에 수평선·추세선·형광펜을 그리고 지울 수 있어요(그린 것은 이 브라우저에 종목별로 저장)
+    drawn = chart_draw.render(fig, code, tf, currency, key=key)
+    if not drawn:
+        st.plotly_chart(fig, key=f"{key}_fig", config={"displaylogo": False, "scrollZoom": True,
+                                                       "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
+    st.caption(("위 도구로 수평선·추세선·형광펜을 그리고 지우개로 지워요. 그린 것은 이 브라우저에 종목별로 저장돼요(PC·휴대폰 따로). "
+                if drawn else "") + "더블클릭하면 원래대로. 거래대금은 평균가×거래량으로 계산한 추정치예요. "
                + ("마지막 봉은 실시간 시세로 갱신돼요." if quote else "해외 종목은 야후 일봉 기준이에요."))
 
 
