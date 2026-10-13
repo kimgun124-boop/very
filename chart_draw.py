@@ -278,6 +278,11 @@ def render(fig, code: str, tf: str, currency: str = "KRW", key: str = "cc") -> b
         return False
     dec = 0 if currency in ("KRW", "JPY") else 2
     cfg = {"code": str(code), "tf": tf, "dec": dec, "krx": currency == "KRW", "key": key}
+    # Streamlit 화면은 축 글자 자리(여백)를 알아서 넓혀 줬는데, 직접 그릴 때는 직접 켜야 날짜·가격 글자가 안 잘려요
+    import copy
+    fig = copy.deepcopy(fig)
+    fig.update_xaxes(automargin=True)
+    fig.update_yaxes(automargin=True)
     fig_json = fig.to_json().replace("</", "<\\/")
     page = (_HTML.replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
             .replace("__VER__", _PLOTLYJS_VER)
