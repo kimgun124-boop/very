@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-10-10-research"
+HOLDINGS_VERSION = "2026-10-17-monitor"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
@@ -885,3 +885,211 @@ def ai_news_summary(api_key: str, model: str, name: str, judged: dict, items: li
         except ValueError:
             return None, f"AI 요약 실패({r.status_code})"
     return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip(), ""
+
+
+# ─────────────────────────── 👀 보유 살피기(실시간 점검 + AI 판단) ───────────────────────────
+def volume_pace(volume, vol50, now: datetime | None = None, status: str | None = None) -> float | None:
+    """오늘 누적 거래량이 '지금 시각까지 평소에 쌓였을 양'의 몇 배인지.
+    장중에는 9:00~15:30(390분) 중 지난 시간 비율로 50일 평균을 나눠 비교해요(장 초반 10분은 과대 추정을 막으려 10분으로 고정)."""
+    v, base = _f(volume), _f(vol50)
+    if not v or not base:
+        return None
+    now = now or now_kst()
+    mins = (now.hour * 60 + now.minute) - 9 * 60
+    open_ = (status == "OPEN") or (status is None and now.weekday() < 5 and 0 <= mins <= 390)
+    frac = min(1.0, max(10, mins) / 390) if open_ and mins < 390 else 1.0
+    return v / (base * frac)
+
+
+def news_is_today(t: str, now: datetime | None = None) -> bool:
+    """뉴스 시각('10/17 09:30')이 오늘인지."""
+    now = now or now_kst()
+    return bool(t) and str(t).startswith(now.strftime("%m/%d"))
+
+
+def flow_snapshot(flow: pd.DataFrame | None) -> dict:
+    """수급 칸: 최근 거래일(날짜 표시)·5일·20일 외국인/기관, 연속 순매수 일수."""
+    out = {"date": None, "rows": [], "streak": {}}
+    if flow is None or flow.empty or "외국인금액" not in flow:
+        return out
+    f = flow.tail(20)
+    last = f.iloc[-1]
+    out["date"] = pd.Timestamp(last["date"]).strftime("%m/%d")
+    for k in ("외국인", "기관", "개인"):
+        col = f"{k}금액"
+        if col not in f:
+            continue
+        out["rows"].append((k, _f(last[col]), float(f[col].tail(5).sum()), float(f[col].sum())))
+    for k in ("외국인", "기관"):
+        n, sign = 0, None
+        for v in reversed(f[k].tolist()):
+            if v is None or pd.isna(v) or v == 0:
+                break
+            if sign is None:
+                sign = v > 0
+            elif (v > 0) != sign:
+                break
+            n += 1
+        out["streak"][k] = (n if sign else -n) if n else 0
+    return out
+
+
+AI_JUDGE_RULES = """[효석 매매 원칙 — 판단의 기준. 원칙이 AI의 의견보다 항상 우선]
+- 우선순위: 리스크관리 > 멘탈관리 > 종목관리 > 타점관리. "시장은 예측이 아니라 대응", "손실은 짧게 수익은 길게".
+- 1R 손절 = 평단 -8%(ATR이 8% 이상이면 ATR까지 넓히되 계좌 손실은 1.5% 이내). 손절선 이탈은 예외 없이 정리 검토.
+- 물타기 절대 금지. 추가 매수는 수익 중인 종목의 새 돌파(불타기)에서만, 추가 후 손절선만 새 평단 기준으로 올리고 3R 익절가는 처음 가격 그대로.
+- 3R(+24%)에서 절반 익절, 나머지는 일봉 5일선이 50일선에 닿으면 정리. R 사다리: 2R이면 손절선 본전, 4R이면 +1R(또는 설정대로).
+- 추세 이탈은 상승 속도에 맞는 이평선으로: 막 돌파 = 5일선, 추세 종목 = 20일선, 느린 종목 = 50일선. 추세가 꺾였다는 판단은 느리게, 급한 악재에는 빠르게.
+- 클라이맥스(신고가에서 사상 최대 거래량·윗꼬리, 섹터 동반) 또는 고점권 -10% 대량 음봉 = 비중 축소 신호.
+- 시장: 코스피·코스닥이 60일선 이하면 쉬는 장(신규·추가 매수 보류). 지수 물량일이 25일 중 4~5일이면 경계.
+- 주도섹터(신고가 2종목 이상) 안의 대장주(RS·시총·거래대금 1위)를 오래 끌고 가는 게 핵심. RS는 70 이상이고 지수 RS보다 높아야.
+- 제일 중요한 건 펀더멘털: 영업이익이 늘지 않는 강세는 배제, 넘버스 없는 내러티브는 비중 축소.
+- 수급(외국인·기관 특히 연기금·투신)은 보너스. 가격은 오르는데 외국인+기관이 팔고 개인만 사면 경계.
+- 추세 계좌와 가치 계좌는 섞지 않음. 추세 계좌에서 '싸졌다'며 버티기·추가 매수 금지.
+- 가치 계좌 종목은 손절선이 아니라 가치우파(하락 멈춤·횡보·우상향) 확인 후 분할매수, 가치훼손이면 매도로 판단.
+"""
+
+AI_JUDGE_PROMPT = """너는 효석의 추세추종 원칙을 그대로 적용하는 보유 종목 점검 보조야. 예측하지 말고, 위 원칙과 아래 숫자·뉴스로
+'지금 원칙상 어떤 상태이고 어떻게 대응하는 게 원칙에 맞는지'만 판단해.
+규칙 점검표(앱이 계산한 판정)는 숫자 계산이 정확하니 손절선·3R·R 값은 그대로 써. 네가 더할 건 뉴스·수급·거래량·펀더멘털을 엮은 해석이야.
+원칙과 충돌하는 대응(물타기, 손절선 이탈 후 버티기, 쉬는 장 신규 매수)은 절대 권하지 마.
+반드시 아래 JSON 하나만 출력해(설명·코드블록 없이). 모든 값은 한국어, 문장은 짧게, 가격은 숫자로:
+{"state": "보유 유지 | 불타기 검토 | 절반 익절 | 나머지 정리 | 비중 축소 | 손절·정리 검토 | 관망·주의 중 하나",
+ "level": "green | purple | blue | yellow | orange | red 중 하나 (보유 유지=green, 불타기=purple, 익절=blue, 주의=yellow, 축소=orange, 손절·정리=red)",
+ "headline": "지금 상태 한 문장",
+ "confidence": "높음 | 보통 | 낮음",
+ "reasons": ["숫자를 넣은 근거 3~5개 — 추세·거래량·수급·펀더멘털·뉴스·시장"],
+ "now": ["지금 할 일 1~3개 — 손절선·익절가 같은 구체 가격 포함"],
+ "scenarios": [{"if": "예: 종가 85,000 이탈", "then": "원칙상 대응"}],
+ "news": "뉴스·리포트가 판단에 주는 영향 1~2문장(호재/악재/중립 표시)",
+ "diff": "앱의 규칙 판정과 다르게 본 점과 이유. 같으면 '규칙 판정과 같음'"}"""
+
+AI_JUDGE_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5-20251001")
+
+_M_LABELS = [("price", "현재가"), ("change", "오늘 등락률%"), ("high52", "52주 최고가"), ("to_high", "신고가까지%"),
+             ("days_since_high", "신고가 후 경과일"), ("bo_status", "돌파 유지/이탈"), ("bo_nth", "몇 번째 돌파"),
+             ("bo_days", "돌파 후 일수"), ("aligned", "정배열"), ("ma5", "5일선"), ("ma20", "20일선"), ("ma50", "50일선"),
+             ("ma5_vs_50", "5일선-50일선 괴리%"), ("dist_ma20", "20일선 괴리%"), ("atr_pct", "ATR%(20일)"), ("adx", "ADX"),
+             ("rs", "종합 RS"), ("rs_1m", "RS 1M"), ("ret_1m", "1개월 수익률%"), ("ret_3m", "3개월 수익률%"),
+             ("dcr_today", "오늘 종가 위치(DCR)"), ("htf", "HTF"), ("sector", "산업"), ("group", "세부 분류")]
+
+
+def _fmt_v(v) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "-"
+    if isinstance(v, (bool, np.bool_)):
+        return "예" if v else "아니오"
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return f"{float(v):,.2f}".rstrip("0").rstrip(".")
+    return str(v)[:60]
+
+
+def build_ai_payload(h: dict, m: dict, j: dict, ctx: dict, bars: pd.DataFrame | None, quote: dict | None,
+                     ev: dict | None, pace: float | None) -> str:
+    """AI에게 넘길 판단 재료(텍스트)."""
+    L = [f"[종목] {h.get('name')}({h.get('code')}) · 계좌: {h.get('account') or '추세'} · 매수일 {h.get('buy_date') or '-'}"
+         f" · 평단 {_fmt_v(h.get('avg'))} · 수량 {_fmt_v(h.get('qty'))} · 절반 익절함: {'예' if h.get('half_taken') else '아니오'}"
+         + (f" · 메모: {h['memo']}" if h.get("memo") else "")]
+    L.append(f"[규칙 판정] {j.get('verdict')} · 수익률 {_fmt_v(j.get('pnl'))}% · {_fmt_v(j.get('r'))}R · 매수 후 최고 {_fmt_v(j.get('max_r'))}R"
+             f" · 손절선 {_fmt_v(j.get('stop_price'))}(손절 기준 {_fmt_v(j.get('stop_pct'))}%, 여유 {_fmt_v(j.get('stop_dist'))}%)"
+             f" · 3R 목표 {_fmt_v(j.get('target3r'))}" + (f" · 점수 {j.get('grade')} {j.get('score')}점" if j.get("score") is not None else ""))
+    for st_, item, txt in j.get("checks") or []:
+        L.append(f"  - [{st_}] {item}: {txt}")
+    for key, title in (("fund", "펀더멘털"), ("flow", "수급 분석"), ("vol", "거래량 분석"), ("masters", "거장 관점")):
+        for st_, item, txt in j.get(key) or []:
+            L.append(f"  - [{title}·{st_}] {item}: {txt}")
+    if j.get("pyramid"):
+        p = j["pyramid"]
+        L.append(f"  - [불타기 점검] {p['n_ok']}/{p['n']} 충족: " + ", ".join(f"{n}{'✔' if ok else '✖'}" for n, ok, _ in p["conds"]))
+    if j.get("actions"):
+        L.append("  - [규칙상 행동] " + " / ".join(j["actions"]))
+    L.append("[지표] " + " · ".join(f"{lab} {_fmt_v(m.get(k))}" for k, lab in _M_LABELS if m.get(k) is not None))
+    if quote:
+        L.append(f"[실시간 시세] 현재가 {_fmt_v(quote.get('price'))} · 시가 {_fmt_v(quote.get('open'))} · 고가 {_fmt_v(quote.get('high'))}"
+                 f" · 저가 {_fmt_v(quote.get('low'))} · 전일 {_fmt_v(quote.get('prev'))} · 누적 거래량 {_fmt_v(quote.get('volume'))}"
+                 f" · 거래량 페이스(평소 이 시각 대비) {_fmt_v(pace)}배 · 장 상태 {quote.get('status') or '-'}")
+    if bars is not None and len(bars):
+        b = bars.tail(15)
+        L.append("[최근 15거래일 일봉: 날짜 시가 고가 저가 종가 거래량]")
+        for _, r in b.iterrows():
+            L.append(f"  {pd.Timestamp(r['date']):%m/%d} {_fmt_v(r['open'])} {_fmt_v(r['high'])} {_fmt_v(r['low'])} "
+                     f"{_fmt_v(r['close'])} {_fmt_v(r['volume'])}")
+    fl = flow_snapshot(m.get("_flow"))
+    if fl["rows"]:
+        L.append(f"[수급(억원 추정) 최근 거래일 {fl['date']} / 5일 / 20일] " + " · ".join(
+            f"{k} {_fmt_v(d)} / {_fmt_v(d5)} / {_fmt_v(d20)}" for k, d, d5, d20 in fl["rows"])
+                 + f" · 연속 순매수(음수=순매도) 외국인 {fl['streak'].get('외국인')}일 · 기관 {fl['streak'].get('기관')}일")
+    L.append(f"[시장] {ctx.get('market_text')} · 60일선 위: {ctx.get('market_ok')} · 지수 RS {ctx.get('idx_rs')}"
+             f" · 지수 물량일(25일) {ctx.get('dist_days')} · 변동성 장세: {ctx.get('vol_mode')}"
+             f" · 주도섹터: {', '.join(sorted(ctx.get('leaders') or [])) or '없음'}")
+    if ev:
+        if ev.get("news"):
+            L.append("[최근 뉴스 제목]")
+            L += [f"  - {x.get('time')} {x.get('source')}: {x.get('title')}" + (f" — {x['body'][:120]}" if x.get("body") else "")
+                  for x in ev["news"][:15]]
+        if ev.get("research"):
+            L.append("[증권사 리포트]")
+            L += [f"  - {x.get('time')} {x.get('source')}: {x.get('title')}" for x in ev["research"][:6]]
+    return "\n".join(L)
+
+
+def ai_judge(api_key: str, model: str | None, payload: str, timeout: int = 90) -> tuple[dict | None, str]:
+    """원칙 + 재료 → AI 판단(JSON). (결과, 오류)"""
+    tried = []
+    r = None
+    for mdl in dict.fromkeys([m for m in (model, *AI_JUDGE_MODELS) if m]):
+        tried.append(mdl)
+        try:
+            r = requests.post(ANTHROPIC_URL, timeout=timeout, headers={
+                "x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": mdl, "max_tokens": 1800, "system": AI_JUDGE_RULES,
+                      "messages": [{"role": "user", "content": payload + "\n\n" + AI_JUDGE_PROMPT}]})
+        except requests.RequestException as exc:
+            return None, f"AI 연결 실패: {exc.__class__.__name__}"
+        if r.status_code == 404 or (r.status_code == 400 and "model" in r.text.lower() and "not" in r.text.lower()):
+            continue
+        break
+    if r is None or r.status_code != 200:
+        try:
+            msg = r.json().get("error", {}).get("message", "") if r is not None else ""
+        except ValueError:
+            msg = r.text[:200]
+        return None, f"AI 판단 실패({getattr(r, 'status_code', '-')}): {msg}"
+    txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+    return parse_ai_judge(txt)
+
+
+AI_STATES = ("보유 유지", "불타기 검토", "절반 익절", "나머지 정리", "비중 축소", "손절·정리 검토", "관망·주의")
+
+
+def parse_ai_judge(txt: str) -> tuple[dict | None, str]:
+    txt = re.sub(r"```(?:json)?", "", txt or "").strip()
+    mm = re.search(r"\{[\s\S]*\}", txt)
+    if not mm:
+        return None, "AI 응답에서 결과를 못 찾았어요. 다시 시도해 보세요."
+    try:
+        d = json.loads(mm.group(0))
+    except ValueError:
+        return None, "AI 응답 형식이 깨졌어요. 다시 시도해 보세요."
+    state = str(d.get("state") or "").strip()
+    d["state"] = next((s for s in AI_STATES if s in state), state or "관망·주의")
+    if d.get("level") not in ("green", "purple", "blue", "yellow", "orange", "red"):
+        d["level"] = {"보유 유지": "green", "불타기 검토": "purple", "절반 익절": "blue", "나머지 정리": "orange",
+                      "비중 축소": "orange", "손절·정리 검토": "red"}.get(d["state"], "yellow")
+    for k in ("reasons", "now"):
+        d[k] = [str(x) for x in (d.get(k) or []) if x][:6]
+    d["scenarios"] = [x for x in (d.get("scenarios") or []) if isinstance(x, dict) and x.get("if")][:5]
+    d["at"] = now_kst().strftime("%m/%d %H:%M")
+    return d, ""
+
+
+def mock_ai_judge(j: dict) -> dict:
+    lv = j.get("level") or "yellow"
+    st_ = {"red": "손절·정리 검토", "orange": "비중 축소", "blue": "절반 익절", "purple": "불타기 검토", "green": "보유 유지"}.get(lv, "관망·주의")
+    return {"state": st_, "level": lv if lv in ("green", "purple", "blue", "yellow", "orange", "red") else "yellow",
+            "headline": "(테스트) 규칙 판정과 같은 방향 — 손절선 유지하며 추세 확인",
+            "confidence": "보통", "reasons": ["(테스트) 20일선 위 유지", "(테스트) 외국인+기관 5일 순매수"],
+            "now": [f"손절선 {_fmt_v(j.get('stop_price'))} 유지"],
+            "scenarios": [{"if": f"종가 {_fmt_v(j.get('stop_price'))} 이탈", "then": "정리 검토"},
+                          {"if": f"{_fmt_v(j.get('target3r'))} 도달", "then": "절반 익절"}],
+            "news": "중립 — (테스트 데이터)", "diff": "규칙 판정과 같음", "at": now_kst().strftime("%m/%d %H:%M")}
