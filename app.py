@@ -6674,6 +6674,9 @@ def load_nxt_quotes(codes: tuple[str, ...]):
 
 # ── 🏁 신고가 후보 전용: 코스피·코스닥 전 종목 일봉(가벼운 배열)을 뒤에서 받아 두는 곳 ──
 SCAN_CHUNK = 60
+# 전 종목 배열은 종목당 약 10KB(전체 25MB 안쪽)라 보드의 메모리 기준(MEM_SOFT·HARD)과 따로 둬요.
+# Streamlit Cloud에선 평소 서버 메모리가 MEM_HARD보다 높아 그 기준을 쓰면 영영 시작을 못 했어요.
+SCAN_MEM_MAX = int(os.environ.get("SCAN_MEM_MB", "900" if IS_STREAMLIT_CLOUD else "1500"))
 
 
 @st.cache_resource
@@ -6695,7 +6698,7 @@ def _scan_bg(codes: tuple[str, ...]):
             return
         full = [c for c in codes if c not in S["arr"]]
         tail = [c for c in codes if c in S["arr"] and S["thru"].get(c, np.datetime64("1970-01-01")) < complete]
-        if not (full or tail) or rss_mb() > MEM_HARD:
+        if not (full or tail) or rss_mb() > SCAN_MEM_MAX:
             return
         S.update(running=True, done=0, total=len(full) + len(tail))
 
@@ -6721,6 +6724,10 @@ def _scan_bg(codes: tuple[str, ...]):
                             S["arr"][c] = data.merge_arr(S["arr"].get(c), a) if kind == "tail" else a
                             S["thru"][c] = complete
                         S["done"] += len(part)
+                    del got
+                    gc.collect()
+                    if rss_mb() > SCAN_MEM_MAX:              # 받는 중에 메모리가 넘치면 멈추고 다음 새로고침에 이어서
+                        break
                     time.sleep(0.3)
         finally:
             S["running"] = False
@@ -6818,7 +6825,8 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
         scope_txt = f"코스피·코스닥 전 종목 {prog['have']:,}개"
     else:
         scope_txt = (f"전 종목 일봉 받는 중 {prog['have']:,}/{prog['total']:,} — 받은 종목 + 보드 종목으로 먼저 보여줘요"
-                     + (" (1분마다 늘어나요)" if prog["running"] else ""))
+                     + (" (1분마다 늘어나요)" if prog["running"] else
+                        f" (서버 메모리 {rss_mb():.0f}MB라 잠시 멈춤)" if rss_mb() > SCAN_MEM_MAX else ""))
     st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
                 f'KRX {data.market_status(quotes)} · {_nxt_status(nxt)} · {scope_txt}</span></div>',
                 unsafe_allow_html=True)
