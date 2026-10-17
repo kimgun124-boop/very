@@ -328,8 +328,14 @@ def _open_blob(blob, keys):
     return None
 
 
-@st.cache_resource(show_spinner=False)
 def _friends_db() -> dict:
+    """열쇠가 바뀌면(토큰을 넣거나 바꾸면) 기억해 둔 것을 버리고 다시 읽어요."""
+    sig = hashlib.sha256("|".join(_friends_keys()).encode("utf-8")).hexdigest()[:16]
+    return _friends_db_load(sig)
+
+
+@st.cache_resource(show_spinner=False)
+def _friends_db_load(sig: str) -> dict:
     """모든 접속이 같이 쓰는 친구 계정·관심종목(서버 메모리 한 벌). 켜질 때 GitHub에서 한 번 받아요.
     열쇠가 맞지 않으면 data=None으로 두고, 저장도 막아서 남의 자료를 덮어쓰지 않아요."""
     keys = _friends_keys()
