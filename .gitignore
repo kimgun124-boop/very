@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+.alert_cache/
+.alert_state/

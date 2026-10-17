@@ -1,0 +1,59 @@
+name: 매수하세요 알림 (인더스트리 액션)
+
+on:
+  schedule:
+    # 한국 시간 평일 09:30~15:25, 10분마다 (UTC = 한국 - 9시간). GitHub 예약 실행은 5~15분 늦을 수 있어요.
+    - cron: "*/10 0-6 * * 1-5"
+    - cron: "12,18 6 * * 1-5"      # 15:12·15:18 종가 확인 한 번 더
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test = 디스코드 연결 시험 / force = 장 시간이 아니어도 지금 판정"
+        required: false
+        default: "test"
+
+concurrency:
+  group: ia-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 날짜 키
+        id: d
+        run: echo "day=$(TZ=Asia/Seoul date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - name: 오늘 일봉·보낸 알림 기록 불러오기
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .alert_cache
+            .alert_state
+          key: ia-${{ steps.d.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            ia-${{ steps.d.outputs.day }}-
+            ia-
+      - name: 판정하고 알림 보내기
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python alert_ia.py --${{ github.event.inputs.mode || 'test' }}
+          else
+            python alert_ia.py
+          fi
+      - name: 기록 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .alert_cache
+            .alert_state
+          key: ia-${{ steps.d.outputs.day }}-${{ github.run_id }}

@@ -6762,6 +6762,52 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
             "- 거래량 배수는 직전 20거래일 평균 대비, 장중엔 지금 시각까지로 환산해요. 장 초반은 과대평가될 수 있어요.")
 
 
+
+def render_buy_alert(df: pd.DataFrame, histories: dict, quotes: dict):
+    """🔔 매수하세요: 오늘 인더스트리 액션 섹터에서 매수 조건을 모두 통과 + 시장 60일선 위인 종목. 어느 탭에서든 보여요."""
+    d = data.IA_DEFAULTS
+    ss = st.session_state
+    p = {"vol_mult": ss.get("ia_vol", d["vol_mult"]), "min_chg": ss.get("ia_chg", d["min_chg"]),
+         "min_n": ss.get("ia_minn", d["min_n"]), "near_pct": ss.get("ia_near", d["near_pct"]),
+         "dcr_min": ss.get("ia_dcr", d["dcr_min"]), "min_cap": ss.get("ia_cap", d["min_cap"]),
+         "max_ext": ss.get("ia_ext", d["max_ext"])}
+    try:
+        sig = data.ia_buy_signals(df, histories, quotes, load_indexes(), p, recent_days, min_count)
+    except Exception as exc:  # noqa: BLE001 — 알림 계산이 실패해도 보드는 떠야 해요
+        st.caption(f"매수 알림 계산 실패: {exc.__class__.__name__}")
+        return
+    if not sig["signals"]:
+        return
+    now = data.now_kst()
+    close = now.weekday() < 5 and (now.hour, now.minute) >= (15, 0)
+    title = "종가 매수하세요 — 2차" if close else "매수하세요 — 1차(장중)"
+    items = []
+    for x in sig["signals"][:8]:
+        tag = " · ".join(t for t in (x["lead"], "⭐ 첫 돌파" if x["first"] else None,
+                                     "돌파" if x["brk"] else f"저항 {x['to_res']:.1f}%") if t)
+        items.append(f'<div class="ia-al-i"><a href="?chart={html.escape(x["code"])}" target="_self"><b>{html.escape(x["name"])}</b></a> '
+                     f'{x["price"]:,.0f}원 <span style="color:{UP}">{x["chg"]:+.1f}%</span> · 거래량 {x["vx"]:.1f}배 · {html.escape(tag)}'
+                     f'<small>{html.escape(x["group"])} · 손절 {x["stop"]:,.0f} · 3R {x["target"]:,.0f}</small></div>')
+    more = len(sig["signals"]) - 8
+    warn = ('<div class="ia-al-w">⚠️ 20일선 아래 종목이 절반 넘어요 — 정찰병 비중으로만</div>'
+            if (sig["d20"] or 0) >= 60 else "")
+    st.markdown(
+        '<style>.ia-al{background:#FDECEC;border:1.5px solid #E8858B;border-radius:12px;padding:.75rem 1rem;margin:.2rem 0 .8rem}'
+        '.ia-al h4{margin:0 0 .35rem;color:#C0262E;font-size:1.1rem;font-weight:800}'
+        '.ia-al-i{font-size:.9rem;padding:.25rem 0;border-top:1px solid #F6CACD}.ia-al-i:first-of-type{border-top:none}'
+        '.ia-al-i a{color:#16212B;text-decoration:none}.ia-al-i small{display:block;color:#7A5A5C;font-size:.74rem}'
+        '.ia-al-w{font-size:.8rem;color:#B45309;margin-top:.3rem}.ia-al-f{font-size:.74rem;color:#7A5A5C;margin-top:.35rem}</style>'
+        f'<div class="ia-al"><h4>🔔 {title} · {len(sig["signals"])}종목</h4>{"".join(items)}'
+        + (f'<div class="ia-al-f">…외 {more}종목은 🏭 인더스트리 액션 탭에서</div>' if more > 0 else "")
+        + warn + '<div class="ia-al-f">인더스트리 액션 섹터 · 거래량 평소 1.5배↑ 장대양봉 · 저항 근처/돌파 · RS 70↑ · '
+        '시장 60일선 위 모두 통과 · 아침·종가 나눠 사기 · 3R에서 1/3 익절 → 본절</div></div>', unsafe_allow_html=True)
+    seen = ss.setdefault("ia_toasted", set())
+    for x in sig["signals"]:
+        if x["code"] not in seen:
+            seen.add(x["code"])
+            st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
+
+
 _QUOTES: dict = {}
 VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
@@ -6830,6 +6876,7 @@ def render_board():
     _TRENDS_BG["v"] = trends_all
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
+    render_buy_alert(df, histories, quotes)
     names = ["📋 리스트", "⭐ 관심종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):

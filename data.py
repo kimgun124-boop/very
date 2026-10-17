@@ -4263,3 +4263,86 @@ def breadth_zone(down20: float | None) -> tuple[str, str]:
     if down20 <= 20:
         return "과열권", "20일선 아래 20% 이하 — 대부분 종목이 단기 추세 위. 저가 매수분은 비중을 줄일 때예요."
     return "보통", "중립 구간이에요."
+
+
+def ia_buy_signals(df: pd.DataFrame, histories: dict, quotes: dict, idx_hist: dict, p: dict | None = None,
+                   recent_days: int = 5, min_count: int = 2, scope_all: bool = False) -> dict:
+    """'매수하세요' 신호: 오늘 인더스트리 액션 섹터 안에서 매수 조건을 모두 통과한 종목 + 시장 60일선 위.
+    앱 상단 알림과 휴대폰 알림(alert_ia.py)이 같은 판정을 써요."""
+    p = {**IA_DEFAULTS, **(p or {})}
+    out = {"market_ok": None, "market_text": "", "d20": None, "signals": [], "watch": [], "sectors": {}, "day": None}
+    oks, parts = [], []
+    for name, sym in MARKETS.items():
+        sm = index_summary((idx_hist.get(sym) or (empty_frame(), None))[0])
+        ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
+        oks.append(ok)
+        parts.append(f"{name} " + ("?" if ok is None else ("✓" if ok else "✕") + f" {sm['dist60']:+.1f}%"))
+    out["market_ok"] = None if None in oks else all(oks)
+    out["market_text"] = " · ".join(parts)
+    idx_rs = {name: index_rs((idx_hist.get(sym) or (empty_frame(), None))[0], df).get("rs") for name, sym in MARKETS.items()}
+    try:
+        bs = breadth_series(histories, quotes)
+        out["d20"] = float(bs["down20"].iloc[-1]) if len(bs) else None
+    except Exception:  # noqa: BLE001 — 과매도 비율은 참고값이라 실패해도 신호 판정은 계속
+        out["d20"] = None
+    scan = industry_action_scan(df, histories, quotes, {**p, "days": 2})
+    if scan.empty:
+        return out
+    today = now_kst().date()
+    day = scan["date"].max()
+    out["day"] = day
+    if day != today:          # 오늘 봉이 없으면(주말·휴일·장 전) 신호 없음
+        return out
+    leaders = {g for g, _ in leading_groups(df, recent_days, min_count)}
+    pot = potential_groups(df, leaders)
+    secs = industry_action_sectors(scan, day, p)
+    if not scope_all:
+        secs = secs[secs["group"].isin(list(pot))]
+    ia = secs[secs["ia"]]
+    if ia.empty:
+        return out
+    names = scan[(scan["date"] == day) & scan["act"]].merge(df[["code", "name"]], on="code", how="left")
+    for g in ia["group"]:
+        sub = names[names["group"] == g].sort_values("vx", ascending=False)
+        out["sectors"][g] = {"label": pot.get(g, ""), "names": [f"{r.name}" for r in sub.itertuples()],
+                             "sec_vx": float(ia.loc[ia["group"] == g, "sec_vx"].iloc[0] or 0)}
+    cand = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs)
+    if cand.empty:
+        return out
+    bp = dict(BUY_DEFAULTS)
+    for r in cand.itertuples():
+        plan = position_plan(float(r.close), r.atr_pct, None, bp)
+        lead = None
+        if r.lead_ok is True and r.lead_rank == r.lead_rank and r.lead_rank is not None:
+            lead = "👑 대장주" if int(r.lead_rank) == 1 else f"섹터 {int(r.lead_rank)}위"
+        item = {"code": r.code, "name": r.name, "group": r.group, "price": float(r.close), "chg": r.chg, "vx": r.vx,
+                "dcr": r.dcr, "brk": bool(r.brk_close), "to_res": r.to_res, "first": bool(r.brk_close and r.bo_nth == 1),
+                "lead": lead, "stop": plan["stop_price"], "stop_pct": plan["stop_pct"], "target": plan["target_price"],
+                "fails": [r.checks[k][1] for k in r.fails]}
+        if r.tier == "매수 가능":
+            out["signals" if out["market_ok"] is True else "watch"].append(item)
+        elif r.tier == "1개 미충족":
+            out["watch"].append(item)
+    return out
+
+
+def ia_signal_text(sig: dict, title: str) -> str:
+    """디스코드·알림용 한글 메시지."""
+    lines = [f"🔔 **{title}**  ({now_kst():%m/%d %H:%M})"]
+    more = len(sig["signals"]) - 8
+    for s in sig["signals"][:8]:            # 최대 8종목(원칙: 최대 8포지션) — 대장주·순위 높은 순
+        tags = " · ".join(x for x in (s["lead"], "⭐ 첫 돌파" if s["first"] else None,
+                                      "52주 고가 돌파" if s["brk"] else f"저항까지 {s['to_res']:.1f}%") if x)
+        sec = sig["sectors"].get(s["group"], {})
+        lines += [f"\n**{s['name']}** ({s['code']}) {s['price']:,.0f}원  {s['chg']:+.1f}%",
+                  f"  거래량 평소 {s['vx']:.1f}배 · 종가강도 {s['dcr']:.0f}% · {tags}",
+                  f"  손절 {s['stop']:,.0f} (-{s['stop_pct']:.1f}%) · 3R {s['target']:,.0f} (+{3 * s['stop_pct']:.0f}%)",
+                  f"  🏭 {s['group']} 액션: {', '.join(sec.get('names', [])[:6])}"]
+    if more > 0:
+        lines.append(f"\n…외 {more}종목은 앱 🏭 인더스트리 액션 탭에서")
+    d20 = sig.get("d20")
+    lines.append(f"\n시장: {sig['market_text']}" + ("" if d20 is None else f" · 20 DOWN {d20:.0f}%"))
+    if d20 is not None and d20 >= 60:
+        lines.append("⚠️ 20일선 아래 종목이 절반 넘음 — 정찰병 비중으로만")
+    lines.append("원칙: 아침·종가 나눠 사기 · 손절 -8%(ATR) · 3R에서 1/3 익절 → 손절 본절(+1%)")
+    return "\n".join(lines)
