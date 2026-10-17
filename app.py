@@ -7444,6 +7444,274 @@ def render_buy_alert(df: pd.DataFrame, histories: dict, quotes: dict):
             st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
 
 
+T126_CSS = """
+<style>
+.t126-rule { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.6rem; margin: 0.2rem 0 0.6rem; }
+.t126-step { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.7rem 0.85rem; }
+.t126-step .w { font-size: 1.6rem; font-weight: 900; color: #C0262E; line-height: 1; }
+.t126-step .w small { font-size: 0.8rem; color: #7A8A94; font-weight: 700; margin-left: 0.3rem; }
+.t126-step .t { font-weight: 800; font-size: 0.92rem; margin: 0.3rem 0 0.15rem; color: #16212B; }
+.t126-step .d { font-size: 0.76rem; color: #51616C; line-height: 1.4; }
+.t126-step .x { font-size: 0.72rem; color: #1F66C9; margin-top: 0.35rem; }
+.t126-note { background: #FFF8E6; border: 1px solid #F3DFA8; border-radius: 10px; padding: 0.55rem 0.8rem; font-size: 0.82rem; color: #5C4A12; margin-bottom: 0.8rem; }
+.t126-dots { display: inline-flex; gap: 3px; vertical-align: middle; }
+.t126-dots i { display: inline-block; height: 9px; border-radius: 3px; background: #E3E8EB; }
+.t126-dots i.on { background: #D6333B; } .t126-dots i.half { background: #F3B9BC; }
+.t126-ev { display: inline-block; font-size: 0.72rem; font-weight: 800; padding: 0.12rem 0.5rem; border-radius: 6px; white-space: nowrap; }
+.t126-ev.buy { background: #FCE4E5; color: #C0262E; } .t126-ev.sell { background: #E4EDFA; color: #1F66C9; }
+.t126-ev.warn { background: #FFF1C9; color: #9A6A00; } .t126-ev.wait { background: #EEF1F3; color: #51616C; }
+.t126-next { font-size: 0.74rem; color: #3E4C55; white-space: normal; max-width: 280px; line-height: 1.35; }
+@media (max-width: 640px) { .t126-rule { grid-template-columns: 1fr; } }
+</style>
+"""
+
+_T126_MEMO: dict = {}
+
+
+def _t126_dots(stage: int, exits) -> str:
+    """1·2·6 진행 막대(폭도 1:2:6). 정리한 칸은 연하게."""
+    on = {0: 0, 1: 1, 2: 2, 3: 2, 4: 3}.get(int(stage), 0)
+    sold = len(exits or [])
+    parts = []
+    for k, w in enumerate((1, 2, 6)):
+        cls = "on" if k < on else ""
+        if stage == 4 and k < sold:
+            cls = "half"
+        parts.append(f'<i class="{cls}" style="width:{w * 7}px"></i>')
+    return f'<span class="t126-dots">{"".join(parts)}</span>'
+
+
+def _t126_next(r, p: dict) -> str:
+    st_ = int(r["stage"])
+    if st_ == 0:
+        if r["os_now"]:
+            return f"RSI {r['rsi']:.0f} — 과매도 중. <b>30 위로 다시 올라오는 날 1 매수</b> (30 아래에서 미리 사지 않기)"
+        return "증거 없음 — 지켜보기"
+    if st_ == 1:
+        t = "MACD가 시그널 위로 올라오면(골든크로스) <b>+2</b>"
+        return t + (" · <b>임박</b>(히스토그램 3일 연속 개선)" if r["near_gc"] else "")
+    if st_ == 2:
+        nc = r["near_cloud"]
+        return ("구름대(천장) 돌파 기다리기" + ("" if nc is None else f" · 윗선까지 {nc:+.1f}%")
+                + " — 돌파해도 바로 6 넣지 않기")
+    if st_ == 3:
+        return "구름대까지 다시 내려와도 무너지지 않고 <b>버티다 위로 돌면 +6</b> (구름 아래로 마감하면 가짜 돌파)"
+    done = set(r["exits"] or [])
+    todo = [t for k, t in (("s1", "MACD 데드크로스 → 1 정리"), ("s2", f"RSI {p['rsi_weak']:.0f} 아래 → 2 정리")) if k not in done]
+    return "보유 9 — " + " · ".join(todo + ["구름대 아래 마감 → 남은 6 정리"])
+
+
+def _t126_ev_html(r) -> str:
+    k = r["ev_kind"]
+    if not isinstance(k, str) or pd.isna(r["ev_ago"]):
+        return '<span class="t126-ev wait">-</span>'
+    cls = {"buy1": "buy", "buy2": "buy", "buy6": "buy", "sell1": "sell", "sell2": "sell", "sell6": "sell",
+           "fail": "sell", "fake": "warn", "break": "warn"}.get(k, "wait")
+    short = {"buy1": "1 매수", "buy2": "+2 추가", "buy6": "+6 추가", "sell1": "1 정리", "sell2": "2 정리",
+             "sell6": "6 정리", "fail": "손절", "fake": "가짜 돌파", "break": "구름 돌파"}.get(k, k)
+    ago = r["ev_ago"]
+    when = "오늘" if ago == 0 else f"{int(ago)}일 전"
+    return f'<span class="t126-ev {cls}">{short}</span><small>{when} · {r["ev_date"]:%m/%d}</small>'
+
+
+def _t126_table(res: pd.DataFrame, p: dict, equity: float):
+    w_of = {"buy1": 1, "buy2": 2, "buy6": 6}
+    rows = []
+    for _, r in res.iterrows():
+        stg = int(r["stage"])
+        # 이번에 넣을 비중: 오늘 매수 신호면 그 비중, 아니면 다음 단계 비중
+        w = w_of.get(r["ev_kind"]) if r["ev_ago"] == 0 and isinstance(r["ev_kind"], str) and r["ev_kind"] in w_of else {0: 1, 1: 2, 2: 6, 3: 6}.get(stg)
+        stop = r["stop"] if r["stop"] == r["stop"] else None
+        if stg == 0 and r["os_now"]:
+            stop = None
+        sz = t126_size_safe(equity, r["price"], stop, p["risk_pct"], w or 0)
+        amt = (f'<b class="px">{sz["amount"] / 1e4:,.0f}만</b><small>{sz["shares"]:,}주 · {w}/9</small>'
+               if sz.get("amount") and w else (f'<b>{w}/9</b><small>계좌 금액 넣으면 계산</small>' if w else "-"))
+        rsi_t = "-" if r["rsi"] is None or r["rsi"] != r["rsi"] else format(r["rsi"], ".0f")
+        nc = r["near_cloud"]
+        nc_t = "-" if nc is None or nc != nc else (format(nc, "+.1f") + "%" if nc > 0 else "위")
+        stop_t = "-" if stop is None else format(stop, ",.0f")
+        sp_t = "" if not sz.get("stop_pct") else "-" + format(sz["stop_pct"], ".1f") + "%"
+        code_e, name_e, grp_e = html.escape(str(r["code"])), html.escape(str(r["name"])), html.escape(str(r["group"]))
+        rows.append(
+            f'<tr><td class="l nm"><a href="?chart={code_e}" target="_self">{name_e}</a>'
+            f'<small>{code_e} · {grp_e}</small></td>'
+            f'<td class="c">{_t126_dots(stg, r["exits"])}<small>{T126_STAGE_TXT.get(stg, "")}</small></td>'
+            f'<td>{_t126_ev_html(r)}</td>'
+            f'<td><b class="px">{r["price"]:,.0f}</b><small>{_chg_html(r["change"])}</small></td>'
+            f'<td><b>{rsi_t}</b><small>RSI</small></td>'
+            f'<td class="hide-m"><b>{nc_t}</b><small>구름 윗선</small></td>'
+            f'<td><b class="px">{stop_t}</b><small>{sp_t}</small></td>'
+            f'<td>{amt}</td>'
+            f'<td class="l hide-m"><div class="t126-next">{_t126_next(r, p)}</div></td></tr>')
+    head = ('<tr><th class="l">종목</th><th class="c">1·2·6</th><th>최근 신호</th><th>현재가</th><th>RSI</th>'
+            '<th class="hide-m">구름까지</th><th>손절 기준</th><th>이번 금액</th><th class="l hide-m">다음 할 일</th></tr>')
+    st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>', unsafe_allow_html=True)
+
+
+T126_STAGE_TXT = {0: "과매도 대기", 1: "1 보유", 2: "3 보유", 3: "3 보유 · 눌림 대기", 4: "9 보유"}
+
+
+def t126_size_safe(equity, price, stop, risk_pct, weight) -> dict:
+    try:
+        return data.t126_size(equity or None, float(price) if price == price else None, stop, risk_pct, weight)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _t126_chart(ind: pd.DataFrame, events: list, name: str):
+    """위: 캔들 + 일목 구름대 + 1·2·6 표시 / 가운데: RSI(30) / 아래: MACD·시그널."""
+    h = ind.tail(160).copy()
+    x = alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False))
+    base = alt.Chart(h).encode(x=x)
+    color = alt.condition("datum.close >= datum.open", alt.value(UP), alt.value(DOWN))
+    cloud = base.mark_area(opacity=0.22, color="#8E9AA6").encode(y=alt.Y("cloud_bot:Q", title=None, scale=alt.Scale(zero=False)),
+                                                                  y2="cloud_top:Q")
+    wick = base.mark_rule().encode(y="low:Q", y2="high:Q", color=color)
+    body = base.mark_bar(width=2.6).encode(y="open:Q", y2="close:Q", color=color,
+                                           tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("close:Q", format=",.0f"),
+                                                    alt.Tooltip("rsi:Q", format=".0f")])
+    lines = alt.Chart(h.melt("date", value_vars=["tenkan", "kijun"], var_name="선", value_name="v").dropna()).mark_line(
+        strokeWidth=1).encode(x="date:T", y="v:Q", color=alt.Color("선:N", scale=alt.Scale(domain=["tenkan", "kijun"],
+                              range=["#F29A18", "#8E5CC4"]), legend=alt.Legend(orient="top", title=None,
+                              labelExpr="datum.label == 'tenkan' ? '전환선' : '기준선'")))
+    ev = pd.DataFrame([{"date": pd.Timestamp(e["date"]), "price": e["price"], "lab": {"buy1": "1", "buy2": "+2", "buy6": "+6",
+                        "sell1": "-1", "sell2": "-2", "sell6": "-6", "fail": "손절", "fake": "가짜", "break": "돌파"}.get(e["kind"], ""),
+                        "buy": e["kind"].startswith("buy"), "label": e["label"]}
+                       for e in events if pd.Timestamp(e["date"]) >= h["date"].iloc[0]])
+    layers = [cloud, wick, body, lines]
+    if not ev.empty:
+        pts = alt.Chart(ev).mark_text(fontSize=12, fontWeight="bold", dy=-14).encode(
+            x="date:T", y="price:Q", text="lab:N",
+            color=alt.condition("datum.buy", alt.value("#C0262E"), alt.value("#1F66C9")), tooltip=["label:N"])
+        tri = alt.Chart(ev).mark_point(shape="triangle-up", filled=True, size=60).encode(
+            x="date:T", y="price:Q", color=alt.condition("datum.buy", alt.value("#C0262E"), alt.value("#1F66C9")))
+        layers += [tri, pts]
+    top = alt.layer(*layers).properties(height=280, width="container", title=name)
+    rsi = alt.layer(
+        base.mark_line(color="#3B5BDB", strokeWidth=1.4).encode(y=alt.Y("rsi:Q", title="RSI", scale=alt.Scale(domain=[0, 100]))),
+        alt.Chart(pd.DataFrame({"y": [30, 50, 70]})).mark_rule(strokeDash=[4, 3], color="#B0BCC4").encode(y="y:Q"),
+    ).properties(height=90, width="container")
+    h["hist"] = h["macd"] - h["signal"]
+    macd = alt.layer(
+        base.mark_bar(width=2.4).encode(y=alt.Y("hist:Q", title="MACD"),
+                                        color=alt.condition("datum.hist >= 0", alt.value("#F3B9BC"), alt.value("#C9DAF2"))),
+        base.mark_line(color="#16212B", strokeWidth=1.2).encode(y="macd:Q"),
+        base.mark_line(color="#F29A18", strokeWidth=1.2).encode(y="signal:Q"),
+    ).properties(height=100, width="container")
+    st.altair_chart(top)
+    st.altair_chart(rsi)
+    st.altair_chart(macd)
+
+
+def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
+    st.markdown(NHC_CSS + T126_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="nh-head"><b>⚖️ 1:2:6 매매</b><span>후지모토 시게루 방식 — 가격이 아니라 증거가 쌓일 때 비중을 늘린다</span></div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="t126-rule">'
+        '<div class="t126-step"><div class="w">1<small>탐색전</small></div><div class="t">RSI 30 아래 → 다시 30 위</div>'
+        '<div class="d">30 아래로 내려간 순간이 아니라, 내려갔다가 <b>다시 올라오는 순간</b>. 매도세가 처음 약해진 자리.</div>'
+        '<div class="x">정리 1 · MACD 데드크로스(경고등 하나)</div></div>'
+        '<div class="t126-step"><div class="w">+2<small>누적 3</small></div><div class="t">MACD 골든크로스</div>'
+        '<div class="d">MACD선이 시그널선을 아래→위로. 처음보다 가격이 올라 있어도 <b>맞을 확률이 높아졌으니</b> 더 산다.</div>'
+        '<div class="x">정리 2 · RSI까지 약해짐</div></div>'
+        '<div class="t126-step"><div class="w">+6<small>누적 9</small></div><div class="t">구름대 돌파 → 눌림에서 버팀</div>'
+        '<div class="d">돌파만으로는 안 넣음(가짜 돌파 많음). 다시 구름대까지 와도 <b>천장이 바닥이 되어 받치고</b> 위로 돌 때.</div>'
+        '<div class="x">정리 6 · 구름대 아래로 무너짐(구조 깨짐)</div></div></div>'
+        '<div class="t126-note">⚠️ 가격이 떨어져서 더 사면 1:2:6이 아니라 <b>물타기</b>예요. 새 증거가 생겼을 때만 더 넣기 · '
+        '"얼마 벌까"보다 <b>"틀리면 얼마 잃나"</b>를 먼저 — 손실 한도 안에서 금액을 정해요.</div>', unsafe_allow_html=True)
+
+    d = data.T126_DEFAULTS
+    with st.expander("⚙️ 계좌 · 기준"):
+        c1, c2, c3, c4 = st.columns(4)
+        equity = c1.number_input("계좌 평가금액(원)", 0, 10_000_000_000, 0, step=1_000_000, key="t126_eq",
+                                 help="저장되지 않아요. 넣으면 단계별 금액·수량을 계산해요.")
+        risk = c2.number_input("한 번 거래 최대 손실(계좌 %)", 0.5, 5.0, float(d["risk_pct"]), 0.5, key="t126_risk",
+                               help="영상 예시는 2% (1천만 원이면 20만 원). 내 원칙은 1.5%.")
+        mincap = c3.number_input("최소 시가총액(억원)", 0, 100000, 3000, 500, key="t126_cap")
+        tol = c4.number_input("구름대 눌림 인정(윗선 + %)", 0.0, 10.0, float(d["retest_tol"]), 0.5, key="t126_tol")
+        c5, c6, c7 = st.columns(3)
+        weak = c5.number_input("RSI '약해짐' 기준(정리 2)", 30.0, 70.0, float(d["rsi_weak"]), 5.0, key="t126_weak",
+                               help="영상은 'RSI까지 약해지면'이라고만 해서 50 아래로 내려오는 것을 기본으로 잡았어요.")
+        only_op = c6.toggle("올해 영업이익 늘어난 종목만", value=False, key="t126_op",
+                            help="바닥에서 잡는 매매라 펀더멘털 확인용. 실적 자료를 다 받은 뒤부터 걸러져요.")
+        st.caption("RSI 14일 · MACD 12/26/9 · 일목 9/26/52(구름대 26일 앞으로) — 영상과 같은 기본값. 손절 기준: 1·2단계는 과매도 구간 최저가, "
+                   "6 이후는 구름대 아랫선. 금액 = 계좌 × 손실% ÷ 손절까지 거리 → 그 금액을 1:2:6으로 나눠요.")
+    p = {**d, "risk_pct": float(risk), "retest_tol": float(tol), "rsi_weak": float(weak)}
+
+    now = data.now_kst()
+    key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), p["retest_tol"], p["rsi_weak"])
+    res = _T126_MEMO.get(key)
+    if res is None:
+        with st.spinner("RSI · MACD · 일목 계산 중…"):
+            res = data.t126_screen(df, histories, quotes, p)
+        _T126_MEMO.clear()
+        _T126_MEMO[key] = res
+    if res.empty:
+        st.info("일봉이 아직 부족해요. 잠시 뒤 다시 볼게요.")
+        return
+    res = res[pd.to_numeric(res["cap_krw"], errors="coerce").fillna(0) >= mincap * 1e8]
+    if only_op and fins_all:
+        ok = {c for c in res["code"] if data.op_growth(fins_all.get(c)).get("op_up") is True}
+        res = res[res["code"].isin(ok)]
+
+    today_ev = res[(res["ev_ago"] == 0) & res["ev_kind"].notna() & (res["ev_kind"] != "break")]
+    prog = res[res["stage"].between(1, 4)]
+    cand = res[((res["stage"] == 0) & res["os_now"]) | ((res["stage"] == 1) & res["near_gc"])
+               | ((res["stage"] == 3))]
+    tiles = [
+        _tile(True if len(today_ev) else None, "🔔 오늘 신호", f"{len(today_ev)}"),
+        _tile(None, "진행 중 1 · 3 · 눌림 · 9",
+              " · ".join(str(int((res["stage"] == s).sum())) for s in (1, 2, 3, 4))),
+        _tile(None, "과매도 대기(RSI<30)", f"{int(((res['stage'] == 0) & res['os_now']).sum())}"),
+        _tile(None, "+2 임박 · +6 대기", f"{int(((res['stage'] == 1) & res['near_gc']).sum())} · {int((res['stage'] == 3).sum())}"),
+    ]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+
+    view = st.segmented_control("보기", ["🔔 오늘 신호", "📈 진행 중", "👀 후보"], default="🔔 오늘 신호",
+                                key="t126_view", label_visibility="collapsed") or "🔔 오늘 신호"
+    if view == "🔔 오늘 신호":
+        show = today_ev.copy()
+        order = {"buy6": 0, "buy2": 1, "buy1": 2, "sell6": 3, "sell2": 4, "sell1": 5, "fail": 6, "fake": 7}
+        show = show.assign(_o=show["ev_kind"].map(order)).sort_values(["_o", "cap_krw"], ascending=[True, False])
+        empty = "오늘 새로 나온 1·2·6 매수/정리 신호가 없어요. '진행 중'·'후보'를 보세요."
+        cap = "오늘 봉 기준(장중이면 지금 값이라 종가에 바뀔 수 있어요) · 매수 신호는 그 단계 비중만큼만 · 정리 신호는 그 비중만큼만 팔기"
+    elif view == "📈 진행 중":
+        show = prog.sort_values(["stage", "ev_ago"], ascending=[False, True])
+        empty = "지금 1:2:6을 진행 중인 종목이 없어요."
+        cap = "단계는 반드시 1 → 2 → 6 순서. 1·2단계 중 과매도 저점 아래로 마감하면 손절(판단이 틀림)로 처음부터 다시."
+    else:
+        show = cand.assign(_o=cand["stage"].map({3: 0, 1: 1, 0: 2})).sort_values(["_o", "cap_krw"], ascending=[True, False])
+        empty = "후보가 없어요. 시가총액 기준을 낮춰 보세요."
+        cap = ("후보 = ① RSI 30 아래(다시 올라오면 1) ② 1 보유 중 MACD 골든크로스 임박(+2) ③ 구름대 돌파 뒤 눌림 확인 대기(+6). "
+               "30 아래에서 미리 사거나, 내렸다고 더 사지 않기")
+    if show.empty:
+        st.caption(empty)
+    else:
+        _t126_table(show.head(80), p, float(equity or 0))
+        st.caption(cap)
+        labels = {r.code: f"{r.name} ({r.code}) · {T126_STAGE_TXT.get(int(r.stage), '')}" for r in show.head(80).itertuples()}
+        code = st.selectbox("차트로 보기 (구름대 · RSI · MACD와 1·2·6 표시)", list(labels), format_func=labels.get, key="t126_chart")
+        hist = (histories.get(code) or (None, data.empty_frame(), None))[1]
+        if hist is not None and not hist.empty:
+            ind = data.t126_indicators(hist, quotes.get(code), data.now_kst().date(), p)
+            ev = show.loc[show["code"] == code, "events"].iloc[0]
+            _t126_chart(ind, ev, labels[code])
+            with st.expander("이 종목 신호 기록"):
+                st.markdown("\n".join(f"- {e['date']:%m/%d} · {e['label']} · {e['price']:,.0f}원" for e in ev) or "기록 없음")
+    with st.expander("ℹ️ 1:2:6 매매란 (영상 요약)"):
+        st.markdown(
+            "- 후지모토 시게루는 버블 때 100억까지 불렸다가 20억으로 줄었고, 그 뒤 **돈을 넣는 순서**만 바꿔 220억 이상으로 다시 키웠어요. "
+            "시장이 벌어 준 돈을 실력으로 착각한 게 실패 원인이었고, 그래서 '처음부터 크게'가 아니라 **시장이 확인해 줄 때마다** 늘리는 방식으로 바꿨어요.\n"
+            "- **1 → +2 → +6**: RSI 30 재돌파(탐색) → MACD 골든크로스 → 구름대 돌파 후 눌림에서 버티고 다시 상승. 증거가 하나씩 늘 때마다 비중도 늘려요.\n"
+            "- **정리도 1:2:6**: MACD 데드크로스에 1 → RSI까지 약해지면 2 → 구름대 아래로 무너지면 남은 6. 한 번에 다 사고 다 팔지 않아요.\n"
+            "- **흔한 실수**: 1만 샀는데 바로 크게 오르면 '처음부터 크게 살걸' → 다음엔 RSI 하나만 보고 크게 들어갔다가 틀려서 큰 손실. "
+            "1을 샀는데 내리면 '더 사면 평단 낮아지는데' → MACD·일목 확인 전에 넣으면 그냥 물타기.\n"
+            "- **금액**: 먼저 '틀리면 얼마 잃나'를 정해요. 1천만 원 · 손실 2%(20만 원) · 손절까지 4%면 이번 거래는 최대 500만 원 → 1:2:6으로 나눠 넣기.\n"
+            "- 지표(RSI·MACD·일목)는 바꿀 수 있어도 **순서**(작게 → 확인되면 늘리기 → 이유가 사라지면 줄이기)가 핵심이에요.")
+
+
 _QUOTES: dict = {}
 VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
@@ -7513,7 +7781,7 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
-    names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보",
+    names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
@@ -7524,7 +7792,7 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
+    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -7540,6 +7808,7 @@ def render_board():
         (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
         (t_vs, lambda: render_volume_surge(df, histories, quotes)),
         (t_ia, lambda: render_industry_action(df, histories, quotes)),
+        (t_126, lambda: render_126(df, histories, quotes, fins_all)),
         (t_buy, lambda: render_buy(df, quotes)),
         (t_money, lambda: render_money(df)),
         (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),

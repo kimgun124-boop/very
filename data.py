@@ -4490,3 +4490,196 @@ def scan_frame(arrs: dict, quotes: dict, uni: dict, board: pd.DataFrame | None =
         vals = pd.to_numeric(f[raw], errors="coerce")
         f[col] = (vals.rank(pct=True, method="average") * 98 + 1).round().where(vals.notna())
     return f
+
+
+# ─────────────────────────── ⚖️ 1:2:6 매매 (후지모토 시게루 방식) ───────────────────────────
+# 핵심: 가격이 떨어져서 더 사는 게 아니라, 내 판단이 맞다는 '새 증거'가 생길 때마다 비중을 늘린다.
+#   1  = RSI가 30 아래로 내려갔다가 다시 30 위로 올라온 날 (탐색전, 작게)
+#   +2 = 그 뒤 MACD선이 시그널선을 아래→위로 돌파(골든크로스) → 누적 3
+#   +6 = 그 뒤 가격이 일목 구름대를 뚫고 올라간 다음, 다시 구름대까지 내려와도 무너지지 않고 버티다 위로 → 누적 9
+#   정리도 1:2:6 = MACD 데드크로스에 1 · RSI까지 약해지면 2 · 구름대 아래로 무너지면 남은 6
+#   증거 없이 가격이 내려서 더 사면 = 그냥 물타기(금지). 손실을 먼저 정하고 그 안에서 금액을 정한다(1회 위험 계좌 2%).
+T126_DEFAULTS = {
+    "rsi_n": 14, "rsi_low": 30.0, "rsi_weak": 50.0,
+    "macd_fast": 12, "macd_slow": 26, "macd_sig": 9,
+    "tenkan": 9, "kijun": 26, "senkou_b": 52, "shift": 26,
+    "retest_tol": 2.0,     # 구름대 윗선의 몇 % 위까지 내려오면 '구름대까지 눌림'으로 볼지
+    "lookback": 120,       # 최근 며칠 안의 신호만 추적
+    "risk_pct": 2.0,       # 영상 예시: 한 번 거래 최대 손실 = 계좌의 2%
+}
+T126_STAGE = {0: "대기", 1: "1 진입(탐색)", 2: "2 추가(누적 3)", 3: "구름 돌파 · 눌림 대기", 4: "6 추가(누적 9)"}
+
+
+def _rsi_np(c: np.ndarray, n: int = 14) -> np.ndarray:
+    d = np.diff(c, prepend=np.nan)
+    up, dn = np.where(d > 0, d, 0.0), np.where(d < 0, -d, 0.0)
+    up[0] = dn[0] = 0.0
+    au = pd.Series(up).ewm(alpha=1 / n, adjust=False, min_periods=n).mean().to_numpy()
+    ad = pd.Series(dn).ewm(alpha=1 / n, adjust=False, min_periods=n).mean().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = au / ad
+        out = 100 - 100 / (1 + rs)
+    out = np.where(ad == 0, 100.0, out)
+    out[:n] = np.nan
+    return out
+
+
+def t126_indicators(hist: pd.DataFrame, quote: dict | None = None, today: date | None = None,
+                    p: dict | None = None) -> pd.DataFrame:
+    """일봉(+오늘 실시간) → RSI · MACD · 일목(전환·기준·구름대). 구름대는 26일 앞으로 밀어 그린 값(그날 머리 위 구름)."""
+    p = {**T126_DEFAULTS, **(p or {})}
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    df = pd.DataFrame({"date": pd.to_datetime(d), "open": o, "high": h, "low": l, "close": c, "volume": v})
+    cs = df["close"]
+    df["rsi"] = _rsi_np(c, p["rsi_n"])
+    ema_f = cs.ewm(span=p["macd_fast"], adjust=False).mean()
+    ema_s = cs.ewm(span=p["macd_slow"], adjust=False).mean()
+    df["macd"] = ema_f - ema_s
+    df["signal"] = df["macd"].ewm(span=p["macd_sig"], adjust=False).mean()
+    hh, ll = df["high"], df["low"]
+    tenkan = (hh.rolling(p["tenkan"]).max() + ll.rolling(p["tenkan"]).min()) / 2
+    kijun = (hh.rolling(p["kijun"]).max() + ll.rolling(p["kijun"]).min()) / 2
+    span_a = ((tenkan + kijun) / 2).shift(p["shift"])
+    span_b = ((hh.rolling(p["senkou_b"]).max() + ll.rolling(p["senkou_b"]).min()) / 2).shift(p["shift"])
+    df["tenkan"], df["kijun"], df["span_a"], df["span_b"] = tenkan, kijun, span_a, span_b
+    df["cloud_top"] = np.fmax(span_a, span_b)
+    df["cloud_bot"] = np.fmin(span_a, span_b)
+    df.loc[df["macd"].index[:p["macd_slow"]], ["macd", "signal"]] = np.nan
+    return df
+
+
+def t126_scan_one(ind: pd.DataFrame, p: dict | None = None) -> dict:
+    """1:2:6 단계를 날짜 순서대로 따라가요. 반드시 1 → 2 → 6 순서(앞 증거 없이 다음 단계 없음)."""
+    p = {**T126_DEFAULTS, **(p or {})}
+    n = len(ind)
+    out = {"stage": 0, "events": [], "stop": None, "os_now": False, "rsi": None, "macd_gap": None,
+           "near_gc": False, "near_cloud": None, "exits": [], "entry1": None, "last_event": None, "last_event_ago": None}
+    if n < p["senkou_b"] + p["shift"] + 10:
+        return out
+    r, m, s = ind["rsi"].to_numpy(), ind["macd"].to_numpy(), ind["signal"].to_numpy()
+    c, lo = ind["close"].to_numpy(), ind["low"].to_numpy()
+    top, bot = ind["cloud_top"].to_numpy(), ind["cloud_bot"].to_numpy()
+    dates = ind["date"].dt.date.to_numpy()
+    start = max(1, n - int(p["lookback"]))
+    state, stop, os_low, in_os, touched, exits = 0, None, None, False, False, set()
+    events = []
+
+    def ev(i, kind, label, w=None):
+        events.append({"i": i, "date": dates[i], "kind": kind, "label": label, "w": w, "price": float(c[i])})
+
+    for i in range(start, n):
+        if not (np.isfinite(r[i]) and np.isfinite(r[i - 1])):
+            continue
+        if r[i] < p["rsi_low"]:                     # 과매도 구간: 그 구간 최저가 = 탐색 매수의 손절 기준
+            os_low = lo[i] if not in_os else min(os_low, lo[i])
+            in_os = True
+        gc = np.isfinite(m[i - 1]) and m[i - 1] <= s[i - 1] and m[i] > s[i]
+        dc = np.isfinite(m[i - 1]) and m[i - 1] >= s[i - 1] and m[i] < s[i]
+        if state in (1, 2, 3) and stop is not None and c[i] < stop:
+            ev(i, "fail", f"손절 — 과매도 저점 {stop:,.0f} 아래로 마감(증거가 틀림)")
+            state, stop, in_os, os_low, touched = 0, None, False, None, False
+            continue
+        if state == 0:
+            if in_os and r[i - 1] < p["rsi_low"] <= r[i]:
+                stop = float(os_low)
+                ev(i, "buy1", "1 매수 — RSI 30 아래 → 다시 30 위", 1)
+                state, in_os, exits = 1, False, set()
+        elif state == 1:
+            if gc:
+                ev(i, "buy2", "2 추가 — MACD 골든크로스(누적 3)", 2)
+                state = 2
+                if np.isfinite(top[i]) and c[i] > top[i]:
+                    ev(i, "break", "구름대 위 — 눌림 확인 대기")
+                    state, touched = 3, False
+        elif state == 2:
+            if np.isfinite(top[i]) and c[i] > top[i]:
+                ev(i, "break", "구름대 돌파 — 바로 6 안 넣고 눌림 확인 대기")
+                state, touched = 3, False
+        elif state == 3:
+            if np.isfinite(bot[i]) and c[i] < bot[i]:
+                ev(i, "fake", "가짜 돌파 — 구름대 아래로 다시 무너짐")
+                state, touched = 2, False
+                continue
+            if np.isfinite(top[i]) and lo[i] <= top[i] * (1 + p["retest_tol"] / 100):
+                touched = True
+            if touched and c[i] > c[i - 1] and np.isfinite(top[i]) and c[i] > top[i] and lo[i] > bot[i]:
+                ev(i, "buy6", "6 추가 — 구름대가 바닥으로 받쳐 주고 다시 상승(누적 9)", 6)
+                state, stop = 4, float(bot[i])
+        elif state == 4:
+            if np.isfinite(bot[i]):
+                stop = float(bot[i])
+            if dc and "s1" not in exits:
+                ev(i, "sell1", "1 정리 — MACD 데드크로스(경고등 하나)", 1)
+                exits.add("s1")
+            if r[i - 1] >= p["rsi_weak"] > r[i] and "s2" not in exits:
+                ev(i, "sell2", f"2 정리 — RSI {p['rsi_weak']:.0f} 아래로 약해짐(하락 근거 하나 더)", 2)
+                exits.add("s2")
+            if np.isfinite(bot[i]) and c[i] < bot[i]:
+                ev(i, "sell6", "남은 6 정리 — 구름대 아래로 무너짐(상승 구조 깨짐)", 6)
+                state, stop, exits = 0, None, set()
+    last = n - 1
+    out.update(stage=state, events=events, stop=stop, exits=sorted(exits))
+    out["rsi"] = float(r[last]) if np.isfinite(r[last]) else None
+    out["os_now"] = bool(out["rsi"] is not None and out["rsi"] < p["rsi_low"])
+    gap = (m[last] - s[last]) if np.isfinite(m[last]) and np.isfinite(s[last]) else None
+    out["macd_gap"] = float(gap) if gap is not None else None
+    if gap is not None and gap < 0 and n > 4 and np.all(np.diff(m[-4:] - s[-4:]) > 0):
+        out["near_gc"] = True                        # 히스토그램이 3일 연속 줄어듦 → 골든크로스 임박
+    if np.isfinite(top[last]) and c[last] > 0:
+        out["near_cloud"] = float((top[last] / c[last] - 1) * 100)   # +면 구름대 윗선까지 남은 %, -면 위
+    out["cloud_top"] = float(top[last]) if np.isfinite(top[last]) else None
+    out["cloud_bot"] = float(bot[last]) if np.isfinite(bot[last]) else None
+    entries = [e for e in events if e["kind"] == "buy1"]
+    out["entry1"] = entries[-1] if entries and state in (1, 2, 3, 4) else None
+    if events:
+        out["last_event"] = events[-1]
+        out["last_event_ago"] = last - events[-1]["i"]
+    return out
+
+
+def t126_screen(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None) -> pd.DataFrame:
+    """국내 종목 1:2:6 상태표."""
+    p = {**T126_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    rows = []
+    base = df[df["code"].map(is_kr) & df["price"].notna()]
+    if "halted" in base:
+        base = base[base["halted"] != True]  # noqa: E712
+    for code in base["code"]:
+        hist = (histories.get(code) or (None, None, None))[1]
+        if hist is None or len(hist) < 100:
+            continue
+        try:
+            st_ = t126_scan_one(t126_indicators(hist, quotes.get(code), today, p), p)
+        except Exception:  # noqa: BLE001 — 한 종목 계산 실패가 표 전체를 막지 않게
+            continue
+        le = st_["last_event"]
+        rows.append({"code": code, "stage": st_["stage"], "os_now": st_["os_now"], "rsi": st_["rsi"],
+                     "macd_gap": st_["macd_gap"], "near_gc": st_["near_gc"], "near_cloud": st_["near_cloud"],
+                     "cloud_top": st_.get("cloud_top"), "cloud_bot": st_.get("cloud_bot"), "stop": st_["stop"],
+                     "exits": st_["exits"], "entry1_price": (st_["entry1"] or {}).get("price"),
+                     "entry1_date": (st_["entry1"] or {}).get("date"),
+                     "ev_kind": le["kind"] if le else None, "ev_label": le["label"] if le else None,
+                     "ev_date": le["date"] if le else None, "ev_ago": st_["last_event_ago"],
+                     "events": st_["events"]})
+    cols = ["code", "stage", "os_now", "rsi", "macd_gap", "near_gc", "near_cloud", "cloud_top", "cloud_bot", "stop",
+            "exits", "entry1_price", "entry1_date", "ev_kind", "ev_label", "ev_date", "ev_ago", "events"]
+    out = pd.DataFrame(rows, columns=cols)
+    if out.empty:
+        return out
+    keep = [k for k in ("name", "group", "price", "change", "cap_krw", "rs", "to_high", "atr_pct") if k in df.columns]
+    return out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+
+
+def t126_size(equity: float | None, price: float | None, stop: float | None, risk_pct: float, weight: int) -> dict:
+    """손실 먼저: 손절까지 거리로 '이번 거래 최대 금액'(계좌 × 위험% ÷ 손절 거리)을 정하고 1:2:6으로 나눠요."""
+    out = {"stop_pct": None, "total": None, "amount": None, "shares": None}
+    if not price or not stop or stop >= price:
+        return out
+    dist = (price - stop) / price * 100
+    out["stop_pct"] = dist
+    if equity:
+        total = min(equity * risk_pct / 100 / (dist / 100), equity)
+        amt = total * weight / 9
+        out.update(total=total, amount=amt, shares=int(amt // price))
+    return out
