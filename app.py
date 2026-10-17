@@ -5644,6 +5644,306 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
             "- 보드에 넣은 종목(stocks.py) 안에서만 찾아요. 오늘 봉은 실시간 누적 거래량이라 장중엔 계속 커져요.")
 
 
+IA_CSS = """
+<style>
+.ia-zone { border-radius: 12px; padding: 0.8rem 1rem; margin: 0.3rem 0 0.8rem; border: 1px solid #E3E8EB; background: #FFFFFF; }
+.ia-zone b.z { font-size: 1.15rem; font-weight: 800; }
+.ia-zone .d { font-size: 0.82rem; color: #3E4C55; margin-top: 0.2rem; }
+.ia-zone.z-과매도권 { background: #FDECEC; border-color: #F3B9BC; } .ia-zone.z-과매도권 b.z { color: #C0262E; }
+.ia-zone.z-과매도 { background: #FFF4E5; border-color: #F6D4A8; } .ia-zone.z-과매도 b.z { color: #B45309; }
+.ia-zone.z-약세 { background: #EEF4FC; border-color: #C9DAF2; } .ia-zone.z-약세 b.z { color: #1F66C9; }
+.ia-zone.z-과열권 { background: #E9F6EE; border-color: #BFE3CC; } .ia-zone.z-과열권 b.z { color: #1B6B3E; }
+.ia-units { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.3rem 0 0.2rem; }
+.ia-unit { flex: 1 1 70px; text-align: center; border-radius: 9px; padding: 0.45rem 0.3rem; font-size: 0.75rem; color: #6B7A84;
+  background: #F2F5F7; border: 1px dashed #D3DCE1; }
+.ia-unit b { display: block; font-size: 0.95rem; color: #16212B; font-weight: 800; }
+.ia-unit.on { background: #FCE4E5; border: 1px solid #F3B9BC; color: #C0262E; }
+.ia-sec { display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 0.05rem 0.4rem; border-radius: 6px; margin-left: 0.3rem;
+  background: #EEF1F3; color: #51616C; }
+.ia-sec.lead { background: #FCE4E5; color: #C0262E; }
+.ia-tier { display: inline-block; font-size: 0.72rem; font-weight: 800; padding: 0.12rem 0.5rem; border-radius: 6px; white-space: nowrap; }
+.ia-tier.t0 { background: #FCE4E5; color: #C0262E; } .ia-tier.t1 { background: #FFF1C9; color: #9A6A00; }
+.ia-tier.t2 { background: #EEF1F3; color: #51616C; }
+.ia-chk { font-size: 0.7rem; color: #6B7A84; white-space: normal; line-height: 1.35; max-width: 260px; }
+.ia-chk .x { color: #1F66C9; font-weight: 700; }
+</style>
+"""
+
+
+def _ia_breadth_chart(bs: pd.DataFrame, idx: pd.DataFrame | None):
+    """코스피(왼쪽 축)와 20일선·200일선 아래 종목 비율(오른쪽 축, %). 20 DOWN 80%↑ 구간은 빨간 띠."""
+    b = bs.copy()
+    b["date"] = pd.to_datetime(b["date"])
+    long = b.melt("date", value_vars=["down20", "down200"], var_name="k", value_name="v")
+    long["k"] = long["k"].map({"down20": "20일선 아래 비율", "down200": "200일선 아래 비율"})
+    x = alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False))
+    hot = b[b["down20"] >= 80].assign(e=lambda t: t["date"] + pd.Timedelta(days=1))
+    band = alt.Chart(hot).mark_rect(color="#F3B9BC", opacity=0.45).encode(x=x, x2="e:T")
+    rules = alt.Chart(pd.DataFrame({"y": [90, 80, 20]})).mark_rule(strokeDash=[4, 3], color="#B0BCC4").encode(
+        y=alt.Y("y:Q", scale=alt.Scale(domain=[0, 100]), axis=None))
+    lines = alt.Chart(long).mark_line(strokeWidth=1.8).encode(
+        x=x, y=alt.Y("v:Q", title="%", scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(orient="right")),
+        color=alt.Color("k:N", scale=alt.Scale(domain=["20일선 아래 비율", "200일선 아래 비율", "코스피"],
+                                               range=["#1FA37A", "#F29A18", "#3B5BDB"]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "k:N", alt.Tooltip("v:Q", format=".1f")])
+    right = band + rules + lines
+    if idx is not None and not idx.empty:
+        k = idx[["date", "close"]].copy()
+        k["date"] = pd.to_datetime(k["date"])
+        k = k[k["date"] >= b["date"].min()].assign(k="코스피")
+        left = alt.Chart(k).mark_line(strokeWidth=1.6).encode(
+            x=x, y=alt.Y("close:Q", title=None, scale=alt.Scale(zero=False), axis=alt.Axis(orient="left", format=",.0f")),
+            color=alt.Color("k:N", scale=alt.Scale(domain=["20일선 아래 비율", "200일선 아래 비율", "코스피"],
+                                                   range=["#1FA37A", "#F29A18", "#3B5BDB"]), legend=None),
+            tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("close:Q", format=",.2f", title="코스피")])
+        chart = alt.layer(left, right).resolve_scale(y="independent")
+    else:
+        chart = right
+    st.altair_chart(chart.properties(height=260, width="container"))
+
+
+def _ia_breadth(histories: dict, quotes: dict):
+    """시장 과매도 체크(20 DOWN) + 저가 매수 유닛 분할."""
+    _sec_h("📉 시장 과매도 체크 (20 DOWN)", "보드 종목 중 20일선 아래 비율 — 90%↑ 통상 과매도권")
+    bs = data.breadth_series(histories, quotes)
+    if bs.empty or len(bs) < 5:
+        st.caption("일봉이 아직 다 안 들어와서 비율을 계산하지 못했어요. 잠시 뒤 다시 볼게요.")
+        return None
+    last = bs.iloc[-1]
+    d20, d200 = float(last["down20"]), (None if pd.isna(last["down200"]) else float(last["down200"]))
+    d20_5 = float(bs["down20"].iloc[-6]) if len(bs) >= 6 else None
+    zone, desc = data.breadth_zone(d20)
+    zcls = "과매도" if zone == "과매도 접근" else zone
+    # 과매도권(80%↑) 연속 일수
+    streak = 0
+    for v in bs["down20"].iloc[::-1]:
+        if v >= 80:
+            streak += 1
+        else:
+            break
+    peak = float(bs["down20"].tail(20).max())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("20 DOWN (20일선 아래)", f"{d20:.1f}%", None if d20_5 is None else f"{d20 - d20_5:+.1f}%p (5일 전 대비)",
+              delta_color="inverse")
+    k2.metric("200일선 아래", "-" if d200 is None else f"{d200:.1f}%")
+    k3.metric("80%↑ 연속", f"{streak}일")
+    k4.metric("최근 20일 최고", f"{peak:.1f}%")
+    st.markdown(f'<div class="ia-zone z-{zcls}"><b class="z">{zone}</b> <span style="color:#7A8A94;font-size:.8rem">'
+                f'{pd.Timestamp(last["date"]):%m/%d} 기준 · {int(last["n20"])}종목</span><div class="d">{html.escape(desc)}</div></div>',
+                unsafe_allow_html=True)
+    _ia_breadth_chart(bs, (load_indexes().get("KOSPI") or (None,))[0])
+
+    with st.expander("🧺 저가 매수 유닛 나누기 (과매도 구간용)", expanded=d20 >= 80):
+        c1, c2, c3 = st.columns(3)
+        units = c1.segmented_control("유닛 수", [3, 4, 5], default=5, key="ia_units", format_func=lambda x: f"{x}유닛") or 5
+        start = c2.number_input("1차 투입 기준(20 DOWN %)", 60, 95, 85, 1, key="ia_start",
+                                help="이 비율 이상이면 1차. 이후 과매도가 이어지는 동안 지표 보며 하루 1유닛씩 더 넣는 흐름이에요.")
+        money = c3.number_input("저가 매수에 쓸 금액(원)", 0, 10_000_000_000, 0, step=1_000_000, key="ia_money",
+                                help="저장되지 않아요. 0이면 금액은 빼고 보여줘요.")
+        st.caption("원칙: 시장이 어떻게 될지 모르니 한 번에 다 사지 않고 3~5유닛으로 나눠 분할 투입 · "
+                   "반등이 나오면 바로 비중을 다시 줄이기 · 단기 반등 수익은 펀더멘털(투자포인트)이 그대로인 가치투자 보유 종목의 수량 늘리기에만.")
+        # 투입 가능 차수: 기준 이상인 날이 연속된 일수(오늘 포함) — 하루 1유닛
+        on_days = 0
+        for v in bs["down20"].iloc[::-1]:
+            if v >= start:
+                on_days += 1
+            else:
+                break
+        n_on = min(on_days, units)
+        per = money / units if money else None
+        cells = "".join(
+            f'<div class="ia-unit{" on" if i < n_on else ""}"><b>{i + 1}차</b>'
+            f'{"투입 구간" if i < n_on else "대기"}{f"<br>{per / 1e4:,.0f}만원" if per else ""}</div>' for i in range(units))
+        st.markdown(f'<div class="ia-units">{cells}</div>', unsafe_allow_html=True)
+        if n_on:
+            st.markdown(f"**지금 {n_on}차까지 투입 구간** — 20 DOWN {start}%↑가 {on_days}일째예요. "
+                        "지표가 더 나빠지거나 버티면 다음 차수, 반등(20 DOWN이 빠르게 내려옴)하면 추가 매수를 멈추고 비중 축소.")
+        elif streak == 0 and peak >= start and d20 < peak - 15:
+            st.markdown(f"**반등 구간** — 최근 20일 최고 {peak:.0f}%에서 {d20:.0f}%로 내려왔어요. "
+                        "과매도 때 산 물량은 반등에서 비중을 줄이는 원칙이에요.")
+        else:
+            st.caption(f"지금은 1차 기준({start}%) 아래라 저가 매수 대기예요.")
+    if d20 >= 60:
+        st.warning("⚠️ 절반 넘는 종목이 20일선 아래예요. 이런 장에선 신고가 돌파·인더스트리 액션도 실패가 잦아요 — 정찰병 비중으로만.")
+    return d20
+
+
+def _ia_params() -> dict:
+    d = data.IA_DEFAULTS
+    with st.expander("⚙️ 인더스트리 액션 기준"):
+        c1, c2, c3, c4 = st.columns(4)
+        vol = c1.number_input("거래량(평소 20일 평균의 몇 배)", 1.0, 5.0, d["vol_mult"], 0.1, key="ia_vol")
+        chg = c2.number_input("장대양봉 최소 등락률(%)", 0.0, 15.0, d["min_chg"], 0.5, key="ia_chg")
+        mn = c3.number_input("섹터 안 같은 날 몇 종목↑", 1, 10, int(d["min_n"]), 1, key="ia_minn")
+        near = c4.number_input("저항(직전 52주 고가)까지 % 이내", 1.0, 20.0, d["near_pct"], 0.5, key="ia_near")
+        c5, c6, c7, c8 = st.columns(4)
+        dcr = c5.number_input("종가 강도 최소(%)", 0.0, 100.0, d["dcr_min"], 5.0, key="ia_dcr",
+                              help="그날 고가~저가 사이에서 종가 위치. 100%면 고가 마감(꼬리 없음)")
+        cap = c6.number_input("최소 시가총액(억원)", 0.0, 100000.0, d["min_cap"], 500.0, key="ia_cap")
+        ext = c7.number_input("20일선 이격 최대(%)", 5.0, 60.0, d["max_ext"], 1.0, key="ia_ext")
+        equity = c8.number_input("계좌 평가금액(원, 수량 계산)", 0, 10_000_000_000, 0, step=1_000_000, key="ia_equity")
+        st.caption("RS 70↑ & 코스피·코스닥 RS보다 위는 원칙이라 고정 · 장중 거래량 배수는 지금 시각까지로 환산(아침엔 크게 나올 수 있어요)")
+    return {**d, "vol_mult": float(vol), "min_chg": float(chg), "min_n": int(mn), "near_pct": float(near),
+            "dcr_min": float(dcr), "min_cap": float(cap), "max_ext": float(ext), "equity": float(equity or 0)}
+
+
+def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
+    st.markdown(NHC_CSS + IA_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="nh-head"><b>🏭 인더스트리 액션</b><span>주도섹터 후보에서 여러 종목이 같은 날 거래량 1.5배↑ + 장대양봉</span></div>',
+                unsafe_allow_html=True)
+    d20 = _ia_breadth(histories, quotes)
+
+    _sec_h("🏭 섹터 인더스트리 액션", "섹터 안 거래량이 같이 붙는 날 → 그중 저항·신고가를 넘는 종목")
+    p = _ia_params()
+    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    pot = data.potential_groups(df, leaders)
+    scan = data.industry_action_scan(df, histories, quotes, p)
+    if scan.empty:
+        st.info("일봉이 아직 부족해요. 잠시 뒤 다시 볼게요.")
+        return
+    dates = sorted(scan["date"].unique(), reverse=True)
+    c1, c2 = st.columns([1.4, 1])
+    scope = c1.segmented_control("섹터 범위", ["주도섹터 가능성", "모든 섹터"], default="주도섹터 가능성", key="ia_scope")
+    today = data.now_kst().date()
+    day = c2.selectbox("날짜", dates, key="ia_day",
+                       format_func=lambda x: ("오늘 " if x == today else "") + f"{x:%m/%d} ({'월화수목금토일'[x.weekday()]})")
+    secs = data.industry_action_sectors(scan, day, p)
+    if scope != "모든 섹터":
+        secs = secs[secs["group"].isin(list(pot))]
+    ia = secs[secs["ia"]]
+    intraday = data.market_status(quotes).startswith("장중") and day == today
+
+    hist_idx = load_indexes()
+    idx_rs = {name: data.index_rs(hist_idx.get(sym, (data.empty_frame(), None))[0], df).get("rs")
+              for name, sym in data.MARKETS.items()}
+    oks = []
+    for name, sym in data.MARKETS.items():
+        sm = data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0])
+        oks.append(None if not sm or sm.get("above60") is None else bool(sm["above60"]))
+    market_ok = None if None in oks else all(oks)
+    cand = data.ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs) if not ia.empty else pd.DataFrame()
+    n_buy = int((cand["tier"] == "매수 가능").sum()) if not cand.empty else 0
+    tiles = [
+        _tile(market_ok, "시장 60일선", " · ".join(f"{n} {'✓' if o else ('✕' if o is False else '?')}" for n, o in zip(data.MARKETS, oks))),
+        _tile(None if d20 is None else d20 < 60, "20 DOWN", "-" if d20 is None else f"{d20:.0f}%"),
+        _tile(True if len(ia) else None, "액션 섹터", f"{len(ia)} / {len(secs)}"),
+        _tile(True if n_buy else None, "✅ 매수 가능", f"{n_buy}"),
+    ]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    if market_ok is False:
+        st.error("⛔ 코스피·코스닥이 60일선 아래 — 원칙상 돌파매매 쉬는 구간이에요. 아래는 참고용.")
+
+    # 섹터 표
+    if secs.empty:
+        st.caption("이 범위에 섹터가 없어요. '모든 섹터'로 넓혀 보세요.")
+    else:
+        names = scan[(scan["date"] == day) & scan["act"]].merge(df[["code", "name"]], on="code", how="left")
+        acts = {g: " · ".join(f"{r.name}({r.chg:+.1f}%, {r.vx:.1f}배)" for r in sub.sort_values("vx", ascending=False).head(5).itertuples())
+                for g, sub in names.groupby("group")}
+        rows = []
+        for r in secs.head(40).itertuples():
+            lab = pot.get(r.group, "")
+            tag = f'<span class="ia-sec{" lead" if lab == "주도섹터" else ""}">{html.escape(lab)}</span>' if lab else ""
+            mark = '<b style="color:#C0262E">🏭 액션</b>' if r.ia else '<span style="color:#9AA9B3">-</span>'
+            rows.append(
+                f'<tr><td class="c">{mark}</td><td class="l nm"><b>{html.escape(str(r.group))}</b>{tag}'
+                f'<small>{html.escape(acts.get(r.group, "액션 종목 없음"))}</small></td>'
+                f'<td><b class="rs" style="color:{UP if r.n_act else "#16212B"}">{r.n_act}</b><small>/ {r.n}종목</small></td>'
+                f'<td><b>{r.n_vol}</b><small>거래량 {p["vol_mult"]:.1f}배↑</small></td>'
+                f'<td><b>{"-" if r.sec_vx is None else f"{r.sec_vx:.1f}배"}</b><small>섹터 거래대금</small></td>'
+                f'<td>{_chg_html(r.chg)}<small>평균 등락</small></td></tr>')
+        head = ('<tr><th class="c">판정</th><th class="l">섹터 · 액션 종목</th><th>장대양봉+거래량</th>'
+                '<th>거래량 증가</th><th>섹터 배수</th><th>등락</th></tr>')
+        st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>', unsafe_allow_html=True)
+        st.caption(f"🏭 액션 = 같은 날 '거래량 평소 {p['vol_mult']:.1f}배↑ + 양봉 {p['min_chg']:.0f}%↑' 종목이 {p['min_n']}개↑ · "
+                   "섹터 배수 = 섹터 거래대금 합 ÷ 평소(20일 평균) 합 · 주도섹터 가능성 = 주도섹터(최근 신고가 2개↑) + 52주 고가 10% 이내 2개↑")
+
+    # 매수 후보
+    _sec_h("🎯 액션 섹터 안 매수 후보", "거래량이 평소보다 높게 터진 종목 → 돌파·저항 근처·종가 강도·RS·시총·이격")
+    if cand.empty:
+        st.caption("이날은 인더스트리 액션 섹터가 없어요. 다른 날짜를 골라 보거나 기준을 넓혀 보세요.")
+    else:
+        bp = {**data.BUY_DEFAULTS}
+        rows = []
+        for r in cand.head(60).itertuples():
+            tcls = {"매수 가능": "t0", "1개 미충족": "t1"}.get(r.tier, "t2")
+            tier = "종가 확인" if (r.tier == "매수 가능" and intraday) else r.tier
+            plan = data.position_plan(float(r.close), r.atr_pct, p["equity"] or None, bp)
+            chk = " · ".join((f'<span class="x">✕ {html.escape(t)}</span>' if ok is False else
+                              (f'<span class="x">? {html.escape(t)}</span>' if ok is None else html.escape(t)))
+                             for ok, t in r.checks.values())
+            lead = ""
+            if r.lead_ok is True and r.lead_rank == r.lead_rank and r.lead_rank is not None:
+                lead = '<span class="vs-tag first">👑 대장주</span>' if int(r.lead_rank) == 1 else f'<span class="ia-sec">섹터 {int(r.lead_rank)}위</span>'
+            first = '<span class="vs-tag multi">⭐ 첫 돌파</span>' if (r.brk_close and r.bo_nth == 1) else ""
+            qty = (f'<small>{plan["shares"]:,}주 · {plan["weight"]:.0f}%</small>' if plan.get("shares") else "")
+            rows.append(
+                f'<tr><td class="c"><span class="ia-tier {tcls}">{tier}</span></td>'
+                f'<td class="l nm"><a href="?chart={html.escape(str(r.code))}" target="_self">{html.escape(str(r.name))}</a>{lead}{first}'
+                f'<small>{r.code} · {html.escape(str(r.group))}</small></td>'
+                f'<td><b class="rs" style="color:{UP}">{r.vx:.1f}배</b><small>거래대금 {_tv_eok(r.tv)}</small></td>'
+                f'<td>{_chg_html(r.chg)}<small>종가 강도 {r.dcr:.0f}%</small></td>'
+                f'<td><b>{"돌파" if r.brk_close else ("-" if r.to_res is None else f"{r.to_res:.1f}%")}</b><small>저항(52주 고가)</small></td>'
+                f'<td><b class="px">{plan["stop_price"]:,.0f}</b><small>손절 -{plan["stop_pct"]:.1f}%</small></td>'
+                f'<td><b class="px">{plan["target_price"]:,.0f}</b><small>3R +{3 * plan["stop_pct"]:.0f}%</small>{qty}</td>'
+                f'<td class="l hide-m"><div class="ia-chk">{chk}</div></td></tr>')
+        head = ('<tr><th class="c">판정</th><th class="l">종목</th><th>거래량</th><th>등락</th><th>저항</th>'
+                '<th>손절가</th><th>3R 목표</th><th class="l hide-m">조건</th></tr>')
+        st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>', unsafe_allow_html=True)
+        st.caption("손절·3R은 그날 종가 기준(1R = 8%, ATR이 8%↑면 ATR) · 수량은 계좌 1.5% 위험 ÷ 3유닛 중 1유닛 · "
+                   "'종가 확인' = 장중이라 종가까지 액션(양봉·거래량)이 유지되는지 봐야 해요")
+        with st.expander("📌 매수 · 관리 순서 (매매 복기에서 정리)"):
+            st.markdown(
+                "1. **섹터 확인** — 주도섹터 가능성 있는 섹터에서 여러 종목이 같은 날 거래량 1.5배↑ 장대양봉(인더스트리 액션)\n"
+                "2. **종목 고르기** — 그중 직전 고점(52주 고가) 근처·돌파, 종가 강하게(꼬리 짧게), 대장주·첫 돌파 우선\n"
+                "3. **진입** — 아침 1차 + 종가 2차로 나눠 사기(양념반·후라이드반). 고가 돌파가 애매하면 관종(포켓피봇)만\n"
+                "4. **손절** — -8%(1R), ATR이 더 크면 ATR\n"
+                "5. **3R(+24%) 도달** — 1/3 익절해서 수익 쿠션 → 손절을 본절(+1%)로\n"
+                "6. **나머지** — 본절 또는 20일선 종가 이탈 시 정리. 매도 후 다시 신고가 근처에서 트리거가 나오면 재진입")
+
+    # 최근 N일 히트맵
+    _sec_h(f"🗓️ 최근 {len(dates)}거래일 인더스트리 액션 기록", "칸 숫자 = 그날 장대양봉+거래량 종목 수 · 빨간 칸 = 액션")
+    hm = scan[scan["act"]].groupby(["group", "date"]).size().reset_index(name="n")
+    if scope != "모든 섹터":
+        hm = hm[hm["group"].isin(list(pot))]
+    hot_groups = hm[hm["n"] >= p["min_n"]]["group"].unique()
+    hm = hm[hm["group"].isin(hot_groups)]
+    if hm.empty:
+        st.caption("최근에 인더스트리 액션이 나온 섹터가 없어요.")
+    else:
+        order = hm.groupby("group")["n"].sum().sort_values(ascending=False).index.tolist()[:25]
+        hm = hm[hm["group"].isin(order)].copy()
+        hm["d"] = pd.to_datetime(hm["date"]).dt.strftime("%m/%d")
+        hm["ia"] = hm["n"] >= p["min_n"]
+        dom = [pd.Timestamp(x).strftime("%m/%d") for x in sorted(dates)]
+        base = alt.Chart(hm).encode(x=alt.X("d:O", title=None, sort=dom, scale=alt.Scale(domain=dom), axis=alt.Axis(labelAngle=0)),
+                                    y=alt.Y("group:N", title=None, sort=order))
+        rect = base.mark_rect(cornerRadius=3).encode(
+            color=alt.condition("datum.ia", alt.Color("n:Q", scale=alt.Scale(scheme="reds", domain=[1, 6]), legend=None),
+                                alt.value("#F6E3E4")),
+            tooltip=["group:N", "d:O", alt.Tooltip("n:Q", title="액션 종목")])
+        txt = base.mark_text(fontSize=11, fontWeight="bold").encode(
+            text="n:Q", color=alt.condition("datum.n >= 3", alt.value("white"), alt.value("#16212B")))
+        st.altair_chart((rect + txt).properties(height=max(120, 26 * len(order)), width="container"))
+
+    # 차트
+    if not cand.empty:
+        labels = {r.code: f"{r.name} ({r.code}) · {r.group} · {r.vx:.1f}배" for r in cand.head(60).itertuples()}
+        code = st.selectbox("차트로 보기", list(labels), format_func=labels.get, key="ia_chart_code")
+        h = (histories.get(code) or (None, data.empty_frame(), None))[1]
+        if h is not None and not h.empty:
+            _vs_chart(h, labels[code], 1, 20)
+    with st.expander("ℹ️ 이 탭을 쓰는 법"):
+        st.markdown(
+            "- **위(20 DOWN)**: 시장 전체가 얼마나 무너졌는지. 90%↑는 통상 과매도권 → 저가 매수는 3~5유닛 분할, 반등 시 비중 축소. "
+            "보드에 올라온 종목 기준이라 전체 상장사 수치와 조금 다를 수 있어요.\n"
+            "- **가운데(인더스트리 액션)**: 한 종목만 튀는 게 아니라 **섹터가 같이 거래량을 동반해 오르는 날**을 찾아요. "
+            "그 섹터 안에서 거래량이 평소보다 높고, 저항(직전 52주 고가)을 넘거나 바로 아래인 종목이 매수 후보예요.\n"
+            "- 날짜를 바꾸면 9/10·9/22처럼 지난 액션 날에 어떤 종목이 후보였는지 복기할 수 있어요.\n"
+            "- 거래량 배수는 직전 20거래일 평균 대비, 장중엔 지금 시각까지로 환산해요. 장 초반은 과대평가될 수 있어요.")
+
+
 _QUOTES: dict = {}
 VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
@@ -5712,7 +6012,7 @@ def render_board():
     _TRENDS_BG["v"] = trends_all
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
-    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🎯 매수 후보",
+    names = ["📋 리스트", "💼 내 보유", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
@@ -5722,7 +6022,7 @@ def render_board():
         except TypeError:          # 예전 Streamlit
             tabs = st.tabs(names)
             lazy = False
-    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
+    t_list, t_hold, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -5735,6 +6035,7 @@ def render_board():
         (t_ath, lambda: render_ath(df, quotes)),
         (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
         (t_vs, lambda: render_volume_surge(df, histories, quotes)),
+        (t_ia, lambda: render_industry_action(df, histories, quotes)),
         (t_buy, lambda: render_buy(df, quotes)),
         (t_money, lambda: render_money(df)),
         (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),

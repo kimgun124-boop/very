@@ -4053,3 +4053,213 @@ def volume_surges(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | Non
                         "aligned", "cap_krw") if k in df.columns]
     out = out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
     return out.sort_values("vs_mult", ascending=False).reset_index(drop=True)
+
+
+# ─────────────────────────── 🏭 인더스트리 액션 · 시장 과매도(20 DOWN) ───────────────────────────
+# 관점(효석 매매 복기 2026.10): 주도섹터 가능성이 있는 섹터에서 여러 종목이 '같은 날' 평소보다 거래량이 크게(1.5배↑)
+# 붙으며 장대양봉이 나오면 = 인더스트리 액션. 그날 신고가·저항 근처를 돌파하는 종목을 아침·종가 분할 매수.
+# 3R(+24%)에서 1/3 익절 → 손절 본절(+1%)로 올리기. 숫자 기준은 앱에서 바꿀 수 있는 기본값이에요.
+IA_DEFAULTS = {
+    "vol_mult": 1.5,     # 평소(직전 20거래일 평균) 거래량의 몇 배
+    "min_chg": 3.0,      # 장대양봉: 등락률 % 이상 + 양봉
+    "min_n": 2,          # 섹터 안 같은 날 액션 종목 수
+    "near_pct": 5.0,     # 직전 52주 고가(저항)까지 % 이내면 '저항 근처'
+    "dcr_min": 60.0,     # 종가 강도(고저 범위 안 위치 %)
+    "rs_min": 70,        # 원칙
+    "min_cap": 3000.0,   # 억원
+    "max_ext": 20.0,     # 20일선 이격 최대 %
+    "days": 10,          # 최근 며칠 기록
+}
+IA_AVG_DAYS = 20
+IA_HIGH_DAYS = 250
+
+
+def ia_stock_days(hist: pd.DataFrame | None, quote: dict | None, today: date | None = None,
+                  days: int = 10, frac: float = 1.0) -> list[dict]:
+    """한 종목의 최근 days거래일 각각: 거래량 배수(직전 20일 평균 대비), 등락률, 양봉, DCR, 직전 52주 고가 대비.
+    오늘이 장중이면 오늘 거래량 배수는 지금 시각까지로 환산(frac)해요."""
+    if hist is None or hist.empty or len(hist) < IA_AVG_DAYS + days + 2:
+        return []
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    n = len(c)
+    t64 = np.datetime64(today or now_kst().date(), "D")
+    out = []
+    for i in range(max(IA_AVG_DAYS + 1, n - days), n):
+        base = v[i - IA_AVG_DAYS:i]
+        base = base[np.isfinite(base) & (base > 0)]
+        if len(base) < IA_AVG_DAYS * 0.7 or not np.isfinite(v[i]):
+            continue
+        f = frac if (i == n - 1 and d[i] == t64) else 1.0
+        vx = float(v[i] / (base.mean() * f))
+        prev_c = c[i - 1]
+        chg = float((c[i] / prev_c - 1) * 100) if prev_c > 0 else None
+        rng = h[i] - l[i]
+        dcr = float((c[i] - l[i]) / rng * 100) if rng > 0 else (100.0 if chg and chg > 0 else 50.0)
+        ph = h[max(0, i - IA_HIGH_DAYS):i]
+        ph = ph[np.isfinite(ph)]
+        prior_high = float(ph.max()) if len(ph) else None
+        out.append({
+            "date": pd.Timestamp(d[i]).date(), "vx": vx, "chg": chg, "up": bool(c[i] > o[i]), "dcr": dcr,
+            "close": float(c[i]), "high": float(h[i]), "prior_high": prior_high,
+            "to_res": (prior_high / c[i] - 1) * 100 if prior_high and c[i] > 0 else None,
+            "brk_close": bool(prior_high and c[i] > prior_high),
+            "brk_touch": bool(prior_high and h[i] > prior_high),
+            "tv": float(c[i] * v[i]),
+        })
+    return out
+
+
+def industry_action_scan(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None) -> pd.DataFrame:
+    """국내 종목 × 최근 days거래일 기록. act = 거래량 배수 ≥ vol_mult & 양봉 & 등락률 ≥ min_chg."""
+    p = {**IA_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    frac = session_frac()
+    rows = []
+    base = df[df["code"].map(is_kr) & df["price"].notna()]
+    if "halted" in base:
+        base = base[base["halted"] != True]  # noqa: E712
+    for code, group in zip(base["code"], base["group"]):
+        if group in NON_SECTOR_GROUPS:
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        for x in ia_stock_days(hist, quotes.get(code), today, int(p["days"]), frac):
+            rows.append({"code": code, "group": group, **x})
+    cols = ["code", "group", "date", "vx", "chg", "up", "dcr", "close", "high", "prior_high", "to_res",
+            "brk_close", "brk_touch", "tv", "act"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame(rows)
+    out["act"] = (out["vx"] >= p["vol_mult"]) & out["up"] & (pd.to_numeric(out["chg"], errors="coerce") >= p["min_chg"])
+    return out
+
+
+def industry_action_sectors(scan: pd.DataFrame, day, p: dict | None = None) -> pd.DataFrame:
+    """그날 섹터별: 종목 수, 거래량 1.5배↑ 종목 수, 액션(장대양봉+거래량) 종목 수, 섹터 거래대금 배수(합계 기준), 평균 등락."""
+    p = {**IA_DEFAULTS, **(p or {})}
+    s = scan[scan["date"] == day]
+    if s.empty:
+        return pd.DataFrame(columns=["group", "n", "n_vol", "n_act", "sec_vx", "chg", "ia"])
+    s = s.assign(tv_base=s["tv"] / s["vx"])
+    rows = []
+    for g, sub in s.groupby("group"):
+        base = sub["tv_base"].replace([np.inf, -np.inf], np.nan).sum()
+        rows.append({"group": g, "n": len(sub), "n_vol": int((sub["vx"] >= p["vol_mult"]).sum()),
+                     "n_act": int(sub["act"].sum()),
+                     "sec_vx": float(sub["tv"].sum() / base) if base else None,
+                     "chg": float(pd.to_numeric(sub["chg"], errors="coerce").mean())})
+    out = pd.DataFrame(rows)
+    out["ia"] = out["n_act"] >= int(p["min_n"])
+    return out.sort_values(["ia", "n_act", "sec_vx"], ascending=False).reset_index(drop=True)
+
+
+def potential_groups(df: pd.DataFrame, leaders: set, near: float = 10.0, min_count: int = 2) -> dict:
+    """주도섹터 가능성: 주도섹터(최근 신고가 2개↑) + 52주 고가 near% 이내 종목이 min_count개↑인 섹터.
+    {섹터: '주도섹터' | '신고가 근접 N'}"""
+    out = {g: "주도섹터" for g in leaders}
+    d = df[df["code"].map(is_kr) & (pd.to_numeric(df["to_high"], errors="coerce") <= near)]
+    for g, n in d.groupby("group").size().items():
+        if g not in out and n >= min_count and g not in NON_SECTOR_GROUPS:
+            out[g] = f"신고가 근접 {n}"
+    return out
+
+
+def ia_candidates(df: pd.DataFrame, scan: pd.DataFrame, day, ia_groups: set, p: dict | None = None,
+                  idx_rs: dict | None = None) -> pd.DataFrame:
+    """인더스트리 액션 섹터 안에서 그날 거래량이 평소보다 높게 터진 종목 + 매수 조건 점검.
+    조건: 거래량 배수 · 장대양봉 · 돌파/저항 근처 · 종가 강도 · RS(70↑ & 지수 RS 위) · 시총 · 20일선 이격"""
+    p = {**IA_DEFAULTS, **(p or {})}
+    s = scan[(scan["date"] == day) & scan["group"].isin(list(ia_groups)) & (scan["vx"] >= p["vol_mult"])]
+    if s.empty:
+        return pd.DataFrame()
+    keep = [k for k in ("name", "price", "change", "rs", "rs_1m", "cap_krw", "atr_pct", "dist_ma20", "aligned",
+                        "lead_rank", "lead_ok", "lead_n", "bo_nth", "to_high") if k in df.columns]
+    s = s.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+    known = {k: v for k, v in (idx_rs or {}).items() if v is not None}
+    rows = []
+    for _, r in s.iterrows():
+        def num(v):
+            return None if v is None or (isinstance(v, float) and v != v) else v
+        c = {}
+        c["vol"] = (True, f"거래량 {r['vx']:.1f}배")
+        chg = num(r["chg"])
+        c["candle"] = (bool(r["up"] and chg is not None and chg >= p["min_chg"]),
+                       f"{'양봉' if r['up'] else '음봉'} {chg:+.1f}%" if chg is not None else "-")
+        if r["brk_close"]:
+            c["level"] = (True, "52주 고가 종가 돌파")
+        elif r["to_res"] is not None and r["to_res"] <= p["near_pct"]:
+            c["level"] = (True, f"저항까지 {r['to_res']:.1f}%" + (" · 장중 돌파" if r["brk_touch"] else ""))
+        else:
+            c["level"] = (False, f"저항까지 {r['to_res']:.1f}%" if r["to_res"] is not None else "고가 모름")
+        c["dcr"] = (r["dcr"] >= p["dcr_min"], f"종가 강도 {r['dcr']:.0f}%")
+        rs = num(r.get("rs"))
+        if rs is None:
+            c["rs"] = (None, "RS 없음")
+        else:
+            beat = all(rs > v for v in known.values()) if known else True
+            c["rs"] = (rs >= p["rs_min"] and beat, f"RS {rs:.0f}" + ("" if beat else " (지수보다 약함)"))
+        cap = num(r.get("cap_krw"))
+        c["cap"] = (None if cap is None else cap / 1e8 >= p["min_cap"], format_krw(cap) + "원" if cap else "시총 모름")
+        ext = num(r.get("dist_ma20"))
+        c["ext"] = (None if ext is None else ext <= p["max_ext"], f"20일선 {ext:+.1f}%" if ext is not None else "-")
+        fails = [k for k, (ok, _) in c.items() if ok is not True]
+        tier = "매수 가능" if not fails else ("1개 미충족" if len(fails) == 1 else "관찰")
+        rows.append({"code": r["code"], "group": r["group"], "tier": tier, "fails": fails, "checks": c,
+                     **{k: r.get(k) for k in ("name", "vx", "chg", "dcr", "to_res", "brk_close", "close", "rs", "cap_krw",
+                                              "atr_pct", "lead_rank", "lead_ok", "bo_nth", "tv")}})
+    out = pd.DataFrame(rows)
+    order = {"매수 가능": 0, "1개 미충족": 1, "관찰": 2}
+    out["_o"] = out["tier"].map(order)
+    out["_lr"] = pd.to_numeric(out["lead_rank"], errors="coerce").fillna(99)
+    return out.sort_values(["_o", "_lr", "vx"], ascending=[True, True, False]).drop(columns=["_o", "_lr"]).reset_index(drop=True)
+
+
+_breadth_memo: dict = {}
+
+
+def breadth_series(histories: dict, quotes: dict, days: int = 120) -> pd.DataFrame:
+    """보드 국내 종목 중 20일선·200일선 아래에 있는 종목 비율(%)을 날짜별로. 20 DOWN = 20일선 아래 비율.
+    (전체 상장사가 아니라 보드에 올라온 종목 기준 근사치예요)"""
+    today = now_kst().date()
+    key = (today, now_kst().hour * 12 + now_kst().minute // 5, len(histories))
+    if key in _breadth_memo:
+        return _breadth_memo[key]
+    cols20, cols200 = {}, {}
+    for code, item in histories.items():
+        if not is_kr(code) or not item:
+            continue
+        hist = item[1]
+        if hist is None or len(hist) < 60:
+            continue
+        d, o, h, l, c, v = _session_bars(hist, quotes.get(code), today)
+        s = pd.Series(c, index=pd.DatetimeIndex(d))
+        s = s[~s.index.duplicated(keep="last")]
+        tail = s.iloc[-days:]
+        ma20 = s.rolling(20).mean().iloc[-days:]
+        ma200 = s.rolling(200).mean().iloc[-days:]
+        cols20[code] = (tail < ma20).where(ma20.notna())
+        cols200[code] = (tail < ma200).where(ma200.notna())
+    if not cols20:
+        return pd.DataFrame(columns=["date", "down20", "down200", "n20", "n200"])
+    b20, b200 = pd.DataFrame(cols20), pd.DataFrame(cols200)
+    out = pd.DataFrame({
+        "down20": b20.mean(axis=1, skipna=True) * 100, "down200": b200.mean(axis=1, skipna=True) * 100,
+        "n20": b20.notna().sum(axis=1), "n200": b200.notna().sum(axis=1)})
+    out = out[out["n20"] >= max(30, out["n20"].max() * 0.5)].reset_index(names="date")
+    _breadth_memo.clear()
+    _breadth_memo[key] = out
+    return out
+
+
+def breadth_zone(down20: float | None) -> tuple[str, str]:
+    """20 DOWN 구간 → (이름, 설명)."""
+    if down20 is None:
+        return "모름", "데이터가 부족해요."
+    if down20 >= 90:
+        return "과매도권", "20일선 아래 90%↑ — 통상 과매도권. 준비한 유닛을 지표 보며 분할 투입하는 구간이에요."
+    if down20 >= 80:
+        return "과매도 접근", "80~90% — 과매도에 가까워요. 1차 유닛 투입을 검토할 수 있는 구간이에요."
+    if down20 >= 60:
+        return "약세", "절반 넘게 20일선 아래 — 신고가 돌파매매는 쉬거나 비중을 줄이는 구간이에요."
+    if down20 <= 20:
+        return "과열권", "20일선 아래 20% 이하 — 대부분 종목이 단기 추세 위. 저가 매수분은 비중을 줄일 때예요."
+    return "보통", "중립 구간이에요."
