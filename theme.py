@@ -44,7 +44,7 @@ CSS = f"""
 /* ── 바탕 ── */
 .stApp {{ background: var(--bg) !important; color: var(--ink); }}
 [data-testid="stHeader"] {{ background: transparent !important; }}
-.stApp .block-container {{ padding-top: 1.6rem; max-width: 1480px; }}
+.stApp .block-container {{ padding-top: 1.6rem; padding-left: 2rem; padding-right: 2rem; max-width: 100% !important; }}
 .stApp h1, .stApp h2, .stApp h3 {{ color: var(--ink); letter-spacing: -0.025em; }}
 
 /* ── 상단 브랜드 머리글 ── */
