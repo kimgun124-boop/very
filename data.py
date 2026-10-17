@@ -3747,9 +3747,13 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
     price = float(live) if live else float(c[-1])
     krx_close = float(c[-1])
     hi_now = max(float(h[-1]), float(nxt_hi or 0), price)
-    if official_high and official_high > ref * 1.003 and official_high > hi_now * 1.001:
+    # 네이버 공식 52주 최고가는 일봉에 그 근처 고가(1.5% 안)가 실제로 있을 때만 써요.
+    # (2026.10.17) HMM처럼 일봉 어디에도 없는 공식값(27,000 vs 일봉 최고 약 25,000)이 기준가가 되면 '신고가까지'가 엉뚱하게 멀어졌어요.
+    def _backed(x):
+        return bool(len(prior[okp])) and bool(np.any(np.abs(prior[okp] / x - 1) <= 0.015))
+    if official_high and official_high > ref * 1.003 and official_high > hi_now * 1.001 and _backed(official_high):
         ref, ref_src = float(official_high), "네이버 공식"
-    if ref_override and ref_override > ref * 1.003 and ref_override > hi_now * 1.001:
+    if ref_override and ref_override > ref * 1.003 and ref_override > hi_now * 1.001 and _backed(ref_override):
         ref, ref_src = float(ref_override), "네이버 공식"
     # ── 52주 고점(오늘 포함)과 그 날짜
     if hi_now > ref:
@@ -4445,9 +4449,12 @@ def scan_frame(arrs: dict, quotes: dict, uni: dict, board: pd.DataFrame | None =
     binfo = board.drop_duplicates("code").set_index("code") if board is not None and len(board) else None
     rows = []
     for code, arr in arrs.items():
-        if arr is None or len(arr[0]) < 60:
+        if arr is None or len(arr[0]) < 60 or not str(code).isdigit():     # 0120X0 같은 펀드형 코드 빼기
             continue
         q = quotes.get(code) or {}
+        vv = arr[5][-5:]
+        if not (np.nan_to_num(vv.astype(float)) > 0).any() and not (q.get("volume") or 0) > 0:
+            continue                                                       # 거래정지(최근 5일 거래량 0) 빼기
         d, o, h, l, c, v = _session_arrays(*arr, q, today)
         n = len(c)
         price = float(c[-1])

@@ -6444,7 +6444,9 @@ def _dist_html(r, big: bool = False) -> tuple[str, str]:
     s = r["nh_state"]
     if s == "돌파":
         return f'<b style="color:{UP}">+{r["nh_brk"]:.2f}%</b>', "기준 위"
-    if s in ("터치", "밀림"):
+    if s == "터치":     # 스탁이지처럼 '기준가까지 남은 %'(오늘 고가에서 몇 % 밀렸는지는 카드 설명에)
+        return f'<b style="color:{DOWN}">{max(r["nh_dist"], 0):.2f}%</b>', "기준까지 남음"
+    if s == "밀림":
         return f'<b style="color:{DOWN}">{r["peak_gap"]:.2f}%</b>', "고점 대비"
     return f'<b>{max(r["nh_dist"], 0):.2f}%</b>', "남음"
 
@@ -6465,7 +6467,7 @@ def _nh_why(r) -> str:
         return f"{ref} · {now} · {tail}".strip(" ·")
     if s == "터치":
         day = "오늘" if r.get("peak_date") == data.now_kst().date() else _md(r.get("peak_date")) or "당일"
-        return f'{day} 고가 {r["day_high"]:,.0f} 찍고 · {now}' + (f' · {_s(r["confirm"])}' if _s(r.get("confirm")) else "")
+        return f'기준 {r["ref_high"]:,.0f} · {day} 고가 {r["day_high"]:,.0f} 찍고 -{r["fade"]:.1f}% · {now}' + (f' · {_s(r["confirm"])}' if _s(r.get("confirm")) else "")
     if s == "밀림":
         ago = f'{int(r["peak_ago"])}거래일 전' if r.get("peak_ago") == r.get("peak_ago") and r.get("peak_ago") else ""
         return f'{_md(r["peak_date"])} 고점 {r["peak"]:,.0f}({ago}) · {now}'
@@ -6477,7 +6479,7 @@ def _nh_card(r) -> str:
     tvr = "-" if pd.isna(r["tv_ratio"]) else f"{r['tv_ratio']:.1f}배"
     rs = "-" if pd.isna(r["rs"]) else f"{r['rs']:.0f}"
     rs1 = "-" if pd.isna(r["rs_1m"]) else f"{r['rs_1m']:.0f}"
-    head = {"돌파": "기준가 대비", "터치": "고점 대비", "밀림": "고점 대비"}.get(r["nh_state"], "기준가까지")
+    head = {"돌파": "기준가 대비", "터치": "기준가까지", "밀림": "고점 대비"}.get(r["nh_state"], "기준가까지")
     ath = ""
     if r.get("nh_kind") == "52주" and r.get("ath_gap") == r.get("ath_gap") and r.get("ath_gap") is not None:
         ath = f' · 역사 고점까지 {r["ath_gap"]:.1f}%'
