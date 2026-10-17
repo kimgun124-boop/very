@@ -18,6 +18,7 @@ import streamlit as st
 import importlib
 import threading
 import time
+from datetime import time as dtime
 
 import data
 import holdings
@@ -66,8 +67,9 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "SCENARIO_PRESETS", "SCN_WINDOWS", "op_growth", "rotation_confirm", "sector_money_radar", "money_stats", "SCN_INFO", "basket_stats", "classify_scenario", "scenario_paths",
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
-            "pullback_screen", "pullback_setup", "PB_DEFAULTS")
-DATA_VERSION = "2026-10-13-nh-nxt"   # data.py의 DATA_VERSION과 같아야 해요
+            "pullback_screen", "pullback_setup", "PB_DEFAULTS",
+            "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
+DATA_VERSION = "2026-10-17-nh-scan"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -5932,10 +5934,10 @@ table.nh-tbl { width: 100%; border-collapse: collapse; font-variant-numeric: tab
 """
 
 NHC_SECTIONS = [
-    ("신선 후보", "✳️", "#1B8A4B", "최근 60거래일 신고가 이력이 없고 거래대금·RS가 살아난 후보예요."),
-    ("돌파권", "🎯", "#C27C0E", "기준가(직전 52주 고가)까지 가깝고 거래대금·RS가 받쳐 주는 종목이에요."),
-    ("돌파 중", "📈", "#D6333B", "오늘 52주 고가를 새로 쓰고, 지금 가격(넥장 포함)도 기준가 위에 있어요."),
-    ("찍고 밀림", "〰️", "#1F66C9", "52주 고점을 찍었지만(오늘 또는 최근 10거래일) 지금은 그 아래예요."),
+    ("신선 후보", "✳️", "#1B8A4B", "최근 60거래일 신고가 이력이 없고, 기준가 근처에서 거래대금·RS가 살아난 후보예요."),
+    ("돌파권", "🎯", "#C27C0E", "기준가(직전 52주 고가)까지 가깝고 거래대금·RS가 받쳐 주는 종목이에요(신선 후보 제외)."),
+    ("돌파 중", "📈", "#D6333B", "52주 고가를 새로 쓰고, 지금 가격(넥장 포함)도 기준가 위에 있어요(거래대금·RS 동반)."),
+    ("찍고 밀림", "〰️", "#1F66C9", "최근 10거래일 안에 52주 고점을 찍고 조금(7% 안쪽) 밀린 재관찰 후보예요(거래대금·RS 동반)."),
 ]
 NHC_LABEL = {"돌파": "돌파 유지", "터치": "오늘 찍고 밀림", "밀림": "고점 후 밀림", "임박": "임박", "근접": "근접",
              "관찰": "관찰"}
@@ -6022,7 +6024,8 @@ def _nh_why(r) -> str:
             tail += f' · 고가 {r["day_high"]:,.0f}서 -{r["fade"]:.1f}%'
         return f"{ref} · {now} · {tail}".strip(" ·")
     if s == "터치":
-        return f'오늘 고가 {r["day_high"]:,.0f} 찍고 · {now}' + (f' · {_s(r["confirm"])}' if _s(r.get("confirm")) else "")
+        day = "오늘" if r.get("peak_date") == data.now_kst().date() else _md(r.get("peak_date")) or "당일"
+        return f'{day} 고가 {r["day_high"]:,.0f} 찍고 · {now}' + (f' · {_s(r["confirm"])}' if _s(r.get("confirm")) else "")
     if s == "밀림":
         ago = f'{int(r["peak_ago"])}거래일 전' if r.get("peak_ago") == r.get("peak_ago") and r.get("peak_ago") else ""
         return f'{_md(r["peak_date"])} 고점 {r["peak"]:,.0f}({ago}) · {now}'
@@ -6039,6 +6042,8 @@ def _nh_card(r) -> str:
     if r.get("nh_kind") == "52주" and r.get("ath_gap") == r.get("ath_gap") and r.get("ath_gap") is not None:
         ath = f' · 역사 고점까지 {r["ath_gap"]:.1f}%'
     lag = '<span class="nh-kind lag">⚠️ 일봉 지연</span>' if _is_true(r.get("data_lag")) else ""
+    if _is_true(r.get("fresh")) and r["nh_state"] in ("돌파", "터치"):
+        lag += '<span class="nh-kind ath">⭐ 60일 만의 첫 신고가</span>'
     return (
         f'<a class="nh-card" href="?chart={html.escape(str(r["code"]))}" target="_self">'
         f'<div class="nh-c-top"><span class="nh-c-name">{html.escape(str(r["name"]))} '
@@ -6061,13 +6066,17 @@ def _nh_params() -> dict:
             "watch": c3.slider("관찰: 기준가까지 %", 8.0, 30.0, float(d["watch"]), 1.0, key="nhc_watch"),
         }
         c4, c5, c6 = st.columns(3)
-        p["tv_min"] = c4.slider("돌파권·신선: 거래대금 20일 평균대비(배)", 1.0, 5.0, float(d["tv_min"]), 0.1, key="nhc_tv")
-        p["rs_min"] = c5.slider("돌파권·신선: 종합 RS 이상", 50, 99, int(d["rs_min"]), 1, key="nhc_rs")
+        p["tv_min"] = c4.slider("네 칸 공통: 거래대금 20일 평균대비(배)", 1.0, 5.0, float(d["tv_min"]), 0.1, key="nhc_tv2")
+        p["rs_min"] = c5.slider("네 칸 공통: 종합 RS 이상(전 종목 기준)", 50, 99, int(d["rs_min"]), 1, key="nhc_rs2")
         p["fresh_days"] = c6.slider("신선: 최근 며칠간 신고가 없음(거래일)", 20, 120, int(d["fresh_days"]), 5, key="nhc_fresh")
         c7, c8, _ = st.columns(3)
         p["recent_peak"] = c7.slider("찍고 밀림: 고점이 최근 며칠 안(거래일)", 3, 30, int(d["recent_peak"]), 1, key="nhc_peak")
         p["fade_warn"] = c8.slider("돌파 중 경고: 오늘 고가에서 몇 % 밀리면", 1.0, 10.0, float(d["fade_warn"]), 0.5,
                                    key="nhc_fade")
+        c9, c10, _ = st.columns(3)
+        p["pull_max"] = c9.slider("찍고 밀림 칸: 고점에서 몇 % 안쪽까지", 2.0, 15.0, float(d["pull_max"]), 0.5, key="nhc_pull")
+        p["tv20_min"] = c10.slider("네 칸 공통: 20일 평균 거래대금 최소(억, 0=끄기)", 0, 100, int(d["tv20_min"] / 1e8), 5,
+                                   key="nhc_tv20") * 1e8
     return p
 
 
@@ -6223,6 +6232,111 @@ def load_nxt_quotes(codes: tuple[str, ...]):
     return data.fetch_nxt_quotes(codes)
 
 
+# ── 🏁 신고가 후보 전용: 코스피·코스닥 전 종목 일봉(가벼운 배열)을 뒤에서 받아 두는 곳 ──
+SCAN_CHUNK = 60
+
+
+@st.cache_resource
+def _scan_store() -> dict:
+    """{arr: {코드: 배열}, thru: {코드: 이 날짜까지는 장 마감 뒤 받은 완성 봉}, running, done, total}"""
+    return {"arr": {}, "thru": {}, "lock": threading.Lock(), "running": False, "done": 0, "total": 0, "err": 0}
+
+
+def _scan_bg(codes: tuple[str, ...]):
+    """없는 종목은 300일, 지난 세션 완성 봉이 없는 종목은 최근 10일만 받아 붙여요. 한 번에 하나의 작업만, 화면은 안 기다려요.
+    (메모리 여유 기준이 보드보다 느슨해요: 이 배열은 종목당 약 10KB라 전 종목이어도 30MB 안쪽이에요.)"""
+    S = _scan_store()
+    exp = data.last_session_day()
+    now = data.now_kst()
+    done_today = now.weekday() >= 5 or now.time() >= dtime(15, 40) or now.time() < dtime(9, 0)
+    complete = exp if done_today else np.busday_offset(exp, -1, roll="forward")
+    with S["lock"]:
+        if S["running"]:
+            return
+        full = [c for c in codes if c not in S["arr"]]
+        tail = [c for c in codes if c in S["arr"] and S["thru"].get(c, np.datetime64("1970-01-01")) < complete]
+        if not (full or tail) or rss_mb() > MEM_HARD:
+            return
+        S.update(running=True, done=0, total=len(full) + len(tail))
+
+    def work():
+        try:
+            for kind, todo in (("full", full), ("tail", tail)):
+                cnt = data.SCAN_BARS if kind == "full" else 10
+                for i in range(0, len(todo), SCAN_CHUNK):
+                    part = todo[i:i + SCAN_CHUNK]
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=6) as pool:
+                        got = list(pool.map(lambda c: (c, data.fetch_history(c, cnt)[1]), part))
+                    miss = [c for c, h in got if h is None or h.empty]
+                    if miss and len(miss) < len(part):          # 네이버가 잠깐 막으면 천천히 한 번 더
+                        time.sleep(2)
+                        got += [(c, data.fetch_history(c, cnt)[1]) for c in miss]
+                    with S["lock"]:
+                        for c, h in got:
+                            a = data.bars_to_arr(h)
+                            if a is None:
+                                S["err"] += 1
+                                continue
+                            S["arr"][c] = data.merge_arr(S["arr"].get(c), a) if kind == "tail" else a
+                            S["thru"][c] = complete
+                        S["done"] += len(part)
+                    time.sleep(0.3)
+        finally:
+            S["running"] = False
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+@st.cache_data(ttl=30, show_spinner=False, max_entries=4)
+def load_scan_quotes(codes: tuple[str, ...]) -> dict:
+    """전 종목 실시간 시세(40종목씩 묶어 요청, 30초 기억)."""
+    return data.fetch_quotes(codes)[0]
+
+
+@st.cache_data(ttl=21600, show_spinner=False, max_entries=40)
+def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
+    """후보 종목만 월봉을 바로 받아요(역사적/52주 신고가 구분용, 6시간 기억).
+    예전엔 서버 메모리가 빠듯하면 월봉 받기가 계속 미뤄져서 모든 종목이 '역사 확인 중'으로 남았어요."""
+    return {c: m for c, m in data.fetch_monthlies(codes, workers=8).items() if m is not None and not m.empty}
+
+
+def _nh_universe(df: pd.DataFrame, histories: dict, quotes: dict):
+    """신고가 후보를 고를 표·일봉·시세. 사이드바 범위(내 보드 등)와 상관없이 코스피·코스닥 전 종목이에요.
+    전 종목 일봉을 아직 다 못 받았으면 받은 만큼 + 보드 종목으로 먼저 보여줘요."""
+    uni = {u["code"]: u for u in (load_universe() or [])}
+    if not uni:
+        return df, histories, quotes, None
+    codes = tuple(sorted(uni))
+    _scan_bg(codes)
+    S = _scan_store()
+    with S["lock"]:
+        arrs = dict(S["arr"])
+        prog = {"have": len(arrs), "total": len(codes), "running": S["running"], "done": S["done"], "todo": S["total"]}
+    q_all = {**load_scan_quotes(codes), **{k: v for k, v in quotes.items() if v}}
+    sf = data.scan_frame({c: a for c, a in arrs.items() if c in uni}, q_all, uni, df)
+    missing_board = [c for c in df["code"] if data.is_kr(c) and c not in arrs] if len(df) else []
+    if missing_board:                           # 아직 전 종목을 못 받았을 때: 보드 종목은 보드 값으로
+        extra = df[df["code"].isin(missing_board)].copy()
+        extra["in_board"] = True
+        sf = pd.concat([sf, extra[[c for c in sf.columns if c in extra.columns]]], ignore_index=True) if len(sf) else extra
+    return sf, (arrs, histories), q_all, prog
+
+
+def _nh_hist_for(codes, src) -> dict:
+    """후보 계산할 종목만 일봉 표로 만들어요(전 종목 배열 → 표, 없으면 보드 일봉)."""
+    if not isinstance(src, tuple):
+        return src
+    arrs, board_hist = src
+    out = {}
+    for c in codes:
+        if c in arrs:
+            out[c] = (None, data.arr_df(arrs[c]), None)
+        elif c in board_hist:
+            out[c] = board_hist[c]
+    return out
+
+
 @st.cache_data(ttl=600, show_spinner=False, max_entries=20)
 def load_official_52w_cand(codes: tuple[str, ...]) -> dict:
     return data.fetch_official_52w(codes)
@@ -6232,7 +6346,10 @@ def _ago_txt(r) -> str:
     a = r.get("peak_ago")
     if a is None or a != a:
         return ""
-    return " 오늘" if int(a) == 0 else f" · {int(a)}일 전"
+    if int(a) == 0:
+        pd_ = r.get("peak_date")
+        return " 오늘" if pd_ is not None and pd_ == data.now_kst().date() else " · 최근 거래일"
+    return f" · {int(a)}일 전"
 
 
 def _nxt_status(nxt: dict) -> str:
@@ -6249,13 +6366,21 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     st.markdown(NHC_CSS, unsafe_allow_html=True)
     p = _nh_params()
     _NH_FADE[0] = p["fade_warn"]
+    df, hsrc, quotes, prog = _nh_universe(df, histories, quotes)
     codes = data.nh_prefilter(df, p)
     ctup = tuple(sorted(codes))
+    histories = _nh_hist_for(ctup, hsrc)
     nxt, nxt_err = load_nxt_quotes(ctup) if ctup else ({}, None)
     official = load_official_52w_cand(ctup) if ctup else {}
-    monthlies = load_monthlies(ctup, trim=False) if ctup else {}
+    if prog is None:
+        scope_txt = f"보드 {len(df):,}종목(전 종목 목록을 못 받아 보드로만)"
+    elif prog["have"] >= prog["total"] * 0.97:
+        scope_txt = f"코스피·코스닥 전 종목 {prog['have']:,}개"
+    else:
+        scope_txt = (f"전 종목 일봉 받는 중 {prog['have']:,}/{prog['total']:,} — 받은 종목 + 보드 종목으로 먼저 보여줘요"
+                     + (" (1분마다 늘어나요)" if prog["running"] else ""))
     st.markdown(f'<div class="nh-head"><b>🏁 신고가 후보</b><span>기준: {data.now_kst():%y.%m.%d %H:%M} · '
-                f'KRX {data.market_status(quotes)} · {_nxt_status(nxt)} · 국내 종목 전체</span></div>',
+                f'KRX {data.market_status(quotes)} · {_nxt_status(nxt)} · {scope_txt}</span></div>',
                 unsafe_allow_html=True)
     with st.expander("읽는 법 · 판정 기준"):
         st.markdown(
@@ -6271,17 +6396,27 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
             "**52주 신고가** = 1년 고점이지만 더 위에 예전 고점이 있음(카드에 '역사 고점까지 %'). "
             "월봉을 아직 못 받은 종목은 '역사 확인 중'.\n"
             "- **⚠️ 일봉 지연** = 시세의 전일 종가가 일봉과 안 맞아 하루 넘게 늦은 일봉 → 판정을 믿을 수 없어 위 네 칸에서 뺐어요.\n"
-            "- **돌파권** = 임박·근접 + 거래대금 1.5배↑ + RS 80↑ · **신선 후보** = 돌파·터치·임박·근접 + 같은 조건 + 최근 60거래일 신고가 없음.\n"
+            "- **네 칸 공통 조건** = 거래대금이 20일 평균의 1.5배↑ + 종합 RS 70↑(코스피·코스닥 전 종목 안 백분위) + 20일 평균 거래대금 10억↑. "
+            "조건이 안 되는 종목은 아래 상세 리스트에만 나와요.\n"
+            "- **신선 후보** = 임박·근접 + 최근 60거래일 신고가 없음 · **돌파권** = 임박·근접 중 신선 후보가 아닌 것 · "
+            "**찍고 밀림** = 오늘 찍고 밀렸거나 최근 10거래일 고점에서 7% 안쪽 · 한 종목은 한 칸에만(돌파 중 > 찍고 밀림 > 신선 > 돌파권).\n"
+            "- **대상** = 사이드바 범위와 상관없이 코스피·코스닥 전 종목(스팩·ETF·우선주 제외). 전 종목 일봉은 뒤에서 받아 두고 매일 새 봉만 붙여요.\n"
             "- 카드를 누르면 앱 안 차트가 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
     if nxt_err:
         st.caption(f"⚠️ {nxt_err} — 이번엔 KRX 시세로만 판정했어요.")
-    cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, monthlies=monthlies, codes=codes)
+    cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
+    if not cand.empty:                     # 후보만 월봉을 받아 역사적/52주 신고가를 가려요
+        mcodes = tuple(sorted(cand["code"].head(250)))
+        with st.spinner("후보 종목의 상장 이후 월봉을 확인하는 중이에요(역사적 신고가 구분)."):
+            monthlies = load_cand_monthlies(mcodes)
+        if monthlies:
+            cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, monthlies=monthlies,
+                                      codes=list(cand["code"]))
     if cand.empty:
         st.info("지금 조건에 맞는 신고가 후보가 없어요.")
         return
 
-    masks = {"신선 후보": cand["fresh"], "돌파권": cand["section"] == "돌파권",
-             "돌파 중": cand["section"] == "돌파 중", "찍고 밀림": cand["section"] == "찍고 밀림"}
+    masks = {sec: cand["section"] == sec for sec in ("신선 후보", "돌파권", "돌파 중", "찍고 밀림")}
     boxes = []
     for sec, icon, color, desc in NHC_SECTIONS:
         sub = cand[masks[sec]]

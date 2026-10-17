@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-13-nh-nxt"
+DATA_VERSION = "2026-10-17-nh-scan"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -3494,8 +3494,11 @@ def sector_money_radar(df: pd.DataFrame, leaders: set, p: dict | None = None) ->
 
 
 # ─────────────────────────── 🏁 신고가 후보 · 💥 거래량 폭발 ───────────────────────────
-NHC_DEFAULTS = {"imminent": 2.0, "near": 7.0, "watch": 15.0, "tv_min": 1.5, "rs_min": 80, "fresh_days": 60,
-                "recent_peak": 10, "fade_warn": 3.0}
+NHC_DEFAULTS = {"imminent": 2.0, "near": 7.0, "watch": 15.0, "tv_min": 1.5, "rs_min": 70, "fresh_days": 60,
+                "recent_peak": 10, "fade_warn": 3.0, "tv20_min": 10e8, "pull_max": 7.0}
+# (2026.10.17) 네 칸(신선·돌파권·돌파 중·찍고 밀림) 모두 '거래대금 20일 평균대비 1.5배↑ + RS 70↑ + 20일 평균 거래대금 10억↑'.
+# 예전엔 돌파 중·찍고 밀림에 이 조건이 없어 거래 없는 종목까지 섞였고, RS는 80이라 원칙(RS 70↑)보다 빡빡했어요.
+# 찍고 밀림 칸은 고점에서 pull_max% 안쪽만(더 밀린 건 아래 리스트에서). 칸끼리 겹치지 않아요(돌파 중 > 찍고 밀림 > 신선 > 돌파권).
 # 돌파 = 오늘 신고가를 쓰고 현재가가 기준가 위 · 터치 = 오늘 고가는 넘었지만 현재가는 아래(오늘 찍고 밀림)
 # 밀림 = 최근 recent_peak거래일 안에 52주 고점을 찍었고 지금은 그 아래(예전에 찍고 밀림) · 임박/근접/관찰 = 기준가까지 남은 %
 NHC_STATES = ("돌파", "터치", "밀림", "임박", "근접", "관찰")
@@ -3510,6 +3513,24 @@ def _is_session_now(today: date) -> bool:
 
 def _near(a, b, tol: float = 0.006) -> bool:
     return bool(a and b and a > 0 and b > 0 and abs(a / b - 1) <= tol)
+
+
+def last_session_day(today: date | None = None) -> np.datetime64:
+    """지금 기준 가장 최근 거래 세션 날짜(평일 기준, 공휴일은 모름): 평일 9시 이후면 오늘, 아니면 그 전 평일."""
+    today = today or now_kst().date()
+    t64 = np.datetime64(today, "D")
+    if _is_session_now(today):
+        return t64
+    return np.busday_offset(t64, -1, roll="forward") if np.is_busday(t64) else np.busday_offset(t64, 0, roll="backward")
+
+
+def _quote_same_session(q: dict, c: np.ndarray) -> bool:
+    """시세가 일봉 마지막 봉과 같은 세션 것인지: 시세의 전일 종가가 일봉 끝에서 두 번째 종가와 맞거나, 전일 종가를 모르면 가격이 가까움."""
+    if len(c) < 2:
+        return False
+    if q.get("prev"):
+        return _near(q["prev"], c[-2], 0.003)
+    return _near(q.get("price"), c[-1], 0.15)
 
 
 def _quote_is_new_day(q: dict, c: np.ndarray, h: np.ndarray, v: np.ndarray) -> bool:
@@ -3534,13 +3555,19 @@ def _session_bars(hist: pd.DataFrame, quote: dict | None, today: date | None = N
     - 일봉에 오늘 봉이 없는데 장중(OPEN)이거나, 장이 끝났어도 시세가 일봉 다음 날 것이면 오늘 봉을 새로 붙여요.
     - 그 밖(주말·장 전·휴일)이면 일봉 마지막 봉이 지금 세션이에요.
     """
-    today = today or now_kst().date()
     d = hist["date"].values.astype("datetime64[D]")
     o = hist["open"].to_numpy(dtype=float) if "open" in hist else hist["close"].to_numpy(dtype=float)
     h, l, c = (hist[k].to_numpy(dtype=float) for k in ("high", "low", "close"))
+    v = hist["volume"].to_numpy(dtype=float) if "volume" in hist else np.full(len(d), np.nan)
+    return _session_arrays(d, o, h, l, c, v, quote, today)
+
+
+def _session_arrays(d, o, h, l, c, v, quote: dict | None, today: date | None = None):
+    """_session_bars와 같은 일을 배열로 바로(전 종목 스캔에서 표를 만들지 않으려고)."""
+    today = today or now_kst().date()
+    o, h, l, c, v = (np.asarray(x, dtype=float) for x in (o, h, l, c, v))
     if not ((h > 0).all() and (l > 0).all() and (o > 0).all()):
         h, l, o = np.where(h > 0, h, c), np.where(l > 0, l, c), np.where(o > 0, o, c)
-    v = hist["volume"].to_numpy(dtype=float) if "volume" in hist else np.full(len(d), np.nan)
     q = quote or {}
     price, qh, ql, qv = q.get("price"), q.get("high"), q.get("low"), q.get("volume")
     t64 = np.datetime64(today, "D")
@@ -3552,6 +3579,27 @@ def _session_bars(hist: pd.DataFrame, quote: dict | None, today: date | None = N
             l[-1] = min(l[-1], float(ql or price), float(price))
         if qv and not (v[-1] >= qv):
             v[-1] = float(qv)
+    elif price and len(d) and d[-1] == last_session_day(today) and not _is_session_now(today) \
+            and q.get("status") != "OPEN" and _quote_same_session(q, c):
+        # 주말·장 전: 일봉 마지막 봉이 장중에 받아 둔 '덜 끝난 봉'일 수 있어요 → 그 세션의 최종 시세로 덮어써요
+        o, h, l, c, v = (x.copy() for x in (o, h, l, c, v))
+        c[-1] = float(price)
+        if qh:
+            h[-1] = max(float(qh), float(price))
+        if ql:
+            l[-1] = min(float(ql), float(price))
+        if qv and not (v[-1] >= qv):
+            v[-1] = float(qv)
+    elif price and len(d) and not _is_session_now(today) and q.get("status") != "OPEN" \
+            and d[-1] < last_session_day(today) and _quote_is_new_day(q, c, h, v):
+        # 주말·장 전인데 일봉에 마지막 세션 봉이 빠졌고, 시세가 그 세션 것(전일 종가 = 일봉 마지막 종가)이면 그 봉을 붙여요
+        ls = last_session_day(today)
+        d = np.append(d, ls)
+        o = np.append(o, float(q.get("open") or price))
+        h = np.append(h, max(float(qh or price), float(price)))
+        l = np.append(l, min(float(ql or price), float(price)))
+        c = np.append(c, float(price))
+        v = np.append(v, float(qv) if qv else np.nan)
     elif price and len(d) and d[-1] < t64 and _is_session_now(today) and (
             q.get("status") == "OPEN" or _quote_is_new_day(q, c, h, v)):
         d = np.append(d, t64)
@@ -3682,9 +3730,11 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
         return out
     q = quote or {}
     # ── 데이터 점검: 일봉이 하루 넘게 늦으면(시세의 전일 종가가 일봉의 마지막·그 앞 종가 어디와도 안 맞음) 판정을 믿지 않아요
+    # (2026.10.17) 예전엔 가격만 비교해서, 장중에 받아 둔 덜 끝난 봉이 남은 급등주(주말)까지 '지연'으로 빠졌어요.
+    # 이제 ① 일봉 마지막 날짜가 가장 최근 세션보다 이르고 ② 시세 가격·전일 종가도 일봉과 안 맞을 때만 지연이에요(공휴일은 가격이 같아 괜찮아요).
     lag = False
-    if q.get("prev") and n >= 3:
-        lag = not (_near(q["prev"], c[-2]) or _near(q["prev"], c[-1]) or d[-1] == np.datetime64(today, "D"))
+    if q.get("price") and n >= 3 and d[-1] < last_session_day(today):
+        lag = not _near(q["price"], c[-1])        # 빠진 봉을 시세로 못 메웠고 가격도 다름 = 이틀 이상 늦은 일봉
     prior = h[max(0, n - 1 - lookback):n - 1]
     okp = np.isfinite(prior)
     if not okp.any():
@@ -3728,7 +3778,9 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
         state = "관찰"
     else:
         state = None
-    closed = q.get("status") not in (None, "OPEN") and _is_session_now(today) and now_kst().time() >= time(15, 30)
+    _now = now_kst()
+    in_session = _now.date() == today and _now.weekday() < 5 and time(9, 0) <= _now.time() < time(15, 30)
+    closed = q.get("status") not in (None, "OPEN") and not in_session     # 장 마감 뒤·주말·장 전 = 마지막 세션 종가로 확정
     confirm = None
     if state == "돌파":
         if closed and krx_close > ref:
@@ -3836,14 +3888,20 @@ def nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | Non
     cand["change"] = np.where(prev > 0, (cand["nh_price"] / prev - 1) * 100, cand["change"])
     rs = pd.to_numeric(cand["rs"], errors="coerce").fillna(0)
     tvr = pd.to_numeric(cand["tv_ratio"], errors="coerce").fillna(0)
-    strong = (rs >= p["rs_min"]) & (tvr >= p["tv_min"])
+    tv20 = pd.to_numeric(cand["tv20"], errors="coerce") if "tv20" in cand else pd.Series(np.nan, index=cand.index)
+    liquid = tv20.isna() | (tv20 >= float(p.get("tv20_min") or 0))
+    strong = (rs >= p["rs_min"]) & (tvr >= p["tv_min"]) & liquid
     st_ = cand["nh_state"]
     good = ~cand["data_lag"].fillna(False).astype(bool)
+    first = cand["nh_recent"].fillna(1) == 0
+    pull_ok = pd.to_numeric(cand["peak_gap"], errors="coerce").fillna(-99) >= -float(p.get("pull_max") or 99)
+    cand["strong"] = strong
     cand["section"] = None
-    cand.loc[(st_ == "돌파") & good, "section"] = "돌파 중"
-    cand.loc[st_.isin(["터치", "밀림"]) & good, "section"] = "찍고 밀림"
     cand.loc[st_.isin(["임박", "근접"]) & strong & good, "section"] = "돌파권"
-    cand["fresh"] = st_.isin(["돌파", "터치", "임박", "근접"]) & strong & (cand["nh_recent"] == 0) & good
+    cand.loc[st_.isin(["임박", "근접"]) & strong & good & first, "section"] = "신선 후보"
+    cand.loc[st_.isin(["터치", "밀림"]) & strong & good & pull_ok, "section"] = "찍고 밀림"
+    cand.loc[(st_ == "돌파") & strong & good, "section"] = "돌파 중"
+    cand["fresh"] = first & st_.isin(["돌파", "터치", "임박", "근접"])          # ⭐ 최근 fresh_days거래일 첫 신고가 자리
     order = {s: i for i, s in enumerate(NHC_STATES)}
     cand["_o"] = cand["nh_state"].map(order)
     cand["_k"] = np.where(cand["nh_state"] == "돌파", -cand["nh_brk"],
@@ -4346,3 +4404,82 @@ def ia_signal_text(sig: dict, title: str) -> str:
         lines.append("⚠️ 20일선 아래 종목이 절반 넘음 — 정찰병 비중으로만")
     lines.append("원칙: 아침·종가 나눠 사기 · 손절 -8%(ATR) · 3R에서 1/3 익절 → 손절 본절(+1%)")
     return "\n".join(lines)
+
+
+# ─────────────────────────── 🏁 신고가 후보: 코스피·코스닥 전 종목 스캔 ───────────────────────────
+SCAN_BARS = 300        # 직전 52주(250일) + 신선(60일) 판단에 필요한 만큼만
+
+
+def bars_to_arr(hist: pd.DataFrame | None, keep: int = SCAN_BARS):
+    """일봉 표 → 가벼운 배열 묶음 (날짜, 시가, 고가, 저가, 종가, 거래량). 표보다 메모리를 훨씬 덜 써요."""
+    if hist is None or hist.empty:
+        return None
+    h = hist.tail(keep)
+    d = h["date"].values.astype("datetime64[D]")
+    cols = [pd.to_numeric(h[k], errors="coerce").to_numpy(dtype=np.float32) if k in h else
+            pd.to_numeric(h["close"], errors="coerce").to_numpy(dtype=np.float32)
+            for k in ("open", "high", "low", "close", "volume")]
+    return (d, *cols)
+
+
+def merge_arr(old, new, keep: int = SCAN_BARS):
+    """예전 배열 + 새로 받은 최근 며칠 → 새 날짜부터는 새 값으로 바꿔 붙여요."""
+    if old is None:
+        return new
+    if new is None or not len(new[0]):
+        return old
+    cut = old[0] < new[0][0]
+    return tuple(np.concatenate([o[cut], n])[-keep:] for o, n in zip(old, new))
+
+
+def arr_df(arr) -> pd.DataFrame:
+    d, o, h, l, c, v = arr
+    return pd.DataFrame({"date": pd.to_datetime(d), "open": o, "high": h, "low": l, "close": c, "volume": v})
+
+
+def scan_frame(arrs: dict, quotes: dict, uni: dict, board: pd.DataFrame | None = None,
+               today: date | None = None) -> pd.DataFrame:
+    """전 종목 배열 + 실시간 시세 → 신고가 후보 계산용 표.
+    RS·RS1M은 보드 종목끼리가 아니라 코스피·코스닥 전 종목 안에서의 백분위(오닐 가중: 3M 0.4 · 6·9·12M 0.2씩)예요."""
+    today = today or now_kst().date()
+    binfo = board.drop_duplicates("code").set_index("code") if board is not None and len(board) else None
+    rows = []
+    for code, arr in arrs.items():
+        if arr is None or len(arr[0]) < 60:
+            continue
+        q = quotes.get(code) or {}
+        d, o, h, l, c, v = _session_arrays(*arr, q, today)
+        n = len(c)
+        price = float(c[-1])
+        if not price > 0:
+            continue
+        prior = h[max(0, n - 251):n - 1]
+        prior = prior[np.isfinite(prior)]
+        hi52 = float(max(prior.max() if len(prior) else 0, h[-1]))
+        hh = h[max(0, n - 250):]
+        dsh = int(np.nanargmax(hh[::-1])) if len(hh) and np.isfinite(hh).any() else None   # 마지막 52주 고점이 며칠 전인지
+        rets = {}
+        for key, k in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
+            rets[key] = (price / float(c[-1 - k]) - 1) * 100 if n > k and c[-1 - k] > 0 else None
+        tv = (c * v)[:-1][-20:]
+        tv = tv[np.isfinite(tv)]
+        prev = q.get("prev") or (float(c[-2]) if n >= 2 else None)
+        b = binfo.loc[code] if binfo is not None and code in binfo.index else None
+        u = uni.get(code) or {}
+        rows.append({
+            "code": code, "name": (b["name"] if b is not None else u.get("name")) or code,
+            "group": (b["group"] if b is not None else (u.get("industry") or u.get("market") or "")),
+            "sector": (b["sector"] if b is not None else ""), "market": u.get("market") or "",
+            "price": price, "change": (price / prev - 1) * 100 if prev else None,
+            "high52": hi52, "days_since_high": dsh, "h52_fixed": False,
+            "atr_pct": _atr_np(h[-41:], l[-41:], c[-41:], ATR_DAYS) if n >= 25 else None,
+            "ret_1m": rets["ret_1m"], "rs_raw": rs_raw_score(rets),
+            "tv20": float(tv.mean()) if len(tv) >= 10 else None, "cap_krw": None,
+            "url": quote_url(code), "in_board": b is not None})
+    f = pd.DataFrame(rows)
+    if f.empty:
+        return f
+    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m")):
+        vals = pd.to_numeric(f[raw], errors="coerce")
+        f[col] = (vals.rank(pct=True, method="average") * 98 + 1).round().where(vals.notna())
+    return f
