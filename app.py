@@ -3374,6 +3374,11 @@ def _lock_gate(stt: dict) -> bool:
                 st.error(f"비밀번호가 달라요. ({n}/{LOCK_MAX_FAIL})")
         if lock.get("hint"):
             st.caption(f"💡 힌트: {lock['hint']}")
+        # 친구는 이 칸이 아니라 ⭐ 관심종목 탭에서 자기 아이디로 로그인해요
+        st.info("👥 **친구라면 여기가 아니에요.** 이 칸은 앱 주인 전용이에요. "
+                "⭐ 관심종목 탭에서 아이디·비밀번호로 가입·로그인하면 내 종목을 볼 수 있어요.")
+        st.button("⭐ 관심종목 탭으로 가기", key="lk_to_watch",
+                  on_click=lambda: st.session_state.update(main_tab_sel="⭐ 관심종목"))
 
         # ③ 비밀번호 찾기(다시 정하기)
         with st.expander("🔑 비밀번호를 잊으셨나요?"):
