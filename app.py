@@ -21,6 +21,7 @@ import time
 
 import data
 import holdings
+import friends
 import reports
 import stocks as stock_list
 import theme
@@ -227,7 +228,8 @@ def _app_gate():
         st.stop()
     sec_lock = _secret("APP_LOCK").lower()
     lock_on = (bool(cfg.get("app_lock")) or sec_lock in ("on", "true", "1", "yes")) and sec_lock != "off"
-    if not lock_on or not holdings.has_password(cfg) or st.session_state.get("app_unlocked"):
+    if not lock_on or not holdings.has_password(cfg) or st.session_state.get("app_unlocked") \
+            or st.session_state.get("friend_id"):
         return
     store = _sec_store()
     now = time.time()
@@ -273,7 +275,138 @@ def _app_gate():
             st.caption(f"💡 힌트: {lock['hint']}")
         st.caption("비밀번호를 잊었으면(앱 주인만): Streamlit Secrets에 APP_LOCK = \"off\"를 넣고 들어가서 "
                    "💼 내 보유 탭의 '비밀번호를 잊으셨나요?'로 다시 정한 뒤 APP_LOCK을 지우세요.")
+        if _friends_key():
+            with st.expander("👥 친구 아이디로 들어가기"):
+                _friend_login_form("gate")
     st.stop()
+
+
+# ─────────────────────────── 👥 친구 계정(로그인·저장) ───────────────────────────
+def _friends_key() -> str:
+    return _secret("USERS_KEY")
+
+
+@st.cache_resource(show_spinner=False)
+def _friends_db() -> dict:
+    """모든 접속이 같이 쓰는 친구 계정·관심종목(서버 메모리 한 벌). 켜질 때 GitHub에서 한 번 받아요.
+    열쇠(USERS_KEY)가 맞지 않으면 data=None으로 두고, 저장도 막아서 남의 자료를 덮어쓰지 않아요."""
+    key = _friends_key()
+    if not key:
+        return {"data": None, "err": "nokey"}
+    token = _secret("GITHUB_TOKEN")
+    if token:
+        blob = reports.fetch_github_json(friends.GH_PATH, token, _secret("GITHUB_REPO", "kimgun124-boop/very"),
+                                         _secret("GITHUB_BRANCH") or None)
+        if blob is not None:
+            d = friends.decrypt(blob, key)
+            if d is None:
+                return {"data": None, "err": "badkey"}
+            friends.save_local(d, key)
+            return {"data": d, "err": ""}
+    d = friends.load_local(key)
+    return {"data": d, "err": "" if d is not None else "badkey"}
+
+
+def _friends_save() -> tuple[bool, str]:
+    db = _friends_db()
+    if db["data"] is None:
+        return False, "계정 저장소를 열 수 없어서 저장하지 않았어요."
+    key = _friends_key()
+    with friends._LOCK:
+        blob = friends.save_local(db["data"], key)
+    token = _secret("GITHUB_TOKEN")
+    if not token:
+        return True, "이 서버에만 임시로 저장했어요(GITHUB_TOKEN이 없어서 앱을 다시 켜면 사라질 수 있어요)."
+    return reports.save_github(blob, token, _secret("GITHUB_REPO", "kimgun124-boop/very"),
+                               _secret("GITHUB_BRANCH") or None, path=friends.GH_PATH)
+
+
+def _login_limited(ip: str) -> tuple[dict, bool]:
+    """로그인 실패 횟수(IP별). 막혔으면 (기록, True)."""
+    store = _sec_store()
+    now = time.time()
+    rec = store["fails"].setdefault("wl:" + ip, {"n": 0, "day": 0, "until": 0.0, "t0": now})
+    if now - rec["t0"] > 86400:
+        rec.update(day=0, t0=now)
+    return rec, rec["until"] > now
+
+
+def _friend_login_form(prefix: str, after=None) -> None:
+    """아이디·비밀번호 로그인 + (초대 코드가 있으면) 가입. 앱 잠금 화면과 관심종목 탭이 같이 써요."""
+    db = _friends_db()
+    if db["data"] is None:
+        if db["err"] == "nokey":
+            st.info("친구 계정 기능을 쓰려면 앱 주인이 Streamlit Secrets에 USERS_KEY를 넣어야 해요.")
+        else:
+            st.error("계정 저장소의 열쇠(USERS_KEY)가 맞지 않아요. 앱 주인에게 알려 주세요.")
+        return
+    ip = _client_ip()
+    invite = _secret("INVITE_CODE")
+    t_in, t_up = st.tabs(["🔑 로그인", "🆕 가입"])
+    with t_in:
+        rec, blocked = _login_limited(ip)
+        if blocked:
+            st.error(f"너무 많이 틀려서 잠시 막혔어요. {int((rec['until'] - time.time()) // 60) + 1}분 뒤에 다시 시도하세요.")
+        else:
+            with st.form(f"{prefix}_login", clear_on_submit=False, border=False):
+                uid = st.text_input("아이디", key=f"{prefix}_uid")
+                pw = st.text_input("비밀번호", type="password", key=f"{prefix}_pw")
+                go = st.form_submit_button("로그인", type="primary", width="stretch")
+            if go:
+                if friends.login(db["data"], uid, pw):
+                    rec.update(n=0)
+                    _sec_log(f"친구 로그인({friends.norm_id(uid)})", ip, True)
+                    st.session_state["friend_id"] = friends.norm_id(uid)
+                    if after:
+                        after()
+                    st.rerun()
+                rec["n"] += 1
+                rec["day"] += 1
+                _sec_log(f"친구 로그인({friends.norm_id(uid)})", ip, False)
+                if rec["n"] >= SEC_MAX_FAIL:
+                    rec.update(n=0, until=time.time() + SEC_WAIT_SEC)
+                    st.error(f"{SEC_MAX_FAIL}번 틀려서 {SEC_WAIT_SEC // 60}분 동안 막았어요.")
+                else:
+                    st.error(f"아이디나 비밀번호가 달라요. ({rec['n']}/{SEC_MAX_FAIL})")
+            st.caption("비밀번호를 잊었으면 앱 주인에게 임시 비밀번호를 받아서 들어온 뒤 바꾸세요.")
+    with t_up:
+        if not invite:
+            st.info("지금은 가입을 받지 않아요. 앱 주인에게 계정을 만들어 달라고 하세요.")
+            return
+        with st.form(f"{prefix}_signup", clear_on_submit=False, border=False):
+            nid = st.text_input("아이디(2~20자)", key=f"{prefix}_nid")
+            nick = st.text_input("이름(화면에 보일 이름, 선택)", key=f"{prefix}_nick")
+            npw = st.text_input("비밀번호(6자 이상)", type="password", key=f"{prefix}_npw")
+            npw2 = st.text_input("비밀번호 한 번 더", type="password", key=f"{prefix}_npw2")
+            code = st.text_input("초대 코드(앱 주인에게 받은 코드)", type="password", key=f"{prefix}_inv")
+            go = st.form_submit_button("가입하기", type="primary", width="stretch")
+        if go:
+            rec, blocked = _login_limited(ip)
+            if blocked:
+                st.error("잠시 막혔어요. 나중에 다시 시도하세요.")
+            elif code.strip() != invite.strip():
+                rec["n"] += 1
+                rec["day"] += 1
+                _sec_log("친구 가입(초대 코드 틀림)", ip, False)
+                if rec["n"] >= SEC_MAX_FAIL:
+                    rec.update(n=0, until=time.time() + SEC_WAIT_SEC)
+                st.error("초대 코드가 달라요.")
+            elif npw != npw2:
+                st.error("비밀번호 두 개가 달라요.")
+            else:
+                err = friends.sign_up(db["data"], nid, npw, nick)
+                if err:
+                    st.error(err)
+                else:
+                    ok, msg = _friends_save()
+                    _sec_log(f"친구 가입({friends.norm_id(nid)})", ip, True)
+                    st.session_state["friend_id"] = friends.norm_id(nid)
+                    st.success("가입했어요! 바로 로그인됐어요." + ("" if ok else f" (주의: {msg})"))
+                    if after:
+                        after()
+                    time.sleep(0.6)
+                    st.rerun()
+        st.caption("비밀번호는 암호화(해시)해서 저장돼서 앱 주인도 볼 수 없어요. 다른 사이트와 다른 비밀번호를 쓰세요.")
 
 
 UP, DOWN = "#D6333B", "#1F66C9"        # 한국식: 상승 빨강, 하락 파랑
@@ -3836,6 +3969,298 @@ def render_monitor_tab(df: pd.DataFrame, quotes: dict):
     st.caption("AI 판단은 원칙 점검을 돕는 참고 의견이에요. 손절선·익절가 같은 숫자는 규칙 판정이 기준이고, 매매 전에는 HTS 시세를 확인하세요.")
 
 
+# ─────────────────────────── ⭐ 관심종목(친구 계정) ───────────────────────────
+WATCH_CSS = """<style>
+.wl-who { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; background:#FFFFFF; border:1px solid #ECEAF7;
+  border-radius:14px; padding:.7rem 1rem; margin:.2rem 0 .8rem; }
+.wl-who b { font-size:1.02rem; } .wl-who span { color:#6B7280; font-size:.85rem; }
+.wl-tbl { width:100%; border-collapse:collapse; font-size:.9rem; background:#FFFFFF; border-radius:12px; overflow:hidden; }
+.wl-tbl th { background:#F6F5FD; color:#51616C; font-weight:700; padding:.5rem .6rem; text-align:right; white-space:nowrap; }
+.wl-tbl td { padding:.5rem .6rem; border-top:1px solid #F0EFF7; text-align:right; white-space:nowrap; }
+.wl-tbl th.l, .wl-tbl td.l { text-align:left; }
+.wl-tbl td.l small { color:#8A979F; margin-left:.3rem; }
+.wl-memo { color:#6B7280; max-width:14rem; overflow:hidden; text-overflow:ellipsis; }
+.wl-wrap { overflow-x:auto; border:1px solid #ECEAF7; border-radius:12px; }
+@media (max-width: 640px) { .wl-tbl { font-size:.8rem; } .wl-tbl th, .wl-tbl td { padding:.4rem .4rem; } .wl-hide-m { display:none; } }
+</style>"""
+
+
+def _watch_rows(items: list[dict], df: pd.DataFrame, quotes: dict, histories: dict | None = None) -> list[dict]:
+    """관심종목 한눈에 표에 쓸 값. 보드에 있는 종목은 보드 값을, 없으면 시세·일봉으로 바로 계산해요."""
+    codes = tuple(x["code"] for x in items)
+    need_q = tuple(c for c in codes if data.is_kr(c) and c not in quotes)
+    qs = dict(quotes)
+    if need_q:
+        try:
+            qs.update(load_quotes(need_q)[0] or {})
+        except Exception:
+            pass
+    kr = tuple(c for c in codes if data.is_kr(c))
+    flows = {**(_TRENDS_BG.get("v") or {})}
+    miss = tuple(c for c in kr if flows.get(c) is None or flows[c].empty)
+    if miss:
+        try:
+            flows.update(load_trends(miss) or {})
+        except Exception:
+            pass
+    now = data.now_kst()
+    out = []
+    for x in items:
+        c = x["code"]
+        q = qs.get(c)
+        hit = df[df["code"] == c]
+        bars = (histories or {}).get(c)
+        if bars is None or getattr(bars, "empty", True):
+            bars = load_chart(c, "일봉")                  # 보드에 없는 종목만 일봉을 따로 받아요
+        if len(hit):
+            m = hit.iloc[0].to_dict()
+        else:
+            m = data.compute_metrics(bars, q) if bars is not None and not bars.empty else {}
+        pace = holdings.volume_pace((q or {}).get("volume"), _vol50(bars), now, (q or {}).get("status"))
+        fl = holdings.flow_snapshot(flows.get(c)) if data.is_kr(c) else {"rows": []}
+        fr = {k: d for k, d, *_ in fl["rows"]}
+        out.append({**x, "m": m, "q": q, "pace": pace, "frg": fr.get("외국인"), "inst": fr.get("기관"),
+                    "flow": flows.get(c), "cur": m.get("currency") or ("KRW" if data.is_kr(c) else "USD")})
+    return out
+
+
+def _watch_table(rows: list[dict]):
+    def col(v, fmt="{:+.2f}%"):
+        if v is None or pd.isna(v):
+            return '<td>-</td>'
+        return f'<td style="color:{UP if v > 0 else DOWN if v < 0 else "inherit"}">{fmt.format(v)}</td>'
+
+    trs = []
+    for r in rows:
+        m = r["m"]
+        to_high = m.get("to_high")
+        th = "-" if to_high is None or pd.isna(to_high) else ("🏔️ 신고가" if to_high <= 0.05 else f"{to_high:.1f}%")
+        pace = r["pace"]
+        trs.append(
+            f'<tr><td class="l"><b>{html.escape(r["name"])}</b><small>{r["code"]}</small></td>'
+            f'<td>{fmt_price(m.get("price"), r["cur"])}</td>' + col(m.get("change"))
+            + f'<td>{th}</td>'
+            + f'<td class="wl-hide-m">{"-" if pace is None else ("<b>" if pace >= 1.5 else "") + f"{pace:.1f}배" + ("</b>" if pace >= 1.5 else "")}</td>'
+            + f'<td class="wl-hide-m" style="color:{UP if (r["frg"] or 0) > 0 else DOWN}">{_eok(r["frg"])}</td>'
+            + f'<td class="wl-hide-m" style="color:{UP if (r["inst"] or 0) > 0 else DOWN}">{_eok(r["inst"])}</td>'
+            + f'<td class="l wl-memo wl-hide-m">{html.escape(r.get("memo") or "")}</td></tr>')
+    st.markdown('<div class="wl-wrap"><table class="wl-tbl"><thead><tr><th class="l">종목</th><th>현재가</th><th>등락</th>'
+                '<th>52주 고점까지</th><th class="wl-hide-m">거래량 페이스</th><th class="wl-hide-m">외국인</th>'
+                '<th class="wl-hide-m">기관</th><th class="l wl-hide-m">메모</th></tr></thead><tbody>'
+                + "".join(trs) + "</tbody></table></div>", unsafe_allow_html=True)
+    st.caption("외국인·기관 = 최근 거래일 순매수(억원, 추정) · 거래량 페이스 = 오늘 거래량 ÷ 50일 평균(지난 장 시간 비율로 맞춤), 1.5배↑ 굵게")
+
+
+def _watch_detail(r: dict, uid: str):
+    db = _friends_db()
+    m, q, cur = r["m"], r["q"], r["cur"]
+    chg = m.get("change")
+    k = st.columns(5)
+    k[0].metric("현재가", fmt_price(m.get("price"), cur), None if chg is None or pd.isna(chg) else f"{chg:+.2f}%")
+    k[1].metric("52주 최고", fmt_price(m.get("high52"), cur),
+                None if m.get("to_high") is None or pd.isna(m.get("to_high")) else f"고점까지 {m['to_high']:.1f}%",
+                delta_color="off")
+    k[2].metric("52주 최저", fmt_price(m.get("low52"), cur), delta_color="off")
+    k[3].metric("거래량 페이스", "-" if r["pace"] is None else f"{r['pace']:.1f}배",
+                None if not q or not q.get("volume") else f"{q['volume']:,.0f}주", delta_color="off")
+    k[4].metric("외국인·기관(억)", f"{_eok(r['frg'])} / {_eok(r['inst'])}", delta_color="off")
+
+    b1, b2 = st.columns([1, 1.2])
+    with b1:
+        st.markdown("**🧭 수급** (외국인·기관)")
+        if r["flow"] is not None and not r["flow"].empty:
+            _mon_flow_view({"_flow": r["flow"]})
+        else:
+            st.caption("수급 자료가 없어요(해외 종목이거나 아직 못 받음).")
+    with b2:
+        st.markdown("**📰 뉴스**")
+        _mon_news_view(load_news_live(r["code"], r["name"]))
+    st.markdown("**🕯️ 차트**")
+    candle_chart(r["code"], cur, q if data.is_kr(r["code"]) else None, m.get("high52"), key=f"wl_ch_{r['code']}")
+
+    with st.expander("✏️ 메모 · 순서 · 빼기"):
+        c1, c2 = st.columns([3, 1])
+        memo = c1.text_input("메모", value=r.get("memo") or "", key=f"wl_memo_{r['code']}", max_chars=60)
+        if c2.button("메모 저장", key=f"wl_memo_save_{r['code']}", width="stretch"):
+            friends.set_memo(db["data"], uid, r["code"], memo)
+            ok, msg = _friends_save()
+            (st.success if ok else st.error)("저장했어요." if ok else msg)
+        c1, c2, c3 = st.columns(3)
+        if c1.button("⬆️ 앞으로", key=f"wl_up_{r['code']}", width="stretch"):
+            friends.move_watch(db["data"], uid, r["code"], -1)
+            _friends_save()
+            st.rerun()
+        if c2.button("⬇️ 뒤로", key=f"wl_dn_{r['code']}", width="stretch"):
+            friends.move_watch(db["data"], uid, r["code"], +1)
+            _friends_save()
+            st.rerun()
+        if c3.button("🗑️ 관심종목에서 빼기", key=f"wl_del_{r['code']}", width="stretch"):
+            friends.remove_watch(db["data"], uid, r["code"])
+            ok, msg = _friends_save()
+            if not ok:
+                st.error(msg)
+            st.session_state.pop("wl_tab_sel", None)
+            st.rerun()
+
+
+def _friends_admin():
+    """앱 주인(💼 내 보유 잠금을 푼 사람)만: 친구 계정 만들기·임시 비밀번호·지우기."""
+    db = _friends_db()
+    if db["data"] is None:
+        return
+    users = db["data"].get("users") or {}
+    with st.expander(f"🛠️ 친구 계정 관리 (앱 주인만 보여요 · {len(users)}명)"):
+        if not _secret("INVITE_CODE"):
+            st.caption("Secrets에 INVITE_CODE = \"원하는코드\"를 넣으면 친구가 그 코드로 직접 가입할 수 있어요. "
+                       "없으면 여기서만 계정을 만들 수 있어요.")
+        else:
+            st.caption("친구에게 초대 코드(Secrets의 INVITE_CODE)를 알려 주면 직접 가입해요.")
+        with st.form("wl_admin_new", clear_on_submit=True, border=False):
+            c1, c2, c3 = st.columns([1.2, 1.2, 1])
+            nid = c1.text_input("새 아이디")
+            nick = c2.text_input("이름(선택)")
+            mk = c3.form_submit_button("계정 만들기", width="stretch")
+        if mk:
+            pw = friends.temp_password()
+            err = friends.sign_up(db["data"], nid, pw, nick)
+            if err:
+                st.error(err)
+            else:
+                ok, msg = _friends_save()
+                st.success(f"만들었어요 → 아이디 **{nid.strip()}** / 임시 비밀번호 **{pw}** (지금만 보여요, 친구에게 전해 주고 "
+                           "들어가서 바꾸라고 하세요)" + ("" if ok else f" · 주의: {msg}"))
+        if users:
+            rows = [{"아이디": u.get("id"), "이름": u.get("nick"), "관심종목": len(u.get("watch") or []),
+                     "가입": u.get("created")} for u in users.values()]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            c1, c2, c3 = st.columns([1.4, 1, 1])
+            who = c1.selectbox("계정 고르기", list(users), format_func=lambda k: f"{users[k].get('id')} ({users[k].get('nick')})",
+                               key="wl_admin_who")
+            if c2.button("🔁 임시 비밀번호", key="wl_admin_reset", width="stretch"):
+                pw = friends.temp_password()
+                friends.change_pw(db["data"], who, pw)
+                ok, msg = _friends_save()
+                st.success(f"{users[who].get('id')}의 임시 비밀번호: **{pw}** (지금만 보여요)" + ("" if ok else f" · 주의: {msg}"))
+            if c3.button("🗑️ 계정 지우기", key="wl_admin_del", width="stretch"):
+                st.session_state["wl_admin_confirm"] = who
+            if st.session_state.get("wl_admin_confirm") == who:
+                st.warning(f"{users[who].get('id')} 계정과 관심종목을 모두 지울까요? 되돌릴 수 없어요.")
+                if st.button("네, 지울게요", key="wl_admin_del_ok", type="primary"):
+                    friends.delete_user(db["data"], who)
+                    if st.session_state.get("friend_id") == who:
+                        st.session_state.pop("friend_id", None)
+                    st.session_state.pop("wl_admin_confirm", None)
+                    ok, msg = _friends_save()
+                    (st.success if ok else st.error)("지웠어요." if ok else msg)
+                    st.rerun()
+
+
+def render_watch_tab(df: pd.DataFrame, quotes: dict, histories: dict | None = None):
+    """⭐ 관심종목: 친구마다 아이디로 로그인해서 자기 관심종목의 주가·수급·차트·뉴스를 봐요."""
+    _sec_h("⭐ 관심종목", "아이디로 로그인하면 내가 담은 종목의 주가·수급·차트·뉴스를 한곳에서 봐요")
+    st.markdown(MON_CSS + WATCH_CSS, unsafe_allow_html=True)
+    db = _friends_db()
+    owner = bool(st.session_state.get("hold_unlocked"))
+    if db["data"] is None and db["err"] == "nokey":
+        st.info("친구 계정 기능이 아직 꺼져 있어요. 앱 주인이 Streamlit Secrets에 USERS_KEY를 넣으면 열려요.")
+        if owner:
+            st.code('USERS_KEY = "아무도 모르는 긴 문자열"   # 계정·관심종목 파일 암호화 열쇠(바꾸면 기존 계정을 못 읽어요)\n'
+                    'INVITE_CODE = "친구에게 알려 줄 초대 코드"   # 선택: 없으면 앱 주인만 계정을 만들어요', language="toml")
+        return
+    uid = st.session_state.get("friend_id")
+    u = friends.user(db["data"], uid) if (uid and db["data"] is not None) else None
+    if not u:
+        st.session_state.pop("friend_id", None)
+        c = st.columns([1, 1.4, 1])[1]
+        with c:
+            _friend_login_form("wl")
+        if owner:
+            _friends_admin()
+        return
+
+    c1, c2 = st.columns([4, 1])
+    c1.markdown(f'<div class="wl-who">👋 <b>{html.escape(u.get("nick") or u.get("id"))}</b>'
+                f'<span>님의 관심종목 · {len(u.get("watch") or [])}/{friends.MAX_WATCH}</span></div>', unsafe_allow_html=True)
+    if c2.button("로그아웃", key="wl_logout", width="stretch"):
+        _sec_log(f"친구 로그아웃({uid})", _client_ip())
+        st.session_state.pop("friend_id", None)
+        st.session_state.pop("wl_tab_sel", None)
+        st.rerun()
+
+    board_labels = {s["code"]: s["name"] for s in STOCKS}
+    with st.expander("➕ 관심종목 추가", expanded=not u.get("watch")):
+        c1, c2 = st.columns([1.4, 1])
+        q = c1.text_input("종목 이름이나 코드", key="wl_q", placeholder="예: 삼성전자, 005930")
+        cands = []
+        if q.strip():
+            ql = q.strip().lower()
+            cands = [(c, n) for c, n in board_labels.items() if ql in n.lower() or c.lower().startswith(ql)][:10]
+            if data.is_kr(q.strip()) and len(q.strip()) == 6 and q.strip() not in board_labels:
+                cands.insert(0, (q.strip(), q.strip()))
+            if len(cands) < 5:
+                cands += [x for x in naver_search(q.strip()) if x[0] not in {c for c, _ in cands}][:8]
+        pick = c2.selectbox("찾은 종목", cands, format_func=lambda t: f"{t[1]} ({t[0]})", key=f"wl_pick_{q.strip()}",
+                            placeholder="먼저 왼쪽에 검색", index=0 if cands else None)
+        c1, c2 = st.columns([3, 1])
+        memo = c1.text_input("메모(선택)", key="wl_new_memo", max_chars=60, placeholder="예: 실적 발표 후 다시 보기")
+        if c2.button("담기", type="primary", width="stretch", disabled=not pick, key="wl_add"):
+            err = friends.add_watch(db["data"], uid, pick[0], pick[1], memo)
+            if err:
+                st.warning(err)
+            else:
+                ok, msg = _friends_save()
+                if ok:
+                    st.success(f"{pick[1]}을(를) 담았어요.")
+                else:
+                    st.error(msg)
+                time.sleep(0.4)
+                st.rerun()
+
+    with st.expander("🔒 내 비밀번호 바꾸기"):
+        with st.form("wl_pw", clear_on_submit=True, border=False):
+            old = st.text_input("지금 비밀번호", type="password")
+            new = st.text_input("새 비밀번호(6자 이상)", type="password")
+            new2 = st.text_input("새 비밀번호 한 번 더", type="password")
+            go = st.form_submit_button("바꾸기")
+        if go:
+            if not friends.login(db["data"], uid, old):
+                st.error("지금 비밀번호가 달라요.")
+            elif new != new2:
+                st.error("새 비밀번호 두 개가 달라요.")
+            else:
+                err = friends.change_pw(db["data"], uid, new)
+                if err:
+                    st.error(err)
+                else:
+                    ok, msg = _friends_save()
+                    (st.success if ok else st.error)("바꿨어요." if ok else msg)
+    if owner:
+        _friends_admin()
+
+    items = friends.watchlist(db["data"], uid)
+    if not items:
+        st.info("아직 담은 종목이 없어요. 위 ➕ 관심종목 추가에서 종목을 검색해서 담아 보세요.")
+        return
+    rows = _watch_rows(items, df, quotes, histories)
+    labels = ["📊 한눈에"] + [r["name"] for r in rows]       # 등락률을 넣으면 새로고침 때마다 고른 탭이 풀려요
+    with st.container(key="wl_tabs"):
+        try:
+            tabs = st.tabs(labels, key="wl_tab_sel", on_change="rerun")
+            lazy = True
+        except TypeError:
+            tabs = st.tabs(labels)
+            lazy = False
+    if (not lazy) or tabs[0].open:
+        with tabs[0]:
+            _watch_table(rows)
+    for tab, r in zip(tabs[1:], rows):
+        if lazy and not tab.open:
+            continue
+        with tab:
+            _watch_detail(r, uid)
+    st.caption("시세는 실시간(해외는 15분 지연), 수급은 최근 거래일 기준 추정치예요. 매매 전에는 HTS 시세를 확인하세요.")
+
+
 def now_date() -> str:
     return data.now_kst().strftime("%y.%m.%d")
 
@@ -6405,7 +6830,7 @@ def render_board():
     _TRENDS_BG["v"] = trends_all
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
-    names = ["📋 리스트", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보",
+    names = ["📋 리스트", "⭐ 관심종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
@@ -6416,13 +6841,14 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
+    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
 
     jobs = [
         (t_list, lambda: render_list(df, histories, quote_error, shares_store, fins_all)),
+        (t_watch, lambda: render_watch_tab(df, quotes, histories)),
         (t_hold, lambda: render_holdings_tab(df, quotes)),
         (t_mon, lambda: render_monitor_tab(df, quotes)),
         (t_chart, lambda: render_chart_tab(df, quotes)),
