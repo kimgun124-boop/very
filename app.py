@@ -321,6 +321,9 @@ def _friends_save() -> tuple[bool, str]:
                                _secret("GITHUB_BRANCH") or None, path=friends.GH_PATH)
 
 
+SIGNUP_PER_IP_DAY = 3      # 한 IP에서 하루에 만들 수 있는 계정 수
+
+
 def _login_limited(ip: str) -> tuple[dict, bool]:
     """로그인 실패 횟수(IP별). 막혔으면 (기록, True)."""
     store = _sec_store()
@@ -341,8 +344,7 @@ def _friend_login_form(prefix: str, after=None) -> None:
             st.error("계정 저장소의 열쇠(USERS_KEY)가 맞지 않아요. 앱 주인에게 알려 주세요.")
         return
     ip = _client_ip()
-    invite = _secret("INVITE_CODE")
-    t_in, t_up = st.tabs(["🔑 로그인", "🆕 가입"])
+    t_in, t_up = st.tabs(["🔑 로그인", "🆕 처음이면 가입"])
     with t_in:
         rec, blocked = _login_limited(ip)
         if blocked:
@@ -370,34 +372,25 @@ def _friend_login_form(prefix: str, after=None) -> None:
                     st.error(f"아이디나 비밀번호가 달라요. ({rec['n']}/{SEC_MAX_FAIL})")
             st.caption("비밀번호를 잊었으면 앱 주인에게 임시 비밀번호를 받아서 들어온 뒤 바꾸세요.")
     with t_up:
-        if not invite:
-            st.info("지금은 가입을 받지 않아요. 앱 주인에게 계정을 만들어 달라고 하세요.")
-            return
         with st.form(f"{prefix}_signup", clear_on_submit=False, border=False):
             nid = st.text_input("아이디(2~20자)", key=f"{prefix}_nid")
-            nick = st.text_input("이름(화면에 보일 이름, 선택)", key=f"{prefix}_nick")
-            npw = st.text_input("비밀번호(6자 이상)", type="password", key=f"{prefix}_npw")
+            npw = st.text_input(f"비밀번호({friends.MIN_PW}자 이상)", type="password", key=f"{prefix}_npw")
             npw2 = st.text_input("비밀번호 한 번 더", type="password", key=f"{prefix}_npw2")
-            code = st.text_input("초대 코드(앱 주인에게 받은 코드)", type="password", key=f"{prefix}_inv")
-            go = st.form_submit_button("가입하기", type="primary", width="stretch")
+            go = st.form_submit_button("가입하고 바로 들어가기", type="primary", width="stretch")
         if go:
-            rec, blocked = _login_limited(ip)
-            if blocked:
-                st.error("잠시 막혔어요. 나중에 다시 시도하세요.")
-            elif code.strip() != invite.strip():
-                rec["n"] += 1
-                rec["day"] += 1
-                _sec_log("친구 가입(초대 코드 틀림)", ip, False)
-                if rec["n"] >= SEC_MAX_FAIL:
-                    rec.update(n=0, until=time.time() + SEC_WAIT_SEC)
-                st.error("초대 코드가 달라요.")
+            store = _sec_store()
+            day = data.now_kst().strftime("%Y%m%d")
+            made = store.setdefault("signups", {}).setdefault(f"{day}:{ip}", 0)
+            if made >= SIGNUP_PER_IP_DAY:          # 같은 곳에서 계정을 마구 만드는 것만 막아요
+                st.error("오늘은 이 기기에서 가입을 더 할 수 없어요. 내일 다시 하거나 앱 주인에게 말해 주세요.")
             elif npw != npw2:
                 st.error("비밀번호 두 개가 달라요.")
             else:
-                err = friends.sign_up(db["data"], nid, npw, nick)
+                err = friends.sign_up(db["data"], nid, npw)
                 if err:
                     st.error(err)
                 else:
+                    store["signups"][f"{day}:{ip}"] = made + 1
                     ok, msg = _friends_save()
                     _sec_log(f"친구 가입({friends.norm_id(nid)})", ip, True)
                     st.session_state["friend_id"] = friends.norm_id(nid)
@@ -4110,11 +4103,7 @@ def _friends_admin():
         return
     users = db["data"].get("users") or {}
     with st.expander(f"🛠️ 친구 계정 관리 (앱 주인만 보여요 · {len(users)}명)"):
-        if not _secret("INVITE_CODE"):
-            st.caption("Secrets에 INVITE_CODE = \"원하는코드\"를 넣으면 친구가 그 코드로 직접 가입할 수 있어요. "
-                       "없으면 여기서만 계정을 만들 수 있어요.")
-        else:
-            st.caption("친구에게 초대 코드(Secrets의 INVITE_CODE)를 알려 주면 직접 가입해요.")
+        st.caption("친구는 ⭐ 관심종목 탭에서 아이디·비밀번호로 직접 가입해요. 여기서는 대신 만들어 주거나 비밀번호를 다시 정해 줄 수 있어요.")
         with st.form("wl_admin_new", clear_on_submit=True, border=False):
             c1, c2, c3 = st.columns([1.2, 1.2, 1])
             nid = c1.text_input("새 아이디")
@@ -4164,8 +4153,7 @@ def render_watch_tab(df: pd.DataFrame, quotes: dict, histories: dict | None = No
     if db["data"] is None and db["err"] == "nokey":
         st.info("친구 계정 기능이 아직 꺼져 있어요. 앱 주인이 Streamlit Secrets에 USERS_KEY를 넣으면 열려요.")
         if owner:
-            st.code('USERS_KEY = "아무도 모르는 긴 문자열"   # 계정·관심종목 파일 암호화 열쇠(바꾸면 기존 계정을 못 읽어요)\n'
-                    'INVITE_CODE = "친구에게 알려 줄 초대 코드"   # 선택: 없으면 앱 주인만 계정을 만들어요', language="toml")
+            st.code('USERS_KEY = "아무도 모르는 긴 문자열"   # 계정·관심종목 파일 암호화 열쇠(바꾸면 기존 계정을 못 읽어요)', language="toml")
         return
     uid = st.session_state.get("friend_id")
     u = friends.user(db["data"], uid) if (uid and db["data"] is not None) else None
@@ -4219,7 +4207,7 @@ def render_watch_tab(df: pd.DataFrame, quotes: dict, histories: dict | None = No
     with st.expander("🔒 내 비밀번호 바꾸기"):
         with st.form("wl_pw", clear_on_submit=True, border=False):
             old = st.text_input("지금 비밀번호", type="password")
-            new = st.text_input("새 비밀번호(6자 이상)", type="password")
+            new = st.text_input("새 비밀번호(4자 이상)", type="password")
             new2 = st.text_input("새 비밀번호 한 번 더", type="password")
             go = st.form_submit_button("바꾸기")
         if go:

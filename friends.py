@@ -23,7 +23,8 @@ import holdings
 FRIENDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_friends.json")
 GH_PATH = "user_friends.json"
 MAX_WATCH = 40                       # 한 사람당 관심종목 최대 개수(앱이 느려지지 않게)
-MAX_USERS = 50
+MAX_USERS = 100
+MIN_PW = 4
 ID_RE = re.compile(r"^[A-Za-z0-9가-힣_.-]{2,20}$")
 
 _LOCK = threading.Lock()
@@ -88,8 +89,8 @@ def valid_id(uid: str) -> str | None:
 
 
 def valid_pw(pw: str) -> str | None:
-    if len(pw or "") < 6:
-        return "비밀번호는 6자 이상으로 정해 주세요."
+    if len(pw or "") < MIN_PW:
+        return f"비밀번호는 {MIN_PW}자 이상으로 정해 주세요."
     return None
 
 
