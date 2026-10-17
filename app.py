@@ -282,28 +282,56 @@ def _app_gate():
 
 
 # ─────────────────────────── 👥 친구 계정(로그인·저장) ───────────────────────────
+def _friends_keys() -> list[str]:
+    """계정 파일 암호화 열쇠 후보. 맨 앞이 지금 쓰는 열쇠예요.
+    USERS_KEY가 있으면 그걸, 없으면 이미 Secrets에 있는 GITHUB_TOKEN으로 열쇠를 만들어요(따로 넣을 것 없음).
+    나중에 USERS_KEY를 넣거나 토큰을 바꿔도, 예전 열쇠(USERS_KEY_OLD)로 한 번 열어서 새 열쇠로 다시 잠가요."""
+    keys = []
+    for k in (_secret("USERS_KEY"), ("gh:" + _secret("GITHUB_TOKEN")) if _secret("GITHUB_TOKEN") else "",
+              _secret("USERS_KEY_OLD")):
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
 def _friends_key() -> str:
-    return _secret("USERS_KEY")
+    ks = _friends_keys()
+    return ks[0] if ks else ""
+
+
+def _open_blob(blob, keys):
+    for k in keys:
+        d = friends.decrypt(blob, k)
+        if d is not None:
+            return d
+    return None
 
 
 @st.cache_resource(show_spinner=False)
 def _friends_db() -> dict:
     """모든 접속이 같이 쓰는 친구 계정·관심종목(서버 메모리 한 벌). 켜질 때 GitHub에서 한 번 받아요.
-    열쇠(USERS_KEY)가 맞지 않으면 data=None으로 두고, 저장도 막아서 남의 자료를 덮어쓰지 않아요."""
-    key = _friends_key()
-    if not key:
+    열쇠가 맞지 않으면 data=None으로 두고, 저장도 막아서 남의 자료를 덮어쓰지 않아요."""
+    keys = _friends_keys()
+    if not keys:
         return {"data": None, "err": "nokey"}
     token = _secret("GITHUB_TOKEN")
     if token:
         blob = reports.fetch_github_json(friends.GH_PATH, token, _secret("GITHUB_REPO", "kimgun124-boop/very"),
                                          _secret("GITHUB_BRANCH") or None)
         if blob is not None:
-            d = friends.decrypt(blob, key)
+            d = _open_blob(blob, keys)
             if d is None:
                 return {"data": None, "err": "badkey"}
-            friends.save_local(d, key)
+            friends.save_local(d, keys[0])
             return {"data": d, "err": ""}
-    d = friends.load_local(key)
+    try:
+        with open(friends.FRIENDS_FILE, encoding="utf-8") as f:
+            import json as _json
+            d = _open_blob(_json.load(f), keys)
+    except OSError:
+        d = friends.empty()
+    except ValueError:
+        d = None
     return {"data": d, "err": "" if d is not None else "badkey"}
 
 
@@ -339,9 +367,9 @@ def _friend_login_form(prefix: str, after=None) -> None:
     db = _friends_db()
     if db["data"] is None:
         if db["err"] == "nokey":
-            st.info("친구 계정 기능을 쓰려면 앱 주인이 Streamlit Secrets에 USERS_KEY를 넣어야 해요.")
+            st.info("친구 계정 기능을 쓰려면 앱 주인이 Streamlit Secrets에 GITHUB_TOKEN을 넣어야 해요.")
         else:
-            st.error("계정 저장소의 열쇠(USERS_KEY)가 맞지 않아요. 앱 주인에게 알려 주세요.")
+            st.error("계정 저장소의 열쇠가 맞지 않아요. 앱 주인에게 알려 주세요(GitHub 토큰을 바꿨다면 Secrets에 USERS_KEY_OLD = \"gh:예전토큰\").")
         return
     ip = _client_ip()
     t_in, t_up = st.tabs(["🔑 로그인", "🆕 처음이면 가입"])
@@ -4151,9 +4179,9 @@ def render_watch_tab(df: pd.DataFrame, quotes: dict, histories: dict | None = No
     db = _friends_db()
     owner = bool(st.session_state.get("hold_unlocked"))
     if db["data"] is None and db["err"] == "nokey":
-        st.info("친구 계정 기능이 아직 꺼져 있어요. 앱 주인이 Streamlit Secrets에 USERS_KEY를 넣으면 열려요.")
+        st.info("친구 계정 기능이 아직 꺼져 있어요. 앱 주인이 Streamlit Secrets에 GITHUB_TOKEN을 넣으면 열려요.")
         if owner:
-            st.code('USERS_KEY = "아무도 모르는 긴 문자열"   # 계정·관심종목 파일 암호화 열쇠(바꾸면 기존 계정을 못 읽어요)', language="toml")
+            st.code('GITHUB_TOKEN = "github_pat_..."   # 계정·관심종목 저장 + 암호화 열쇠로도 써요', language="toml")
         return
     uid = st.session_state.get("friend_id")
     u = friends.user(db["data"], uid) if (uid and db["data"] is not None) else None
