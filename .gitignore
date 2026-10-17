@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .alert_cache/
 .alert_state/
+.friends_local_key

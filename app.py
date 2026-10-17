@@ -282,13 +282,34 @@ def _app_gate():
 
 
 # ─────────────────────────── 👥 친구 계정(로그인·저장) ───────────────────────────
+@st.cache_resource(show_spinner=False)
+def _local_key() -> str:
+    """Secrets에 아무것도 없을 때 쓰는 이 서버만의 열쇠. 저장소에는 안 올라가요(서버 안 파일)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".friends_local_key")
+    try:
+        with open(path, encoding="utf-8") as f:
+            k = f.read().strip()
+            if k:
+                return k
+    except OSError:
+        pass
+    import secrets as _sc
+    k = "local:" + _sc.token_urlsafe(24)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(k)
+    except OSError:
+        pass
+    return k
+
+
 def _friends_keys() -> list[str]:
     """계정 파일 암호화 열쇠 후보. 맨 앞이 지금 쓰는 열쇠예요.
     USERS_KEY가 있으면 그걸, 없으면 이미 Secrets에 있는 GITHUB_TOKEN으로 열쇠를 만들어요(따로 넣을 것 없음).
     나중에 USERS_KEY를 넣거나 토큰을 바꿔도, 예전 열쇠(USERS_KEY_OLD)로 한 번 열어서 새 열쇠로 다시 잠가요."""
     keys = []
     for k in (_secret("USERS_KEY"), ("gh:" + _secret("GITHUB_TOKEN")) if _secret("GITHUB_TOKEN") else "",
-              _secret("USERS_KEY_OLD")):
+              _secret("USERS_KEY_OLD"), _local_key()):
         if k and k not in keys:
             keys.append(k)
     return keys
@@ -4183,6 +4204,9 @@ def render_watch_tab(df: pd.DataFrame, quotes: dict, histories: dict | None = No
         if owner:
             st.code('GITHUB_TOKEN = "github_pat_..."   # 계정·관심종목 저장 + 암호화 열쇠로도 써요', language="toml")
         return
+    if not _secret("GITHUB_TOKEN") and owner:
+        st.warning("지금은 계정·관심종목이 이 서버에만 저장돼요. Streamlit이 앱을 다시 켜면(재부팅·잠들었다 깨기) 사라질 수 있어요. "
+                   "Secrets에 GITHUB_TOKEN을 넣으면 그때부터 GitHub에 암호화해서 영구 저장하고, 지금 계정도 그대로 옮겨져요.")
     uid = st.session_state.get("friend_id")
     u = friends.user(db["data"], uid) if (uid and db["data"] is not None) else None
     if not u:
