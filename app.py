@@ -6391,6 +6391,10 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
         with st.expander("🖥️ 메모리 쓰임새(창고별)"):
             st.caption(" · ".join(f"{n} {v:,.1f}MB" for n, v in mem_report() if v >= 0.3)
                        + f" · 새로 받기 멈춤 {MEM_SOFT:,}MB · 기억 비우기 {MEM_HARD:,}MB")
+            ph = [(k, v) for k, v in _PHASE.items() if not k.startswith("_")]
+            if ph:
+                st.caption("지난 새로고침 단계별: " + " → ".join(f"{k} {b - a:+.0f}MB" for k, (a, b) in ph)
+                           + f" · 정리 뒤 가장 낮았던 값 {_PHASE.get('_low', 0):,.0f}MB · 코드 {MEM_CODE_TAG}")
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
     cap_missing = int(df["cap_krw"].isna().sum())
@@ -7895,8 +7899,19 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
+MEM_CODE_TAG = "10/18-c"
+_PHASE: dict = {}          # (원인 찾기) 마지막 새로고침의 단계별 메모리 {단계: (전, 후)}
+
+
+def _ph(name: str, t0: float):
+    _PHASE[name] = (t0, rss_mb())
+    return rss_mb()
+
+
 def render_board():
+    _m0 = rss_mb()
     quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
+    _m0 = _ph("시세", _m0)
     _QUOTES.clear()
     _QUOTES.update(quotes)
     shares_store = load_shares()
@@ -7926,6 +7941,7 @@ def render_board():
     # (메모리) 역대 신고가용 월봉·수급·실적은 공부 자료 종목 + 작은 신고가 종목만(전체 1,000종목이면 서버 메모리 초과)
     heavy = tuple(sorted(set(kr_board) | (small_hi_set if scope_core else set()))) + view_os
     VIEW_CODES["heavy"] = tuple(c for c in heavy if data.is_kr(c))
+    _m0 = _ph("일봉", _m0)
     df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
                           monthlies=load_monthlies(heavy), official52=load_official_52w(kr_board))
     df = mark_sector_first(df, histories)
@@ -7933,6 +7949,8 @@ def render_board():
     if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
         gc.collect()
     _GC["mb"] = mem_guard(set(view_kr + view_os) | set(KR_CODES))
+    _m0 = _ph("표 계산", _m0)
+    _PHASE["_tab0"] = _m0
     _mem_log(len(df))
     if os.environ.get("MEM_REPORT_FILE"):          # (테스트용) 창고별 크기를 파일로
         try:
@@ -8004,9 +8022,15 @@ def render_board():
     ]
     for tab, job in jobs:
         if is_open(tab):
+            _t0 = rss_mb()
             with tab:
                 job()
+            _PHASE["탭"] = (_t0, rss_mb())
+    _t0 = rss_mb()
+    _TRIM_T[0] = 0.0 if rss_mb() - (_PHASE.get("_low") or 1e9) > 150 else _TRIM_T[0]   # 많이 늘었으면 바로 정리
     trim_maybe()
+    _PHASE["정리(gc·trim)"] = (_t0, rss_mb())
+    _PHASE["_low"] = min(_PHASE.get("_low") or 1e9, rss_mb())
 
 
 def _attach_flows(f: pd.DataFrame) -> pd.DataFrame:
