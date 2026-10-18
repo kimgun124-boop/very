@@ -120,7 +120,7 @@ _STORE_ROOTS: list = []     # 오래 들고 있는 창고들(아래에서 채워
 
 def trim_maybe(every: float = 60.0) -> None:
     """(메모리) 쓰고 난 메모리를 운영체제에 돌려줘요. 서버 전체에서 every초에 한 번만(몇 ms 걸려요).
-    1분마다 창고 속 표의 pandas 기록을 정리하고, 10분마다는 서버에 살아 있는 표 전부를 한 번 훑어요."""
+    1분마다 창고 속 표의 pandas 기록을 정리하고, 3분마다는 서버에 살아 있는 표 전부를 한 번 훑어요."""
     import gc as _gc
     import time as _t
     now = _t.time()
@@ -135,7 +135,7 @@ def trim_maybe(every: float = 60.0) -> None:
             pruned += prune_pandas_refs(get())
         except Exception:
             pass
-    if len(_TRIM_T) > 2 and now - _TRIM_T[2] > float(os.environ.get("SWEEP_EVERY") or 600) and not os.environ.get("PRUNE_OFF"):
+    if len(_TRIM_T) > 2 and now - _TRIM_T[2] > float(os.environ.get("SWEEP_EVERY") or 180) and not os.environ.get("PRUNE_OFF"):
         _TRIM_T[2] = now
         import pandas as _pd
         for o in _gc.get_objects():
