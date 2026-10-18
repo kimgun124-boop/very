@@ -74,17 +74,26 @@ def _prune_frame(o) -> int:
     """pandas 3는 표에서 열을 꺼낼 때마다 '복사 없이 같이 쓰기' 기록(약한 참조)을 표 안에 쌓아요.
     오래 들고 있는 표(일봉·월봉·수급·실적)를 1분마다 읽으면 이 기록이 끝없이 늘어서 메모리가 불어났어요.
     has_reference()를 부르면 pandas가 이미 사라진 기록을 지워요(살아 있는 건 그대로라 결과는 같아요)."""
+    n = 0
+    refs = []
     try:
-        n = 0
-        for blk in o._mgr.blocks:
-            r = getattr(blk, "refs", None)
-            if r is not None and len(r.referenced_blocks) > 1:
-                n += len(r.referenced_blocks)
-                r.has_reference()
-                n -= len(r.referenced_blocks)
-        return n
+        if hasattr(o, "_mgr"):                       # 표·열(DataFrame·Series): 값 칸들 + 행 이름표 + 열 이름표
+            refs += [getattr(b, "refs", None) for b in o._mgr.blocks]
+            for ix in (getattr(o, "index", None), getattr(o, "columns", None)):
+                refs.append(getattr(ix, "_references", None))
+        else:                                        # 행 이름표(Index) 자체
+            refs.append(getattr(o, "_references", None))
     except Exception:
         return 0
+    for r in refs:
+        try:
+            if r is not None and len(r.referenced_blocks) > 1:
+                k = len(r.referenced_blocks)
+                r.has_reference()
+                n += k - len(r.referenced_blocks)
+        except Exception:
+            pass
+    return n
 
 
 def prune_pandas_refs(root, depth: int = 0, seen: set | None = None) -> int:
@@ -94,7 +103,7 @@ def prune_pandas_refs(root, depth: int = 0, seen: set | None = None) -> int:
     if depth > 5 or id(root) in seen:
         return 0
     seen.add(id(root))
-    if isinstance(root, (_pd.DataFrame, _pd.Series)):
+    if isinstance(root, (_pd.DataFrame, _pd.Series, _pd.Index)):
         return _prune_frame(root)
     n = 0
     if isinstance(root, dict):
@@ -130,7 +139,7 @@ def trim_maybe(every: float = 60.0) -> None:
         _TRIM_T[2] = now
         import pandas as _pd
         for o in _gc.get_objects():
-            if isinstance(o, (_pd.DataFrame, _pd.Series)):
+            if isinstance(o, (_pd.DataFrame, _pd.Series, _pd.Index)):
                 pruned += _prune_frame(o)
     _gc.collect()
     malloc_trim()
@@ -6504,6 +6513,20 @@ def _mem_census():
                f"{sum(f[0] for f in frames) / 1e6:,.0f}MB")
     st.caption("많은 종류: " + " · ".join(f"{k} {v:,}개({shallow[k] / 1e6:,.0f}MB)" for k, v in cnt.most_common(10)))
     st.caption("큰 표: " + " · ".join(f"{b / 1e6:,.1f}MB {sh} {cols}" for b, sh, cols in frames[:8]))
+    wref = collections.Counter()
+    fn_names = collections.Counter()
+    for o in objs:
+        tn = type(o).__name__
+        if tn == "ReferenceType":
+            try:
+                r = o()
+                wref["(사라짐)" if r is None else type(r).__name__] += 1
+            except Exception:
+                pass
+        elif tn == "function":
+            fn_names[getattr(o, "__qualname__", "?")] += 1
+    st.caption("약한 참조가 가리키는 것: " + " · ".join(f"{k} {v:,}" for k, v in wref.most_common(6)))
+    st.caption("같은 이름 함수가 여러 벌: " + " · ".join(f"{k} ×{v:,}" for k, v in fn_names.most_common(6)))
     by_shape = collections.Counter((f[1][1], tuple(f[2])) for f in frames)
     st.caption("같은 모양 표가 많은 것: " + " · ".join(f"{n:,}개 × {c[0]}열 {list(c[1])}" for c, n in by_shape.most_common(5)))
     del objs
@@ -8032,7 +8055,7 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-f"
+MEM_CODE_TAG = "10/18-h"
 _STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
                    lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
                    lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]
