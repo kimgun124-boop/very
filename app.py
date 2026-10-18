@@ -6847,7 +6847,13 @@ _NH_FADE = [3.0]     # 돌파 중 경고 기준(설정값을 render에서 넣어
 
 
 def _nh_why(r) -> str:
-    """카드 한 줄 근거: 기준가(날짜·출처) · 지금 가격(출처) · 확정 여부."""
+    """카드 한 줄 근거: 기준가(날짜·출처) · 지금 가격(출처) · 확정 여부 (+ 깨진 봉을 고쳤으면 그 내용)."""
+    base = _nh_why_base(r)
+    fx = r.get("bar_fix")
+    return f"{base} · {fx}" if isinstance(fx, str) and fx else base
+
+
+def _nh_why_base(r) -> str:
     s = r["nh_state"]
     ref = f'기준 {r["ref_high"]:,.0f}' + (f'({_md(r["ref_date"])})' if _md(r.get("ref_date")) else
                                          ("(네이버 공식)" if r.get("ref_src") == "네이버 공식" else ""))
@@ -7216,6 +7222,71 @@ def _nxt_status(nxt: dict) -> str:
     return f"넥장 {name} {'진행 중' if str(stt).upper() == 'OPEN' else '마감'} · 최근 체결 {t:%m/%d %H:%M}"
 
 
+def _nh_spike_dates(hist: pd.DataFrame | None, dates) -> list[str]:
+    """기준가·고점이 된 날 중, 그날 고가가 앞뒤 사흘 종가보다 5% 넘게 튀어나온 날(깨진 봉일 수 있는 날)."""
+    if hist is None or hist.empty:
+        return []
+    ds = pd.to_datetime(hist["date"]).dt.strftime("%Y-%m-%d").to_numpy()
+    hi = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)
+    cl = pd.to_numeric(hist["close"], errors="coerce").to_numpy(dtype=float)
+    out = []
+    for d in {str(x)[:10] for x in dates if x is not None and str(x) not in ("NaT", "nan", "None")}:
+        idx = np.flatnonzero(ds == d)
+        if not len(idx):
+            continue
+        i = int(idx[-1])
+        near = cl[max(0, i - 1):i + 2]
+        near = near[np.isfinite(near)]
+        if len(near) and hi[i] > near.max() * 1.05:
+            out.append(d)
+    return out
+
+
+def _nh_fix_bars(cand: pd.DataFrame, histories: dict) -> dict:
+    """후보의 기준가·고점 봉이 네이버 데이터 오류(깨진 봉)인지 확인하고, 맞으면 고쳐서 다시 계산하게 해요.
+    {코드: {날짜: 고친 값}}. 고친 봉은 전 종목 창고·보드 일봉에도 반영돼요."""
+    jobs = []
+    for _, r in cand.head(250).iterrows():
+        hist = (histories.get(r["code"]) or (None, None, None))[1]
+        dd = _nh_spike_dates(hist, [r.get("ref_date"), r.get("peak_date")])
+        if dd:
+            jobs.append((r["code"], dd, hist))
+    if not jobs:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        found = list(pool.map(lambda j: (j[0], data.check_bars(j[0], j[1]), j[2]), jobs))
+    fixed = {}
+    for code, fx, hist in found:
+        ok = data.confirm_bar_fix(code, hist, fx) if fx else {}
+        if ok:
+            fixed[code] = ok
+    if not fixed:
+        return {}
+    S, SS = _hist_store(), _scan_store()
+    for code in fixed:
+        h = histories.get(code)
+        if h and h[1] is not None:
+            histories[code] = (h[0], data.apply_bar_fix(code, h[1]), h[2])
+        with S["lock"]:
+            b = S["data"].get(code)
+            if b and b[1] is not None:
+                S["data"][code] = (b[0], data.apply_bar_fix(code, b[1]), b[2])
+        with SS["lock"]:
+            a = SS["arr"].get(code)
+            if a is not None:
+                SS["arr"][code] = data.bars_to_arr(data.apply_bar_fix(code, data.arr_df(a)))
+    return fixed
+
+
+def _fix_txt(fx: dict | None) -> str:
+    if not fx:
+        return ""
+    d, f = sorted(fx.items())[-1]
+    return (f"⚠️ 네이버 {d[5:].replace('-', '/')} 일봉 오류(고가 {f['was_high']:,.0f}·종가 {f['was_close']:,.0f}, "
+            f"다음 날 기준 종가는 {f['close']:,.0f}) — 고쳐서 계산")
+
+
 def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     st.markdown(NHC_CSS, unsafe_allow_html=True)
     p = _nh_params()
@@ -7255,11 +7326,16 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
             "조건이 안 되는 종목은 아래 상세 리스트에만 나와요.\n"
             "- **신선 후보** = 임박·근접 + 최근 60거래일 신고가 없음 · **돌파권** = 임박·근접 중 신선 후보가 아닌 것 · "
             "**찍고 밀림** = 오늘 찍고 밀렸거나 최근 10거래일 고점에서 7% 안쪽 · 한 종목은 한 칸에만(돌파 중 > 찍고 밀림 > 신선 > 돌파권).\n"
+            "- **🩹 깨진 봉 고치기** = 기준가·고점이 된 봉이 앞뒤보다 유난히 튀면, 다음 날 '전일 대비'로 거꾸로 계산한 진짜 종가와 맞춰 봐요. "
+            "2% 넘게 다르면 네이버 데이터 오류로 보고 그 봉의 고가·종가를 고쳐서 계산해요(카드에 ⚠️로 표시). 예: 에스원 10/14 고가 106,500 → 86,300.\n"
             "- **대상** = 사이드바 범위와 상관없이 코스피·코스닥 전 종목(스팩·ETF·우선주 제외). 전 종목 일봉은 뒤에서 받아 두고 매일 새 봉만 붙여요.\n"
             "- 카드를 누르면 앱 안 차트가 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
     if nxt_err:
         st.caption(f"⚠️ {nxt_err} — 이번엔 KRX 시세로만 판정했어요.")
     cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
+    bar_fixed = _nh_fix_bars(cand, histories) if not cand.empty else {}
+    if bar_fixed:                          # 깨진 봉을 고쳤으면 그 종목은 다시 계산
+        cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
     if not cand.empty:                     # 후보만 월봉을 받아 역사적/52주 신고가를 가려요
         mcodes = tuple(sorted(cand["code"].head(250)))
         with st.spinner("후보 종목의 상장 이후 월봉을 확인하는 중이에요(역사적 신고가 구분)."):
@@ -7270,6 +7346,8 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     if cand.empty:
         st.info("지금 조건에 맞는 신고가 후보가 없어요.")
         return
+    all_fix = {c: data.BAR_FIX.get(c) for c in cand["code"] if data.BAR_FIX.get(c)}
+    cand["bar_fix"] = cand["code"].map(lambda c: _fix_txt(all_fix.get(c)))
 
     masks = {sec: cand["section"] == sec for sec in ("신선 후보", "돌파권", "돌파 중", "찍고 밀림")}
     boxes = []
@@ -7282,6 +7360,12 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
             f'<span class="cnt" style="color:{color}">{len(sub)}</span></div><div class="nh-box-d">{desc}</div></div>'
             f'<div class="nh-box-b">{body}{more}</div></div>')
     st.markdown(f'<div class="nh-grid">{"".join(boxes)}</div>', unsafe_allow_html=True)
+    fixed_rows = cand[cand["bar_fix"].astype(bool)]
+    if len(fixed_rows):
+        st.caption("🩹 네이버 일봉이 앞뒤와 안 맞는 깨진 봉을 고쳐서 계산한 종목: "
+                   + " · ".join(f"{n}({t.split('(')[0].replace('⚠️ 네이버 ', '').replace(' 일봉 오류', '')})"
+                                for n, t in zip(fixed_rows["name"], fixed_rows["bar_fix"]))
+                   + " — 다음 날 '전일 대비'로 거꾸로 계산한 진짜 종가와 2% 넘게 다르고, 앞뒤보다 고가만 튀어나온 봉이에요.")
     lag = cand[cand["data_lag"].map(_is_true)]
     if len(lag):
         st.caption(f"⚠️ 일봉이 늦게 들어온 {len(lag)}종목은 판정에서 뺐어요: "

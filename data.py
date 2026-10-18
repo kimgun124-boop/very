@@ -4753,16 +4753,35 @@ def check_bars(code: str, dates, ttl: int = 43200) -> dict[str, dict]:
     oldest = min(dates)
     hit = _bar_chk_cache.get(code)
     if hit and now - hit[0] < ttl and hit[1] <= oldest:
-        return {d: BAR_FIX.get(code, {}).get(d) for d in dates if d in BAR_FIX.get(code, {})}
+        return {d: v for d, v in hit[2].items() if d in dates}
     days_back = (now_kst().date() - date.fromisoformat(oldest)).days
     pages = min(5, max(1, int(days_back * 0.7 / 60) + 1))       # 60거래일씩, 최대 300거래일
     rows = daily_prices(code, pages=pages)
     bad = bar_chain_check(rows)
-    if bad:
-        BAR_FIX.setdefault(code, {}).update(bad)
     covered = rows[-1]["date"] if rows else "9999-12-31"
-    _bar_chk_cache[code] = (now, covered)
-    return {d: v for d, v in BAR_FIX.get(code, {}).items() if d in dates}
+    _bar_chk_cache[code] = (now, covered, bad)
+    return {d: v for d, v in bad.items() if d in dates}
+
+
+def confirm_bar_fix(code: str, hist: pd.DataFrame | None, fixes: dict[str, dict]) -> dict[str, dict]:
+    """check_bars 후보 중 '앱 일봉의 그날 종가도 다음 날 기준(진짜 종가)과 2% 넘게 다른' 것만 깨진 봉으로 적어요.
+    (권리락·분할처럼 기준가가 바뀐 날은 수정주가 일봉이 이미 맞춰져 있어 여기서 걸러져요.)"""
+    if not fixes or hist is None or hist.empty:
+        return {}
+    ds = pd.to_datetime(hist["date"]).dt.strftime("%Y-%m-%d").to_numpy()
+    cl = pd.to_numeric(hist["close"], errors="coerce").to_numpy(dtype=float)
+    hi = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)
+    ok = {}
+    for d, f in fixes.items():
+        idx = np.flatnonzero(ds == d)
+        if not len(idx):
+            continue
+        c, h = cl[idx[-1]], hi[idx[-1]]
+        if c > 0 and abs(c / f["close"] - 1) * 100 > 2.0 and h > f["high"] * 1.005:
+            ok[d] = {**f, "was_high": float(h), "was_close": float(c)}
+    if ok:
+        BAR_FIX.setdefault(code, {}).update(ok)
+    return ok
 
 
 def apply_bar_fix(code: str, df: pd.DataFrame | None) -> pd.DataFrame | None:
