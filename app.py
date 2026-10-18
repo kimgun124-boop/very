@@ -70,15 +70,73 @@ def proc_mem() -> dict:
     return out
 
 
+def _prune_frame(o) -> int:
+    """pandas 3는 표에서 열을 꺼낼 때마다 '복사 없이 같이 쓰기' 기록(약한 참조)을 표 안에 쌓아요.
+    오래 들고 있는 표(일봉·월봉·수급·실적)를 1분마다 읽으면 이 기록이 끝없이 늘어서 메모리가 불어났어요.
+    has_reference()를 부르면 pandas가 이미 사라진 기록을 지워요(살아 있는 건 그대로라 결과는 같아요)."""
+    try:
+        n = 0
+        for blk in o._mgr.blocks:
+            r = getattr(blk, "refs", None)
+            if r is not None and len(r.referenced_blocks) > 1:
+                n += len(r.referenced_blocks)
+                r.has_reference()
+                n -= len(r.referenced_blocks)
+        return n
+    except Exception:
+        return 0
+
+
+def prune_pandas_refs(root, depth: int = 0, seen: set | None = None) -> int:
+    """root(사전·목록·튜플) 안의 표를 찾아 쌓인 기록을 지워요. 지운 개수를 돌려줘요."""
+    import pandas as _pd
+    seen = set() if seen is None else seen
+    if depth > 5 or id(root) in seen:
+        return 0
+    seen.add(id(root))
+    if isinstance(root, (_pd.DataFrame, _pd.Series)):
+        return _prune_frame(root)
+    n = 0
+    if isinstance(root, dict):
+        for v in list(root.values()):
+            n += prune_pandas_refs(v, depth + 1, seen)
+    elif isinstance(root, (list, tuple)):
+        for v in list(root):
+            n += prune_pandas_refs(v, depth + 1, seen)
+    return n
+
+
+_STORE_ROOTS: list = []     # 오래 들고 있는 창고들(아래에서 채워요)
+
+
 def trim_maybe(every: float = 60.0) -> None:
-    """(메모리) 쓰고 난 메모리를 운영체제에 돌려줘요. 서버 전체에서 every초에 한 번만(몇 ms 걸려요)."""
+    """(메모리) 쓰고 난 메모리를 운영체제에 돌려줘요. 서버 전체에서 every초에 한 번만(몇 ms 걸려요).
+    1분마다 창고 속 표의 pandas 기록을 정리하고, 10분마다는 서버에 살아 있는 표 전부를 한 번 훑어요."""
     import gc as _gc
     import time as _t
-    if _t.time() - _TRIM_T[0] < every:
+    now = _t.time()
+    every = float(os.environ.get("TRIM_EVERY") or every)       # (테스트용)
+    if now - _TRIM_T[0] < every:
         return
-    _TRIM_T[0] = _t.time()
+    _TRIM_T[0] = now
+    stat = _TRIM_T[1] if len(_TRIM_T) > 1 else None
+    pruned = 0
+    for get in ([] if os.environ.get("PRUNE_OFF") else list(_STORE_ROOTS)):
+        try:
+            pruned += prune_pandas_refs(get())
+        except Exception:
+            pass
+    if len(_TRIM_T) > 2 and now - _TRIM_T[2] > float(os.environ.get("SWEEP_EVERY") or 600) and not os.environ.get("PRUNE_OFF"):
+        _TRIM_T[2] = now
+        import pandas as _pd
+        for o in _gc.get_objects():
+            if isinstance(o, (_pd.DataFrame, _pd.Series)):
+                pruned += _prune_frame(o)
     _gc.collect()
     malloc_trim()
+    if isinstance(stat, dict):
+        stat["pruned"] = stat.get("pruned", 0) + pruned
+        stat["runs"] = stat.get("runs", 0) + 1
 
 
 import data
@@ -90,7 +148,9 @@ import theme
 import chart_draw
 import recovery
 
-_TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0])      # 서버 전체에서 이어지는 '마지막 정리 시각'
+_TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
+while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
+    _TRIM_T.append({} if len(_TRIM_T) == 1 else 0.0)
 
 try:     # (원인 찾기) 서버가 켜지고 라이브러리만 올린 직후 메모리 — data 모듈에 한 번만 적어 둬요(새로고침마다 다시 안 재요)
     with open("/proc/self/statm") as _f:
@@ -6419,6 +6479,36 @@ def render_buy(df: pd.DataFrame, quotes: dict):
                     "- 해외 종목은 제외 · 종목별 수급의 연기금·투신은 기관 합계에 포함 · 마지막 확인은 HTS 차트로")
 
 
+def _mem_census():
+    """살아 있는 파이썬 객체를 종류별로 세고, 큰 표(DataFrame)를 찾아요."""
+    import collections
+    import sys as _sys
+    gc.collect()
+    objs = gc.get_objects()
+    cnt, shallow = collections.Counter(), collections.Counter()
+    frames = []
+    for o in objs:
+        tn = type(o).__name__
+        cnt[tn] += 1
+        try:
+            shallow[tn] += _sys.getsizeof(o)
+        except TypeError:
+            pass
+        if tn == "DataFrame":
+            try:
+                frames.append((int(o.memory_usage(deep=True).sum()), o.shape, list(o.columns[:4])))
+            except Exception:
+                pass
+    frames.sort(key=lambda x: -x[0])
+    st.caption(f"객체 {len(objs):,}개 · 파이썬 작은 블록 {_sys.getallocatedblocks():,}개 · 표 {len(frames):,}개 합계 "
+               f"{sum(f[0] for f in frames) / 1e6:,.0f}MB")
+    st.caption("많은 종류: " + " · ".join(f"{k} {v:,}개({shallow[k] / 1e6:,.0f}MB)" for k, v in cnt.most_common(10)))
+    st.caption("큰 표: " + " · ".join(f"{b / 1e6:,.1f}MB {sh} {cols}" for b, sh, cols in frames[:8]))
+    by_shape = collections.Counter((f[1][1], tuple(f[2])) for f in frames)
+    st.caption("같은 모양 표가 많은 것: " + " · ".join(f"{n:,}개 × {c[0]}열 {list(c[1])}" for c, n in by_shape.most_common(5)))
+    del objs
+
+
 def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
     mb = _GC.get("mb") or rss_mb()
     if mb:
@@ -6431,7 +6521,11 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
             if ph:
                 st.caption("지난 새로고침 단계별: " + " → ".join(f"{k} {b - a:+.0f}MB" for k, (a, b) in ph)
                            + f" · 정리 뒤 가장 낮았던 값 {_PHASE.get('_low', 0):,.0f}MB · 코드 {MEM_CODE_TAG}")
+            if st.button("🔬 파이썬 객체 세기(2~5초, 원인 찾기용)", key="mem_census"):
+                _mem_census()
             pm, mi = proc_mem(), malloc_info()
+            tst = _TRIM_T[1] if isinstance(_TRIM_T[1], dict) else {}
+            st.caption(f"정리 {tst.get('runs', 0):,}번 · pandas 쌓인 기록 {tst.get('pruned', 0):,}개 지움")
             st.caption(f"켜진 직후(라이브러리만) {getattr(data, '_BOOT_RSS', 0):,.0f}MB · 지금까지 최고점 {pm.get('VmHWM', 0):,.0f}MB"
                        + (f" · 할당기: 쓰는 중 {mi['used']:,.0f}MB, 비었는데 쥐고 있음 {mi['free_held']:,.0f}MB" if mi else ""))
     failed = df[df["price"].isna()]
@@ -7938,7 +8032,10 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-d"
+MEM_CODE_TAG = "10/18-f"
+_STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
+                   lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
+                   lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]
 _PHASE: dict = data.__dict__.setdefault("_PHASE_MEM", {})   # (원인 찾기) 마지막 새로고침의 단계별 메모리 {단계: (전, 후)}
 
 
