@@ -6529,6 +6529,23 @@ def _mem_census():
     tn = collections.Counter(re.sub(r"[-_ ]?\d+.*$", "", t.name) or t.name for t in ths)
     th_objs = sum(1 for o in objs if isinstance(o, threading.Thread))
     st.caption(f"살아 있는 스레드 {len(ths):,}개 · 스레드 객체 {th_objs:,}개 · " + " · ".join(f"{k} {v:,}" for k, v in tn.most_common(6)))
+    dead_th = [o for o in objs if isinstance(o, threading.Thread) and not o.is_alive()]
+    holders = collections.Counter()
+    for t in dead_th[:20]:
+        for r in gc.get_referrers(t):
+            if r is objs or r is dead_th:
+                continue
+            if isinstance(r, dict):
+                holders["dict" + str(sorted(map(str, r.keys()))[:3])] += 1
+            elif isinstance(r, (list, set, tuple)):
+                owners = [type(x).__name__ + (str(sorted(map(str, x.keys()))[:2]) if isinstance(x, dict) else "")
+                          for x in gc.get_referrers(r) if x is not objs and x is not dead_th][:2]
+                holders[f"{type(r).__name__}(len {len(r)})<-{owners}"] += 1
+            else:
+                holders[type(r).__name__] += 1
+    if dead_th:
+        st.caption(f"끝난 스레드 {len(dead_th):,}개, 이름 예: {', '.join(t.name for t in dead_th[:4])} · 붙잡는 쪽: "
+                   + " · ".join(f"{k} {v}" for k, v in holders.most_common(5)))
     st.caption("약한 참조가 가리키는 것: " + " · ".join(f"{k} {v:,}" for k, v in wref.most_common(6)))
     st.caption("같은 이름 함수가 여러 벌: " + " · ".join(f"{k} ×{v:,}" for k, v in fn_names.most_common(6)))
     by_shape = collections.Counter((f[1][1], tuple(f[2])) for f in frames)
@@ -8059,7 +8076,7 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-i"
+MEM_CODE_TAG = "10/18-j"
 _STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
                    lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
                    lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]
