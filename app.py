@@ -141,6 +141,10 @@ def trim_maybe(every: float = 60.0) -> None:
         for o in _gc.get_objects():
             if isinstance(o, (_pd.DataFrame, _pd.Series, _pd.Index)):
                 pruned += _prune_frame(o)
+    try:
+        data._mt_prune()                         # 이미 쌓인 끝난 스레드 목록도 비워요
+    except Exception:
+        pass
     _gc.collect()
     malloc_trim()
     if isinstance(stat, dict):
@@ -207,7 +211,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
-DATA_VERSION = "2026-10-17-nh-scan"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-18-mem"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -8076,7 +8080,7 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-j"
+MEM_CODE_TAG = "10/18-k"
 _STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
                    lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
                    lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]

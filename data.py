@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-17-nh-scan"
+DATA_VERSION = "2026-10-18-mem"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -373,6 +373,18 @@ def index_summary(df: pd.DataFrame) -> dict | None:
     }
 
 
+def _mt_prune() -> None:
+    """(메모리 누수) yfinance가 병렬로 받을 때 쓰는 multitasking 라이브러리는 만든 스레드를 전부 config["TASKS"]에
+    넣고 지우지 않아요(실제 서버에서 끝난 스레드 880여 개가 쌓여 있었음) → 끝난 스레드는 목록에서 빼요."""
+    try:
+        import multitasking
+        tasks = multitasking.config.get("TASKS")
+        if isinstance(tasks, list) and tasks:
+            tasks[:] = [t for t in tasks if getattr(t, "is_alive", lambda: False)()]
+    except Exception:
+        pass
+
+
 def _yf_batch(tickers, period: str, interval: str) -> dict[str, pd.DataFrame]:
     """야후 여러 종목을 한 번에 받아요(yfinance가 안에서 병렬로 받음). 못 받은 티커는 결과에서 빠져요."""
     tickers = list(tickers)
@@ -389,6 +401,8 @@ def _yf_batch(tickers, period: str, interval: str) -> dict[str, pd.DataFrame]:
                               threads=True, progress=False)
         except Exception:  # 야후 일시 오류·요청 제한 → 아래에서 하나씩 다시
             raw = None
+        finally:
+            _mt_prune()
         if raw is None or raw.empty:
             if not out:      # 첫 묶음부터 하나도 못 받으면 야후가 막힌 것 → 나머지 묶음도 두드리지 않아요
                 break
