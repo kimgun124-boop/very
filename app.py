@@ -197,6 +197,36 @@ if _qp_chart:
     st.session_state["main_tab_sel"] = "🕯️ 차트"       # 카드·신고가 후보에서 누르면 차트 탭으로 바로
     del st.query_params["chart"]
 
+# (진단) ?diag=종목코드 → 네이버 일봉 원본을 출처별로 나란히(공개 시세만, 저장 안 함). KRX·넥장 섞임 확인용
+_qp_diag = str(st.query_params.get("diag") or "")
+if re.fullmatch(r"\d{6}", _qp_diag):
+    import requests as _rq
+    st.markdown(f"### 진단: {_qp_diag} 일봉 원본")
+    _end = data.now_kst().strftime("%Y%m%d")
+    _start = (data.now_kst() - pd.Timedelta(days=20)).strftime("%Y%m%d")
+    _tries = [
+        ("fchart", data.FCHART_URL, {"symbol": _qp_diag, "timeframe": "day", "count": 8, "requestType": 0}),
+        ("siseJson", data.SISEJSON_URL, {"symbol": _qp_diag, "requestType": 1, "startTime": _start, "endTime": _end,
+                                         "timeframe": "day"}),
+        ("api chart", f"https://api.stock.naver.com/chart/domestic/item/{_qp_diag}/day",
+         {"startDateTime": _start + "0000", "endDateTime": _end + "2359"}),
+        ("api chart KRX", f"https://api.stock.naver.com/chart/domestic/item/{_qp_diag}/day",
+         {"startDateTime": _start + "0000", "endDateTime": _end + "2359", "tradeType": "KRX"}),
+        ("m price", f"https://m.stock.naver.com/api/stock/{_qp_diag}/price", {"pageSize": 8, "page": 1}),
+        ("m price KRX", f"https://m.stock.naver.com/api/stock/{_qp_diag}/price", {"pageSize": 8, "page": 1, "tradeType": "KRX"}),
+        ("m price NXT", f"https://m.stock.naver.com/api/stock/{_qp_diag}/price", {"pageSize": 8, "page": 1, "tradeType": "NXT"}),
+        ("stock api price KRX", f"{data.STOCK_API}/domestic/detail/{_qp_diag}/price", {"pageSize": 8, "page": 1, "tradeType": "KRX"}),
+    ]
+    for _nm, _url, _pr in _tries:
+        try:
+            _r = data.session.get(_url, params=_pr, headers=data.JSON_HEADERS, timeout=8)
+            _txt = data.decode(_r.content)
+            st.markdown(f"**{_nm}** · {_r.status_code} · {_r.url[:160]}")
+            st.code(re.sub(r"\s+", " ", _txt)[:1500])
+        except Exception as _e:
+            st.markdown(f"**{_nm}** · 실패 {type(_e).__name__}")
+    st.stop()
+
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
             "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
