@@ -39,7 +39,35 @@ def malloc_trim() -> None:
             pass
 
 
-_TRIM_T = [0.0]
+_TRIM_T = [0.0]       # (주의) app.py는 새로고침마다 다시 실행돼요 → 아래 import data 뒤에서 data 모듈 값으로 바꿔 끼워요
+
+
+def malloc_info() -> dict:
+    """할당기 상태(MB): used = 실제로 쓰는 중, free_held = 비었지만 운영체제에 안 돌려주고 쥐고 있는 양."""
+    if _LIBC is None:
+        return {}
+    try:
+        class _MI2(_ctypes.Structure):
+            _fields_ = [(n, _ctypes.c_size_t) for n in ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+                                                        "fsmblks", "uordblks", "fordblks", "keepcost")]
+        _LIBC.mallinfo2.restype = _MI2
+        m = _LIBC.mallinfo2()
+        return {"heap": (m.arena + m.hblkhd) / 1e6, "used": (m.uordblks + m.hblkhd) / 1e6, "free_held": m.fordblks / 1e6}
+    except Exception:
+        return {}
+
+
+def proc_mem() -> dict:
+    """/proc/self/status: 지금(VmRSS)·최고점(VmHWM) MB."""
+    out = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS", "VmHWM")):
+                    out[line.split(":")[0]] = int(line.split()[1]) / 1e3
+    except OSError:
+        pass
+    return out
 
 
 def trim_maybe(every: float = 60.0) -> None:
@@ -61,6 +89,14 @@ import stocks as stock_list
 import theme
 import chart_draw
 import recovery
+
+_TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0])      # 서버 전체에서 이어지는 '마지막 정리 시각'
+
+try:     # (원인 찾기) 서버가 켜지고 라이브러리만 올린 직후 메모리 — data 모듈에 한 번만 적어 둬요(새로고침마다 다시 안 재요)
+    with open("/proc/self/statm") as _f:
+        data.__dict__.setdefault("_BOOT_RSS", int(_f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6)
+except (OSError, ValueError):
+    pass
 
 st.set_page_config(page_title="밸류체인 신고가 보드", page_icon="📈", layout="wide")
 
@@ -6395,6 +6431,9 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
             if ph:
                 st.caption("지난 새로고침 단계별: " + " → ".join(f"{k} {b - a:+.0f}MB" for k, (a, b) in ph)
                            + f" · 정리 뒤 가장 낮았던 값 {_PHASE.get('_low', 0):,.0f}MB · 코드 {MEM_CODE_TAG}")
+            pm, mi = proc_mem(), malloc_info()
+            st.caption(f"켜진 직후(라이브러리만) {getattr(data, '_BOOT_RSS', 0):,.0f}MB · 지금까지 최고점 {pm.get('VmHWM', 0):,.0f}MB"
+                       + (f" · 할당기: 쓰는 중 {mi['used']:,.0f}MB, 비었는데 쥐고 있음 {mi['free_held']:,.0f}MB" if mi else ""))
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
     cap_missing = int(df["cap_krw"].isna().sum())
@@ -7899,8 +7938,8 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-c"
-_PHASE: dict = {}          # (원인 찾기) 마지막 새로고침의 단계별 메모리 {단계: (전, 후)}
+MEM_CODE_TAG = "10/18-d"
+_PHASE: dict = data.__dict__.setdefault("_PHASE_MEM", {})   # (원인 찾기) 마지막 새로고침의 단계별 메모리 {단계: (전, 후)}
 
 
 def _ph(name: str, t0: float):
