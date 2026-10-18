@@ -20,6 +20,39 @@ import threading
 import time
 from datetime import time as dtime
 
+# (메모리) 리눅스 메모리 할당기 설정 — 무거운 import 전에.
+# 여러 스레드가 동시에 시세·일봉을 받으면 스레드마다 따로 메모리 칸(arena)을 만들어 쓰고 난 뒤에도 쥐고 있어요.
+# 칸을 2개로 묶고(MALLOC_ARENA_MAX=2와 같음), 다 쓴 메모리는 malloc_trim으로 운영체제에 돌려줘요.
+try:
+    import ctypes as _ctypes
+    _LIBC = _ctypes.CDLL("libc.so.6")
+    _LIBC.mallopt(-8, 2)          # M_ARENA_MAX
+except Exception:
+    _LIBC = None
+
+
+def malloc_trim() -> None:
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
+_TRIM_T = [0.0]
+
+
+def trim_maybe(every: float = 60.0) -> None:
+    """(메모리) 쓰고 난 메모리를 운영체제에 돌려줘요. 서버 전체에서 every초에 한 번만(몇 ms 걸려요)."""
+    import gc as _gc
+    import time as _t
+    if _t.time() - _TRIM_T[0] < every:
+        return
+    _TRIM_T[0] = _t.time()
+    _gc.collect()
+    malloc_trim()
+
+
 import data
 import holdings
 import friends
@@ -960,9 +993,37 @@ def _bg_store() -> dict:
 
 # Streamlit 무료 서버는 앱마다 메모리를 690MB~2.7GB 사이로 그때그때 나눠 줘요 → 가장 적을 때(690MB)에 맞춰요
 IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
-MEM_SOFT = int(os.environ.get("MEM_SOFT_MB", "380" if IS_STREAMLIT_CLOUD else "650"))   # 넘으면 뒤쪽 새로 받기 멈춤
-MEM_HARD = int(os.environ.get("MEM_HARD_MB", "480" if IS_STREAMLIT_CLOUD else "800"))   # 넘으면 기억 비우기
-BIG_SERVER = MEM_SOFT >= 2000                           # Hugging Face(16GB) 같은 넉넉한 서버
+def _mem_limit_mb() -> float:
+    """이 서버가 쓸 수 있는 메모리 한도(MB). 컨테이너 한도(cgroup) → 기계 전체 메모리 순서로 읽어요.
+    Streamlit Community Cloud는 앱당 최대 2.7GB(최소 보장 690MB)라서 못 읽으면 2,700MB로 봐요."""
+    if os.environ.get("MEM_LIMIT_MB"):
+        return float(os.environ["MEM_LIMIT_MB"])
+    vals = []
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            if v.isdigit() and int(v) < 1 << 46:           # 'max'·엄청 큰 수 = 한도 없음
+                vals.append(int(v) / 1e6)
+        except OSError:
+            pass
+    try:
+        with open("/proc/meminfo") as f:
+            vals.append(int(f.readline().split()[1]) / 1e3)
+    except (OSError, ValueError, IndexError):
+        pass
+    lim = min(vals) if vals else 0.0
+    if IS_STREAMLIT_CLOUD:
+        lim = min(lim or 2700.0, 2700.0)
+    return lim or 2000.0
+
+
+MEM_LIMIT = _mem_limit_mb()
+# (2026.10.18) 예전 기준(Cloud 380/480MB)은 앱이 켜지기만 해도 넘는 값(라이브러리만 약 250MB, 평소 700MB대)이라
+# 뒤에서 새로 받기·작은 종목·월봉이 늘 멈춰 있었어요 → 실제 한도의 비율로 정해요(Cloud 2.7GB면 약 1,200 / 1,600MB).
+MEM_SOFT = int(os.environ.get("MEM_SOFT_MB") or MEM_LIMIT * 0.45)   # 넘으면 뒤쪽 새로 받기 멈춤
+MEM_HARD = int(os.environ.get("MEM_HARD_MB") or MEM_LIMIT * 0.60)   # 넘으면 기억 비우기(차트·뉴스·화면 밖 일봉)
+BIG_SERVER = int(os.environ.get("MEM_SOFT_MB") or 0) >= 2000         # Hugging Face(16GB)처럼 따로 크게 잡아 준 서버
 
 
 def _mem_log(n_rows: int):
@@ -981,6 +1042,66 @@ def _mem_log(n_rows: int):
     print(f"[MEM] {time.strftime('%m/%d %H:%M:%S')} rss={rss_mb():.0f}MB sessions={n_sess} "
           f"hist={len(S['data'])} light={len(S['light'])} swr={len(_bg_store()['items'])} rows={n_rows} "
           f"threads={threading.active_count()}", flush=True)
+
+
+def _deep_bytes(obj, seen: set | None = None, depth: int = 0) -> int:
+    """대략적인 메모리 크기(표·배열·사전·목록을 따라 들어가며 더해요). 같은 물건은 한 번만 세요."""
+    import sys as _sys
+    seen = set() if seen is None else seen
+    if id(obj) in seen or depth > 6:
+        return 0
+    seen.add(id(obj))
+    if isinstance(obj, pd.DataFrame):
+        try:
+            return int(obj.memory_usage(deep=True, index=True).sum()) + 2000
+        except Exception:
+            return 0
+    if isinstance(obj, pd.Series):
+        return int(obj.memory_usage(deep=True, index=True)) + 500
+    if isinstance(obj, np.ndarray):
+        return int(obj.nbytes) + 112
+    if isinstance(obj, dict):
+        return _sys.getsizeof(obj) + sum(_deep_bytes(k, seen, depth + 1) + _deep_bytes(v, seen, depth + 1)
+                                         for k, v in list(obj.items()))
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return _sys.getsizeof(obj) + sum(_deep_bytes(v, seen, depth + 1) for v in list(obj))
+    try:
+        return _sys.getsizeof(obj)
+    except TypeError:
+        return 0
+
+
+def mem_report() -> list[tuple[str, float]]:
+    """(원인 찾기) 기억 창고별 대략 크기(MB). 사이드바 맨 아래 '서버 메모리'와 서버 로그에 나와요."""
+    out = []
+    S = _hist_store()
+    out.append(("보드 일봉", _deep_bytes(S["data"])))
+    out.append(("작은 종목 고가", _deep_bytes(S["light"])))
+    try:
+        out.append(("전 종목 일봉(🏁)", _deep_bytes(_scan_store()["arr"])))
+    except Exception:
+        pass
+    out.append(("월봉", _deep_bytes(_monthly_store()["items"])))
+    kinds: dict[str, int] = {}
+    for k, v in list(_bg_store()["items"].items()):
+        name = k[0] if isinstance(k, tuple) else str(k)
+        kinds[name] = kinds.get(name, 0) + _deep_bytes(v.get("value"))
+    for name, b in sorted(kinds.items(), key=lambda x: -x[1])[:6]:
+        out.append((f"뒤에서 받은 {name}", b))
+    for nm in ("_trend_cache", "_fin_cache", "_metrics_memo", "_ADX_CACHE", "_breadth_memo", "_flow_memo"):
+        if hasattr(data, nm):
+            out.append((f"data.{nm}", _deep_bytes(getattr(data, nm))))
+    try:
+        from streamlit.runtime.caching import get_data_cache_stats_provider
+        per: dict[str, int] = {}
+        for stat in get_data_cache_stats_provider().get_stats():
+            nm = str(getattr(stat, "cache_name", "?")).split(".")[-1]
+            per[nm] = per.get(nm, 0) + int(getattr(stat, "byte_length", 0) or 0)
+        for nm, b in sorted(per.items(), key=lambda x: -x[1])[:6]:
+            out.append((f"캐시 {nm}", b))
+    except Exception:
+        pass
+    return [(n, b / 1e6) for n, b in sorted(out, key=lambda x: -x[1])]
 
 
 def rss_mb() -> float:
@@ -1140,6 +1261,7 @@ def _light_bg(codes):
                 _light_put(data.fetch_histories(batch, workers=4))
                 with S["lock"]:
                     S["lbg"]["done"] += len(batch)
+                trim_maybe(20)
                 time.sleep(0.5)
         finally:
             with S["lock"]:
@@ -1150,13 +1272,24 @@ def _light_bg(codes):
 
 
 def get_light(codes) -> dict:
+    """작은 종목의 최근 260일 고가. 🏁 전 종목 창고에 있으면 거기서 바로 꺼내고(따로 안 받아요), 없는 종목만 받아요."""
     S = _hist_store()
     now = time.time()
     born = S.setdefault("born", now)
+    try:
+        arrs = _scan_store()["arr"]
+    except NameError:
+        arrs = {}
+    from_scan = {c: arrs[c][2][-260:] for c in codes if c in arrs}
+    codes = [c for c in codes if c not in from_scan]
+    if from_scan:                                  # 창고에 있는 종목은 예전 가벼운 기록을 지워요(같은 걸 두 번 들고 있지 않게)
+        with S["lock"]:
+            for c in from_scan:
+                S["light"].pop(c, None)
     need = [c for c in codes if c not in S["light"] or now - S["light"][c][1] > LIGHT_TTL]
     if need and now - born > 45 and rss_mb() < MEM_SOFT:   # (메모리) 켜진 직후·메모리 빠듯할 땐 작은 종목은 나중에
         _light_bg(need)
-    return {c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}
+    return {**from_scan, **{c: S["light"][c][0] for c in codes if c in S["light"] and S["light"][c][0] is not None}}
 
 
 def _hist_drop(keep: set):
@@ -1190,6 +1323,7 @@ def _hist_bg(codes):
                 _hist_put(data.fetch_histories(batch, workers=6))
                 with S["lock"]:
                     S["bg"]["done"] += len(batch)
+                trim_maybe(20)
                 time.sleep(0.3)
         finally:
             with S["lock"]:
@@ -1291,6 +1425,7 @@ def core_view(quotes: dict, shares: dict) -> tuple[set, set, dict]:
         e = sorted([c for c in EXTRA_CODES if caps[c] >= CORE_CAP], key=lambda c: -caps[c])
         core = set((b + e)[:CORE_N])
     rest = [c for c in all_kr if c not in core]
+    _scan_bg(tuple(sorted(set(all_kr))))              # 🏁 전 종목 창고를 채우면 작은 종목 고가도 거기서 꺼내 써요
     light = get_light(rest)                           # 작은 종목은 뒤에서, 고가만 가볍게
     small_hi = {c for c, hs in light.items() if _recent_high(hs, quotes.get(c), max(5, recent_days))}
     S = _hist_store()["lbg"]
@@ -1353,6 +1488,14 @@ def _monthly_store():
     return {"lock": threading.Lock(), "items": {}, "busy": False}
 
 
+def _slim_monthly(df_):
+    """(메모리) 월봉은 역대 최고가 계산에 날짜·고가만 써요 → 두 열만 float32로."""
+    if df_ is None or df_.empty or "high" not in df_:
+        return None
+    return pd.DataFrame({"date": pd.to_datetime(df_["date"]).values,
+                         "high": pd.to_numeric(df_["high"], errors="coerce").astype("float32").values})
+
+
 def load_monthlies(codes: tuple[str, ...], trim: bool = True):
     """역대 최고가 계산용 월봉(종목별로 6시간 기억).
     예전엔 종목 구성이 조금만 바뀌어도(작은 신고가 종목 추가 등) 600종목 월봉을 처음부터 다시 받아서,
@@ -1379,8 +1522,8 @@ def load_monthlies(codes: tuple[str, ...], trim: bool = True):
                 t = time.time()
                 with ms["lock"]:
                     for c in part:
-                        df_ = got.get(c)
-                        if df_ is not None and not df_.empty:
+                        df_ = _slim_monthly(got.get(c))
+                        if df_ is not None:
                             ms["items"][c] = (t, df_)
                         elif c not in ms["items"]:
                             ms["items"][c] = (t - 21600 + 1800, None)   # 못 받은 종목은 30분 뒤 다시
@@ -6225,7 +6368,11 @@ def render_buy(df: pd.DataFrame, quotes: dict):
 def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict | None = None):
     mb = _GC.get("mb") or rss_mb()
     if mb:
-        st.caption(f"🖥️ 서버 메모리 {mb:,.0f}MB" + (" · 빠듯해서 뒤쪽 새로 받기를 잠시 멈췄어요" if mb > MEM_SOFT else ""))
+        st.caption(f"🖥️ 서버 메모리 {mb:,.0f}MB / 한도 {MEM_LIMIT:,.0f}MB"
+                   + (f" · 빠듯해서(기준 {MEM_SOFT:,}MB) 뒤쪽 새로 받기를 잠시 멈췄어요" if mb > MEM_SOFT else ""))
+        with st.expander("🖥️ 메모리 쓰임새(창고별)"):
+            st.caption(" · ".join(f"{n} {v:,.1f}MB" for n, v in mem_report() if v >= 0.3)
+                       + f" · 새로 받기 멈춤 {MEM_SOFT:,}MB · 기억 비우기 {MEM_HARD:,}MB")
     failed = df[df["price"].isna()]
     mismatch = df[df["name_ok"] == False]  # noqa: E712
     cap_missing = int(df["cap_krw"].isna().sum())
@@ -6676,9 +6823,8 @@ def load_nxt_quotes(codes: tuple[str, ...]):
 
 # ── 🏁 신고가 후보 전용: 코스피·코스닥 전 종목 일봉(가벼운 배열)을 뒤에서 받아 두는 곳 ──
 SCAN_CHUNK = 60
-# 전 종목 배열은 종목당 약 10KB(전체 25MB 안쪽)라 보드의 메모리 기준(MEM_SOFT·HARD)과 따로 둬요.
-# Streamlit Cloud에선 평소 서버 메모리가 MEM_HARD보다 높아 그 기준을 쓰면 영영 시작을 못 했어요.
-SCAN_MEM_MAX = int(os.environ.get("SCAN_MEM_MB", "900" if IS_STREAMLIT_CLOUD else "1500"))
+# 전 종목 배열은 종목당 약 10KB(전체 25MB 안쪽)라 기억 비우기 기준(MEM_HARD)까지는 받아요.
+SCAN_MEM_MAX = int(os.environ.get("SCAN_MEM_MB") or MEM_HARD)
 
 
 @st.cache_resource
@@ -6727,7 +6873,7 @@ def _scan_bg(codes: tuple[str, ...]):
                             S["thru"][c] = complete
                         S["done"] += len(part)
                     del got
-                    gc.collect()
+                    trim_maybe(20)
                     if rss_mb() > SCAN_MEM_MAX:              # 받는 중에 메모리가 넘치면 멈추고 다음 새로고침에 이어서
                         break
                     time.sleep(0.3)
@@ -6743,11 +6889,25 @@ def load_scan_quotes(codes: tuple[str, ...]) -> dict:
     return data.fetch_quotes(codes)[0]
 
 
-@st.cache_data(ttl=21600, show_spinner=False, max_entries=40)
 def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
-    """후보 종목만 월봉을 바로 받아요(역사적/52주 신고가 구분용, 6시간 기억).
-    예전엔 서버 메모리가 빠듯하면 월봉 받기가 계속 미뤄져서 모든 종목이 '역사 확인 중'으로 남았어요."""
-    return {c: m for c, m in data.fetch_monthlies(codes, workers=8).items() if m is not None and not m.empty}
+    """후보 종목만 월봉을 바로 받아요(역사적/52주 신고가 구분용, 종목별로 6시간 기억 — 보드 월봉과 같은 창고).
+    (메모리) 예전엔 후보 목록(튜플)마다 따로 40개까지 기억해서, 후보가 조금씩 바뀔 때마다 같은 월봉이 겹겹이 쌓였어요."""
+    ms = _monthly_store()
+    now = time.time()
+    with ms["lock"]:
+        need = [c for c in codes if c not in ms["items"] or now - ms["items"][c][0] > 21600]
+    if need:
+        got = data.fetch_monthlies(tuple(need), workers=8)
+        t = time.time()
+        with ms["lock"]:
+            for c in need:
+                df_ = _slim_monthly(got.get(c))
+                if df_ is not None:
+                    ms["items"][c] = (t, df_)
+                elif c not in ms["items"]:
+                    ms["items"][c] = (t - 21600 + 1800, None)
+    with ms["lock"]:
+        return {c: ms["items"][c][1] for c in codes if c in ms["items"] and ms["items"][c][1] is not None}
 
 
 def _nh_universe(df: pd.DataFrame, histories: dict, quotes: dict):
@@ -7756,6 +7916,13 @@ def render_board():
         gc.collect()
     _GC["mb"] = mem_guard(set(view_kr + view_os) | set(KR_CODES))
     _mem_log(len(df))
+    if os.environ.get("MEM_REPORT_FILE"):          # (테스트용) 창고별 크기를 파일로
+        try:
+            import json as _json
+            with open(os.environ["MEM_REPORT_FILE"], "w", encoding="utf-8") as _f:
+                _json.dump({"rss": rss_mb(), "items": mem_report()}, _f, ensure_ascii=False)
+        except Exception:
+            pass
     if core_info:
         bg = core_info["bg"]
         st.caption(f"⚡ 빠른 화면: 시가총액 3,000억↑ 주요 {core_info['core']}종목 + 시총이 작아도 최근 신고가 "
@@ -7821,6 +7988,7 @@ def render_board():
         if is_open(tab):
             with tab:
                 job()
+    trim_maybe()
 
 
 def _attach_flows(f: pd.DataFrame) -> pd.DataFrame:
