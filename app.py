@@ -6525,6 +6525,10 @@ def _mem_census():
                 pass
         elif tn == "function":
             fn_names[getattr(o, "__qualname__", "?")] += 1
+    ths = threading.enumerate()
+    tn = collections.Counter(re.sub(r"[-_ ]?\d+.*$", "", t.name) or t.name for t in ths)
+    th_objs = sum(1 for o in objs if isinstance(o, threading.Thread))
+    st.caption(f"살아 있는 스레드 {len(ths):,}개 · 스레드 객체 {th_objs:,}개 · " + " · ".join(f"{k} {v:,}" for k, v in tn.most_common(6)))
     st.caption("약한 참조가 가리키는 것: " + " · ".join(f"{k} {v:,}" for k, v in wref.most_common(6)))
     st.caption("같은 이름 함수가 여러 벌: " + " · ".join(f"{k} ×{v:,}" for k, v in fn_names.most_common(6)))
     by_shape = collections.Counter((f[1][1], tuple(f[2])) for f in frames)
@@ -8055,7 +8059,7 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-h"
+MEM_CODE_TAG = "10/18-i"
 _STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
                    lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
                    lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]
