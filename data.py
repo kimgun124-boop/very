@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-18-mem"
+DATA_VERSION = "2026-10-18-barfix"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -254,7 +254,7 @@ def fetch_history(code: str, count: int = HIST_COUNT) -> tuple[str | None, pd.Da
         r.raise_for_status()
         name, df = parse_fchart(decode(r.content))
         if not df.empty:
-            return name, df, None
+            return name, apply_bar_fix(code, df), None
         error = "fchart 응답에 일봉이 없음"
     except requests.RequestException as exc:
         error = f"fchart 실패: {exc.__class__.__name__}"
@@ -276,7 +276,7 @@ def fetch_history(code: str, count: int = HIST_COUNT) -> tuple[str | None, pd.Da
         r.raise_for_status()
         df = parse_sisejson(decode(r.content))
         if not df.empty:
-            return None, df, None
+            return None, apply_bar_fix(code, df), None
         error = (error or "") + " / siseJson 응답에 일봉이 없음"
     except requests.RequestException as exc:
         error = (error or "") + f" / siseJson 실패: {exc.__class__.__name__}"
@@ -4697,3 +4697,89 @@ def t126_size(equity: float | None, price: float | None, stop: float | None, ris
         amt = total * weight / 9
         out.update(total=total, amount=amt, shares=int(amt // price))
     return out
+
+
+# ─────────────────────────── 깨진 일봉 거르기(네이버 데이터 오류) ───────────────────────────
+# (2026.10.18) 에스원 10/14 일봉이 네이버 모든 출처에서 고가 106,500·종가 96,300으로 왔는데, 다음 날(10/15)의
+# '전일 대비 +12,800 → 98,500'으로 보면 10/14 진짜 종가는 85,700(HTS도 8만원대 작은 봉) → 깨진 봉이 52주 최고가가 됐어요.
+# 모바일 일별 시세(종가 + 전일 대비)로 '그날 종가 = 다음 날 종가 − 다음 날 전일 대비'가 맞는지 확인해요.
+# 넥장 때문에 전일 대비 기준이 조금 달라 평소에도 1% 안쪽은 어긋나요 → BAR_BAD_PCT(4%)보다 크면 깨진 봉으로 봐요.
+BAR_BAD_PCT = 4.0
+BAR_FIX: dict[str, dict] = {}          # {코드: {날짜(YYYY-MM-DD): {"close": 진짜 종가, "high": 고친 고가, "low": 고친 저가}}}
+_bar_chk_cache: dict[tuple, tuple] = {}
+
+
+def daily_prices(code: str, pages: int = 1, size: int = 60) -> list[dict]:
+    """모바일 일별 시세 [{date, open, high, low, close, chg}] (최근부터)."""
+    out = []
+    for page in range(1, pages + 1):
+        js = _get_json([f"{M_API}/stock/{code}/price"], params={"pageSize": size, "page": page}, timeout=6)
+        if not isinstance(js, list) or not js:
+            break
+        for d in js:
+            try:
+                out.append({"date": str(d.get("localTradedAt"))[:10], "open": _num(d.get("openPrice")),
+                            "high": _num(d.get("highPrice")), "low": _num(d.get("lowPrice")),
+                            "close": _num(d.get("closePrice")), "chg": _num(d.get("compareToPreviousClosePrice"))})
+            except Exception:
+                continue
+    return out
+
+
+def bar_chain_check(rows: list[dict]) -> dict[str, dict]:
+    """일별 시세(최근부터)에서 '종가 ≠ 다음 날 종가 − 전일 대비'가 BAR_BAD_PCT보다 큰 날 → 고칠 값."""
+    bad = {}
+    rows = [r for r in rows if r.get("close") and r.get("date")]
+    for nxt, cur in zip(rows, rows[1:]):          # nxt = 다음 거래일, cur = 그 전날
+        if nxt.get("chg") is None:
+            continue
+        implied = nxt["close"] - nxt["chg"]
+        if implied > 0 and abs(cur["close"] / implied - 1) * 100 > BAR_BAD_PCT:
+            lo = min(x for x in (cur.get("low"), implied, cur.get("open")) if x)
+            hi = max(x for x in (cur.get("open"), implied) if x)
+            bad[cur["date"]] = {"close": implied, "high": hi, "low": lo, "was_high": cur.get("high"),
+                                "was_close": cur["close"]}
+    return bad
+
+
+def check_bars(code: str, dates, ttl: int = 43200) -> dict[str, dict]:
+    """dates(YYYY-MM-DD) 중 깨진 봉을 찾아 BAR_FIX에 적고 돌려줘요. 종목별 12시간 기억."""
+    if MOCK or not is_kr(code):
+        return {}
+    dates = sorted({str(x)[:10] for x in dates if x is not None})
+    if not dates:
+        return {}
+    now = _time.time()
+    oldest = min(dates)
+    hit = _bar_chk_cache.get(code)
+    if hit and now - hit[0] < ttl and hit[1] <= oldest:
+        return {d: BAR_FIX.get(code, {}).get(d) for d in dates if d in BAR_FIX.get(code, {})}
+    days_back = (now_kst().date() - date.fromisoformat(oldest)).days
+    pages = min(5, max(1, int(days_back * 0.7 / 60) + 1))       # 60거래일씩, 최대 300거래일
+    rows = daily_prices(code, pages=pages)
+    bad = bar_chain_check(rows)
+    if bad:
+        BAR_FIX.setdefault(code, {}).update(bad)
+    covered = rows[-1]["date"] if rows else "9999-12-31"
+    _bar_chk_cache[code] = (now, covered)
+    return {d: v for d, v in BAR_FIX.get(code, {}).items() if d in dates}
+
+
+def apply_bar_fix(code: str, df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """BAR_FIX에 적힌 깨진 봉을 고친 새 표(없으면 그대로)."""
+    fx = BAR_FIX.get(code)
+    if not fx or df is None or df.empty:
+        return df
+    ds = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    hit = ds.isin(list(fx))
+    if not hit.any():
+        return df
+    df = df.copy()
+    for i in df.index[hit]:
+        f = fx[ds[i]]
+        for col in ("close", "high", "low"):
+            if col in df and f.get(col):
+                df.loc[i, col] = f[col]
+        if "open" in df and f.get("high"):
+            df.loc[i, "open"] = min(float(df.loc[i, "open"]), f["high"])
+    return df

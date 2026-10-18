@@ -225,6 +225,18 @@ if re.fullmatch(r"\d{6}", _qp_diag):
             st.code(re.sub(r"\s+", " ", _txt)[:1500])
         except Exception as _e:
             st.markdown(f"**{_nm}** · 실패 {type(_e).__name__}")
+    try:
+        _rows = data.daily_prices(_qp_diag, pages=5)
+        _bad = data.bar_chain_check(_rows)
+        _mis = []
+        for _n, _c in zip(_rows, _rows[1:]):
+            if _n.get("chg") is not None and _c.get("close"):
+                _mis.append(abs(_c["close"] / (_n["close"] - _n["chg"]) - 1) * 100)
+        st.markdown(f"**연속성 점검** · {len(_rows)}일 · 어긋남 중앙값 {np.median(_mis) if _mis else 0:.2f}% · "
+                    f"최대 {max(_mis) if _mis else 0:.2f}% · 1% 넘는 날 {sum(1 for x in _mis if x > 1)}일")
+        st.code(str(_bad) or "깨진 봉 없음")
+    except Exception as _e:
+        st.markdown(f"연속성 점검 실패 {type(_e).__name__}: {_e}")
     st.stop()
 
 REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
@@ -241,7 +253,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
-DATA_VERSION = "2026-10-18-mem"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-18-barfix"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
