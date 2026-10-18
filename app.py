@@ -1094,11 +1094,29 @@ def mem_report() -> list[tuple[str, float]]:
     try:
         from streamlit.runtime.caching import get_data_cache_stats_provider
         per: dict[str, int] = {}
-        for stat in get_data_cache_stats_provider().get_stats():
+        stats = get_data_cache_stats_provider().get_stats()
+        if isinstance(stats, dict):          # 새 Streamlit: {묶음 이름: [CacheStat, ...]}
+            stats = [x for v in stats.values() for x in (v or [])]
+        for stat in stats:
             nm = str(getattr(stat, "cache_name", "?")).split(".")[-1]
             per[nm] = per.get(nm, 0) + int(getattr(stat, "byte_length", 0) or 0)
         for nm, b in sorted(per.items(), key=lambda x: -x[1])[:6]:
             out.append((f"캐시 {nm}", b))
+    except Exception:
+        pass
+    try:                                     # 접속 중인 화면(세션)마다 들고 있는 상태
+        from streamlit.runtime import get_instance
+        sm = get_instance()._session_mgr
+        sess = sm.list_active_sessions() if hasattr(sm, "list_active_sessions") else []
+        tot = 0
+        for si in sess:
+            ss = getattr(getattr(si, "session", None), "_session_state", None)
+            if ss is not None:
+                try:
+                    tot += _deep_bytes({k: ss[k] for k in ss.filtered_state})
+                except Exception:
+                    pass
+        out.append((f"접속 화면 {len(sess)}개 상태", tot))
     except Exception:
         pass
     return [(n, b / 1e6) for n, b in sorted(out, key=lambda x: -x[1])]
