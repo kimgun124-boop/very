@@ -160,6 +160,8 @@ import stocks as stock_list
 import theme
 import chart_draw
 import recovery
+import macro
+import macro_view
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -277,6 +279,12 @@ if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     _missing.append("holdings.py 새 파일")
+MACRO_VERSION = "2026-10-20-macro"
+if getattr(macro, "MACRO_VERSION", None) != MACRO_VERSION:
+    macro = importlib.reload(macro)
+    macro_view = importlib.reload(macro_view)
+if getattr(macro, "MACRO_VERSION", None) != MACRO_VERSION:
+    _missing.append("macro.py 새 파일")
 if _missing:
     st.error("GitHub의 data.py가 예전 내용이에요. 저장소에서 data.py를 열어 새 파일 내용으로 바꿔 주세요. "
              "'data (1).py'처럼 이름이 바뀐 파일이 따로 올라가 있지 않은지도 확인해 주세요. "
@@ -1748,6 +1756,10 @@ def load_shares() -> dict:
 
 def load_fx():
     return swr(("fx",), 3600, data.fetch_fx, "환율을 불러오는 중이에요.")
+
+
+def load_macro():
+    return swr(("macro",), 300, macro.snapshot, "매크로 시황(세계 지수·섹터·금리·뉴스)을 불러오는 중이에요.")
 
 
 def load_indexes():
@@ -8445,7 +8457,7 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
-    names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
+    names = ["📋 리스트", "🌍 매크로 시황", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
              "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
@@ -8456,13 +8468,14 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
+    t_list, t_macro, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
 
     jobs = [
         (t_list, lambda: render_list(df, histories, quote_error, shares_store, fins_all)),
+        (t_macro, lambda: macro_view.render(load_macro())),
         (t_watch, lambda: render_watch_tab(df, quotes, histories)),
         (t_hold, lambda: render_holdings_tab(df, quotes)),
         (t_mon, lambda: render_monitor_tab(df, quotes)),

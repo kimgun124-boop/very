@@ -1,0 +1,23 @@
+name: 매크로 아침 브리핑
+
+on:
+  schedule:
+    # 한국 시간 평일(화~토 아침 = 미국 월~금 마감 뒤) 07:40. UTC = 한국 - 9시간. 예약 실행은 5~15분 늦을 수 있어요.
+    - cron: "40 22 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 브리핑 보내기
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python macro_brief.py
