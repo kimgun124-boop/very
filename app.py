@@ -18,7 +18,7 @@ import streamlit as st
 import importlib
 import threading
 import time
-from datetime import time as dtime
+from datetime import date, time as dtime
 
 # (메모리) 리눅스 메모리 할당기 설정 — 무거운 import 전에.
 # 여러 스레드가 동시에 시세·일봉을 받으면 스레드마다 따로 메모리 칸(arena)을 만들어 쓰고 난 뒤에도 쥐고 있어요.
@@ -8093,6 +8093,149 @@ def _t126_chart(ind: pd.DataFrame, events: list, name: str):
     st.altair_chart(macd)
 
 
+T126_SIM_STARTS = {"올해 첫 거래일(1/2)": (1, 2), "4월 1일": (4, 1), "7월 1일": (7, 1), "직접 고르기": None}
+_T126_SIM_MEMO: dict = {}
+
+
+def _t126_sim_opts() -> dict:
+    """모의 계좌 설정(화면 아래 설정 칸과 같은 값). 타일도 같은 값으로 계산해요."""
+    ss, y = st.session_state, data.now_kst().year
+    pick = ss.get("t126s_start", "올해 첫 거래일(1/2)")
+    md = T126_SIM_STARTS.get(pick)
+    start = date(y, *md) if md else ss.get("t126s_date", date(y, 1, 2))
+    return {"start": start, "seed": int(ss.get("t126s_seed", 10_000_000)), "risk": float(ss.get("t126s_risk", 1.5)),
+            "max_pos": int(ss.get("t126s_max", 8)), "narr_only": bool(ss.get("t126s_narr", True))}
+
+
+def _t126_sim_run(df, histories, quotes, p, fins_all):
+    """원칙(1:2:6 순서·위험 한도) + 펀더멘털(영업이익 증가) + 내러티브(공부 자료·리포트 종목)로 스스로 매매한 결과."""
+    if not fins_all:
+        return None, "실적(영업이익) 자료를 받는 중이에요. 펀더멘털을 확인한 종목만 사기 때문에 잠시 뒤 계좌가 계산돼요."
+    o = _t126_sim_opts()
+    story = {x["code"]: x for x in STOCKS}
+    meta = {}
+    for code in df.loc[df["code"].map(data.is_kr), "code"].unique():
+        if o["narr_only"] and code not in story:
+            continue
+        g = data.op_growth(fins_all.get(code))
+        if g.get("op_up") is not True:
+            continue
+        x = story.get(code) or {}
+        narr = " · ".join(t for t in [x.get("group"), x.get("desc")] if t) or "공부 자료 밖 종목"
+        meta[code] = {"op_txt": g["op_txt"], "op_g": g.get("op_g"), "narr": narr}
+    if not meta:
+        return None, "조건(영업이익 증가 + 공부 자료 종목)을 통과한 종목이 아직 없어요."
+    now = data.now_kst()
+    key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), len(meta), tuple(sorted(o.items())),
+           p["retest_tol"], p["rsi_weak"])
+    res = _T126_SIM_MEMO.get(key)
+    if res is None:
+        kospi = (load_indexes().get("KOSPI") or (None,))[0]
+        with st.spinner("1천만 원 모의 계좌를 시작일부터 하루씩 매매해 보는 중…"):
+            res = data.t126_sim(df, histories, quotes, o["start"], meta, kospi, p,
+                                {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"]})
+        _T126_SIM_MEMO.clear()
+        _T126_SIM_MEMO[key] = res
+    return (res, None) if res.get("ok") else (None, "시작일 이후 일봉이 부족해요.")
+
+
+def _t126_sim_view(sim: dict | None, msg: str | None):
+    o = _t126_sim_opts()
+    with st.expander("⚙️ 모의 계좌 설정", expanded=False):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        pick = c1.selectbox("시작일", list(T126_SIM_STARTS), key="t126s_start")
+        if T126_SIM_STARTS[pick] is None:
+            c1.date_input("직접 고른 시작일", value=o["start"], min_value=date(data.now_kst().year - 1, 1, 2),
+                          max_value=data.now_kst().date(), key="t126s_date")
+        c2.number_input("시드(원)", 1_000_000, 1_000_000_000, 10_000_000, 1_000_000, key="t126s_seed")
+        c3.number_input("1회 위험(계좌 %)", 0.5, 3.0, 1.5, 0.5, key="t126s_risk", help="내 원칙 1.5% (영상 예시는 2%)")
+        c4.number_input("동시 보유 최대", 3, 15, 8, 1, key="t126s_max", help="내 원칙 최대 8종목")
+        c5.toggle("공부 자료·리포트 종목만", value=True, key="t126s_narr",
+                  help="끄면 영업이익이 늘어난 종목이면 시장 전체에서 골라요(내러티브 조건 해제).")
+    if not sim:
+        st.info(msg or "계산할 수 있는 종목이 없어요.")
+        return
+    seed = sim["seed"]
+    col = UP if sim["pnl"] > 0 else DOWN if sim["pnl"] < 0 else "#26343E"
+    kr = sim.get("kospi_ret")
+    k = st.columns(4)
+    k[0].markdown(f'<div class="pf-k">평가금액</div><div class="pf-v">{sim["equity"]:,.0f}원</div>'
+                  f'<div class="pf-s">시드 <b>{seed:,.0f}원</b> · {sim["start"]:%Y.%m.%d}부터</div>', unsafe_allow_html=True)
+    k[1].markdown(f'<div class="pf-k">수익금 · 수익률</div><div class="pf-v" style="color:{col}">{sim["pnl"]:+,.0f}원</div>'
+                  f'<div class="pf-s">수익률 <b style="color:{col}">{sim["ret"]:+.2f}%</b>'
+                  + (f' · 같은 기간 코스피 <b>{kr:+.2f}%</b>' if kr is not None else "") + "</div>", unsafe_allow_html=True)
+    stock_v = sim["equity"] - sim["cash"]
+    k[2].markdown(f'<div class="pf-k">계좌 구성</div><div class="pf-v">{stock_v / sim["equity"] * 100:.0f}% 주식</div>'
+                  f'<div class="pf-s">주식 <b>{stock_v:,.0f}원</b> · 현금 <b>{sim["cash"]:,.0f}원</b></div>', unsafe_allow_html=True)
+    wr = f'{sim["wins"] / sim["closed"] * 100:.0f}%' if sim["closed"] else "-"
+    k[3].markdown(f'<div class="pf-k">실현손익 · 승률</div><div class="pf-v">{sim["realized"]:+,.0f}원</div>'
+                  f'<div class="pf-s">끝난 매매 <b>{sim["closed"]}건</b> · 승률 <b>{wr}</b> · 최대 낙폭 <b>{sim["mdd"]:.1f}%</b></div>',
+                  unsafe_allow_html=True)
+
+    a, b = st.columns([3, 2])
+    with a:
+        st.markdown("**계좌 흐름**")
+        cv = sim["curve"]
+        long = [cv.assign(구분="모의 계좌", 값=cv["equity"])]
+        if "kospi" in cv:
+            long.append(cv.assign(구분="코스피(같은 돈)", 값=cv["kospi"]))
+        long = pd.concat(long).rename(columns={"date": "날짜"})
+        ch = (alt.Chart(long).mark_line(interpolate="monotone").encode(
+            x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%m.%d", labelAngle=0, grid=False)),
+            y=alt.Y("값:Q", title="원", scale=alt.Scale(zero=False), axis=alt.Axis(format="~s")),
+            color=alt.Color("구분:N", scale=alt.Scale(domain=["모의 계좌", "코스피(같은 돈)"], range=["#5B47F5", "#B9B4D8"]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("값:Q", format=",.0f")])
+            .properties(height=280, width="container"))
+        st.altair_chart(ch)
+    with b:
+        st.markdown("**지금 계좌 구성**")
+        parts = [(x["name"], x["value"]) for x in sim["hold"]] + ([("현금", sim["cash"])] if sim["cash"] > 0 else [])
+        pdf = pd.DataFrame(parts, columns=["종목", "금액"])
+        pdf["비중"] = pdf["금액"] / pdf["금액"].sum() * 100
+        pie = (alt.Chart(pdf).mark_arc(innerRadius=55, outerRadius=100).encode(
+            theta="금액:Q", color=alt.Color("종목:N", sort=list(pdf["종목"]), legend=alt.Legend(orient="bottom", title=None, columns=2)),
+            tooltip=["종목:N", alt.Tooltip("금액:Q", format=",.0f"), alt.Tooltip("비중:Q", format=".1f")])
+            .properties(height=300, width="container"))
+        st.altair_chart(pie)
+
+    t1, t2 = st.tabs([f"보유 종목 {len(sim['hold'])}", f"매매 일지 {len(sim['trades'])}"])
+    with t1:
+        if sim["hold"]:
+            stage = {1: "1 (탐색)", 3: "3 (MACD 확인)", 9: "9 (구름대 확인)"}
+            tb = pd.DataFrame([{
+                "종목": f"{x['name']} · {x['code']}", "단계": stage.get(x["units"], str(x["units"])), "수량": x["qty"],
+                "평단": x["avg"], "현재가": x["price"], "평가금액": x["value"], "비중": x["value"] / sim["equity"] * 100,
+                "수익률": x["ret"], "평가손익": x["pnl"], "편입": f"{x['opened']:%m/%d}",
+                "펀더멘털": x.get("op_txt", ""), "내러티브": x.get("narr", "")} for x in sim["hold"]])
+            sty = tb.style.format({"수량": "{:,.0f}", "평단": "{:,.0f}", "현재가": "{:,.0f}", "평가금액": "{:,.0f}",
+                                   "비중": "{:.1f}%", "수익률": "{:+.2f}%", "평가손익": "{:+,.0f}"}) \
+                .map(lambda v: f"color:{UP if v > 0 else DOWN if v < 0 else '#26343E'}", subset=["수익률", "평가손익"])
+            st.dataframe(sty, hide_index=True, width="stretch")
+        else:
+            st.caption("지금은 들고 있는 종목 없이 전부 현금이에요 — 1:2:6 신호와 조건이 같이 맞는 종목을 기다리는 중.")
+    with t2:
+        if sim["trades"]:
+            tr = pd.DataFrame([{"날짜": f"{x['date']:%Y-%m-%d}", "종목": x["name"], "구분": x["side"], "이유": x["why"],
+                                "가격": x["price"], "수량": x["qty"], "금액": x["amount"], "실현손익": x["pnl"]}
+                               for x in sim["trades"]])
+            sty = tr.style.format({"가격": "{:,.0f}", "수량": "{:,.0f}", "금액": "{:,.0f}",
+                                   "실현손익": lambda v: "" if v is None or pd.isna(v) else f"{v:+,.0f}"}) \
+                .map(lambda v: "" if v is None or pd.isna(v) else f"color:{UP if v > 0 else DOWN if v < 0 else '#26343E'}",
+                     subset=["실현손익"]) \
+                .map(lambda v: f"color:{UP if v == '매수' else DOWN}", subset=["구분"])
+            st.dataframe(sty, hide_index=True, width="stretch", height=380)
+        else:
+            st.caption("아직 매매가 없어요.")
+    st.caption(
+        f"🤖 스스로 매매하는 규칙 — **원칙**: 1 → +2 → +6 순서로만 늘리고 가격이 내렸다고 더 사지 않음 · 1회 위험 계좌의 {o['risk']:.1f}% "
+        f"(손절 = 과매도 저점) · 한 종목 최대 19% · 동시 보유 최대 {o['max_pos']}종목 · 정리도 1:2:6, 과매도 저점 깨지면 전부 손절. "
+        "**펀더멘털**: 올해 영업이익이 작년보다 늘어난 종목만. **내러티브**: 공부 자료·리포트에 투자 이야기가 있는 종목만, 같은 날 신호가 겹치면 "
+        f"영업이익 증가율·시총 큰 순. 시총 3,000억 이상 · 신호 날 종가 체결 · 수수료 0.015%·거래세 0.20% 반영 · 조건 통과 {sim['universe']}종목에서 골라요.\n\n"
+        "⚠️ 영업이익·공부 자료는 '지금' 기준이라 과거 그날엔 몰랐던 정보가 섞여 있어요(실제보다 좋게 나올 수 있음). 오늘 신호는 장중이면 종가에 바뀔 수 있어요. "
+        "모의 결과이고 매수 권유가 아니에요.")
+
+
 def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
     st.markdown(NHC_CSS + T126_CSS, unsafe_allow_html=True)
     st.markdown('<div class="nh-head"><b>⚖️ 1:2:6 매매</b><span>후지모토 시게루 방식 — 가격이 아니라 증거가 쌓일 때 비중을 늘린다</span></div>',
@@ -8156,11 +8299,18 @@ def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
         _tile(None, "과매도 대기(RSI<30)", f"{int(((res['stage'] == 0) & res['os_now']).sum())}"),
         _tile(None, "+2 임박 · +6 대기", f"{int(((res['stage'] == 1) & res['near_gc']).sum())} · {int((res['stage'] == 3).sum())}"),
     ]
+    sim, sim_msg = _t126_sim_run(df, histories, quotes, p, fins_all)
+    if sim and sim.get("ok"):
+        tiles.insert(0, _tile(sim["pnl"] > 0 if sim["pnl"] else None, "🤖 1천만원 모의 계좌",
+                              f"{sim['equity']:,.0f}원 · {sim['ret']:+.2f}%"))
     st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
 
-    view = st.segmented_control("보기", ["🔔 오늘 신호", "📈 진행 중", "👀 후보"], default="🔔 오늘 신호",
+    view = st.segmented_control("보기", ["🤖 모의 계좌", "🔔 오늘 신호", "📈 진행 중", "👀 후보"], default="🔔 오늘 신호",
                                 key="t126_view", label_visibility="collapsed") or "🔔 오늘 신호"
-    if view == "🔔 오늘 신호":
+    if view == "🤖 모의 계좌":
+        _t126_sim_view(sim, sim_msg)
+        show, empty, cap = pd.DataFrame(), None, ""
+    elif view == "🔔 오늘 신호":
         show = today_ev.copy()
         order = {"buy6": 0, "buy2": 1, "buy1": 2, "sell6": 3, "sell2": 4, "sell1": 5, "fail": 6, "fake": 7}
         show = show.assign(_o=show["ev_kind"].map(order)).sort_values(["_o", "cap_krw"], ascending=[True, False])
@@ -8176,7 +8326,8 @@ def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
         cap = ("후보 = ① RSI 30 아래(다시 올라오면 1) ② 1 보유 중 MACD 골든크로스 임박(+2) ③ 구름대 돌파 뒤 눌림 확인 대기(+6). "
                "30 아래에서 미리 사거나, 내렸다고 더 사지 않기")
     if show.empty:
-        st.caption(empty)
+        if empty:
+            st.caption(empty)
     else:
         _t126_table(show.head(80), p, float(equity or 0))
         st.caption(cap)

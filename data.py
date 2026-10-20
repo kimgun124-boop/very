@@ -4597,6 +4597,7 @@ def t126_scan_one(ind: pd.DataFrame, p: dict | None = None) -> dict:
             if in_os and r[i - 1] < p["rsi_low"] <= r[i]:
                 stop = float(os_low)
                 ev(i, "buy1", "1 매수 — RSI 30 아래 → 다시 30 위", 1)
+                events[-1]["stop"] = stop
                 state, in_os, exits = 1, False, set()
         elif state == 1:
             if gc:
@@ -4683,6 +4684,157 @@ def t126_screen(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None 
         return out
     keep = [k for k in ("name", "group", "price", "change", "cap_krw", "rs", "to_high", "atr_pct") if k in df.columns]
     return out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+
+
+# ─────────────────────────── 1:2:6 모의 계좌(시드 1천만 원, 스스로 매매) ───────────────────────────
+# 시작일부터 하루씩 넘기며 1:2:6 신호대로 사고팔아요. 고르는 기준은 세 가지:
+#   원칙   = 1 → +2 → +6 순서로만 늘림(물타기 없음) · 1회 위험 = 계좌 × 위험% · 한 종목 최대 비중 · 동시 보유 최대 N
+#   펀더멘털 = 올해 영업이익이 작년보다 늘어난 종목만 (영업이익이 늘지 않으면 신호가 좋아도 안 삼)
+#   내러티브 = 공부 자료·리포트에 들어 있는 종목(투자 이야기가 있는 종목)만 · 같은 날 신호가 겹치면 영업이익 증가율·시총 큰 순
+# 체결 = 신호가 나온 날 종가 · 수수료 0.015%(사고팔 때) · 거래세 0.20%(팔 때)
+T126_SIM_DEFAULTS = {"seed": 10_000_000, "risk_pct": 1.5, "max_pos": 8, "max_weight": 19.0,
+                     "fee": 0.00015, "tax": 0.0020, "min_cap": 3000e8}
+
+
+def t126_sim(df: pd.DataFrame, histories: dict, quotes: dict, start: date, meta: dict,
+             index_df: pd.DataFrame | None = None, p: dict | None = None, sim: dict | None = None) -> dict:
+    """meta = {코드: {"op_txt", "op_g", "narr"}} — 펀더멘털·내러티브를 통과한 종목만 넣어 주세요."""
+    p = {**T126_DEFAULTS, **(p or {})}
+    s = {**T126_SIM_DEFAULTS, **(sim or {})}
+    today = now_kst().date()
+    start_ts = pd.Timestamp(start)
+    info = df.drop_duplicates("code").set_index("code")
+    closes, evs = {}, []
+    for code in meta:
+        if code not in info.index:
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        if hist is None or len(hist) < 100:
+            continue
+        cap = info.at[code, "cap_krw"] if "cap_krw" in info.columns else None
+        if cap is None or pd.isna(cap) or float(cap) < s["min_cap"]:
+            continue
+        try:
+            ind = t126_indicators(hist, quotes.get(code), today, p)
+            nb = int((ind["date"] >= start_ts).sum())
+            if nb < 2:
+                continue
+            st_ = t126_scan_one(ind, {**p, "lookback": nb})
+        except Exception:  # noqa: BLE001
+            continue
+        closes[code] = pd.Series(ind["close"].to_numpy(), index=ind["date"].dt.normalize()).groupby(level=0).last()
+        for e in st_["events"]:
+            if e["kind"] in ("buy1", "buy2", "buy6", "sell1", "sell2", "sell6", "fail"):
+                evs.append({**e, "code": code, "date": pd.Timestamp(e["date"])})
+    if not closes:
+        return {"ok": False}
+    days = sorted({d for sr in closes.values() for d in sr.index if d >= start_ts})
+    px = pd.DataFrame(closes).reindex(sorted(set().union(*[sr.index for sr in closes.values()]))).ffill()
+    order = {"fail": 0, "sell6": 1, "sell2": 2, "sell1": 3, "buy6": 4, "buy2": 5, "buy1": 6}
+    by_day: dict = {}
+    for e in evs:
+        by_day.setdefault(e["date"], []).append(e)
+
+    cash, pos, trades, curve, closed = float(s["seed"]), {}, [], [], []
+
+    def name(c):
+        return str(info.at[c, "name"]) if "name" in info.columns and c in info.index else c
+
+    def equity_on(d):
+        row = px.loc[d] if d in px.index else None
+        v = cash
+        for c, h in pos.items():
+            pr = row[c] if row is not None and c in row and pd.notna(row[c]) else h["last"]
+            v += h["qty"] * pr
+        return v
+
+    def sell(c, d, price, qty, why):
+        nonlocal cash
+        h = pos[c]
+        qty = min(qty, h["qty"])
+        if qty <= 0:
+            return
+        gross = qty * price
+        net = gross * (1 - s["fee"] - s["tax"])
+        cost = h["cost"] * qty / h["qty"]
+        pnl = net - cost
+        cash += net
+        h["qty"] -= qty
+        h["cost"] -= cost
+        h["realized"] += pnl
+        trades.append({"date": d, "code": c, "name": name(c), "side": "매도", "why": why, "price": price,
+                       "qty": qty, "amount": gross, "pnl": pnl})
+        if h["qty"] <= 0:
+            closed.append({"code": c, "name": name(c), "pnl": h["realized"], "opened": h["opened"], "closed": d})
+            del pos[c]
+
+    def buy(c, d, price, amt, why, w):
+        nonlocal cash
+        amt = min(amt, cash / (1 + s["fee"]))
+        qty = int(amt // price)
+        if qty <= 0:
+            return 0
+        cost = qty * price * (1 + s["fee"])
+        cash -= cost
+        h = pos.setdefault(c, {"qty": 0, "cost": 0.0, "realized": 0.0, "units": 0, "peak": 0, "opened": d,
+                               "plan": 0.0, "stop": None, "last": price, "why": []})
+        h["qty"] += qty
+        h["cost"] += cost
+        h["units"] += w
+        h["peak"] = max(h["peak"], h["qty"])
+        h["why"].append(why)
+        trades.append({"date": d, "code": c, "name": name(c), "side": "매수", "why": why, "price": price,
+                       "qty": qty, "amount": qty * price, "pnl": None})
+        return qty
+
+    for d in days:
+        for e in sorted(by_day.get(d, []), key=lambda x: (order[x["kind"]], -(meta[x["code"]].get("op_g") or 0),
+                                                           -float(info.at[x["code"], "cap_krw"] or 0))):
+            c, k, price = e["code"], e["kind"], float(e["price"])
+            if k in ("fail", "sell6") and c in pos:
+                sell(c, d, price, pos[c]["qty"], e["label"])
+            elif k in ("sell1", "sell2") and c in pos:
+                sell(c, d, price, max(1, round(pos[c]["peak"] * (1 if k == "sell1" else 2) / 9)), e["label"])
+            elif k == "buy1" and c not in pos and len(pos) < s["max_pos"]:
+                eq = equity_on(d)
+                stop = e.get("stop")
+                dist = (price - stop) / price if stop and stop < price else 0.08
+                dist = max(dist, 0.03)                 # 손절 거리가 너무 짧으면 금액이 과해져서 최소 3%로 봐요
+                plan = min(eq * s["risk_pct"] / 100 / dist, eq * s["max_weight"] / 100)
+                if buy(c, d, price, plan / 9, e["label"], 1):
+                    pos[c].update(plan=plan, stop=stop)
+            elif k == "buy2" and c in pos and pos[c]["units"] == 1:
+                buy(c, d, price, pos[c]["plan"] * 2 / 9, e["label"], 2)
+            elif k == "buy6" and c in pos and pos[c]["units"] == 3:
+                buy(c, d, price, pos[c]["plan"] * 6 / 9, e["label"], 6)
+        row = px.loc[d] if d in px.index else None
+        for c, h in pos.items():
+            if row is not None and pd.notna(row.get(c)):
+                h["last"] = float(row[c])
+        curve.append({"date": d, "equity": equity_on(d), "cash": cash})
+
+    cv = pd.DataFrame(curve)
+    if index_df is not None and len(index_df) and len(cv):
+        ix = index_df.assign(date=pd.to_datetime(index_df["date"]).dt.normalize()).set_index("date")["close"]
+        ix = pd.to_numeric(ix, errors="coerce").groupby(level=0).last().reindex(cv["date"]).ffill().bfill()
+        if ix.notna().any() and ix.iloc[0]:
+            cv["kospi"] = (ix / ix.iloc[0] * s["seed"]).to_numpy()
+    eq_now = float(cv["equity"].iloc[-1]) if len(cv) else s["seed"]
+    peak = cv["equity"].cummax() if len(cv) else pd.Series([s["seed"]])
+    mdd = float(((cv["equity"] / peak - 1) * 100).min()) if len(cv) else 0.0
+    hold = []
+    for c, h in pos.items():
+        val = h["qty"] * h["last"]
+        hold.append({"code": c, "name": name(c), "units": h["units"], "qty": h["qty"], "avg": h["cost"] / h["qty"],
+                     "price": h["last"], "value": val, "ret": (val / h["cost"] - 1) * 100 if h["cost"] else 0.0,
+                     "pnl": val - h["cost"], "opened": h["opened"], "why": h["why"], **meta.get(c, {})})
+    wins = sum(1 for x in closed if x["pnl"] > 0)
+    return {"ok": True, "curve": cv, "hold": sorted(hold, key=lambda x: -x["value"]), "trades": trades[::-1],
+            "cash": cash, "equity": eq_now, "seed": s["seed"], "ret": (eq_now / s["seed"] - 1) * 100,
+            "pnl": eq_now - s["seed"], "realized": sum(x["pnl"] for x in trades if x["pnl"] is not None),
+            "closed": len(closed), "wins": wins, "mdd": mdd,
+            "kospi_ret": (float(cv["kospi"].iloc[-1]) / s["seed"] - 1) * 100 if "kospi" in cv else None,
+            "universe": len(closes), "start": days[0] if days else start_ts}
 
 
 def t126_size(equity: float | None, price: float | None, stop: float | None, risk_pct: float, weight: int) -> dict:
