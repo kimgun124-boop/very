@@ -160,6 +160,7 @@ import stocks as stock_list
 import theme
 import chart_draw
 import recovery
+import tracker
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -321,7 +322,7 @@ def _sync_from_github() -> str:
     repo, branch = sec("GITHUB_REPO", "kimgun124-boop/very"), sec("GITHUB_BRANCH") or None
     got = []
     base = os.path.dirname(os.path.abspath(__file__))
-    for name in ("user_holdings.json", "user_settings.json", "user_reports.json"):
+    for name in ("user_holdings.json", "user_settings.json", "user_reports.json", "user_tracker.json"):
         d = reports.fetch_github_json(name, token, repo, branch)
         if d is not None:
             try:
@@ -6278,7 +6279,178 @@ def _pb_fig(code: str, quote: dict | None, r: dict):
     return fig
 
 
-def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict):
+PB_SIM_STARTS = {"하반기 첫날(7/1)": (7, 1), "올해 첫 거래일(1/2)": (1, 2), "4월 1일": (4, 1), "직접 고르기": None}
+_PB_SIM_MEMO: dict = {}
+
+
+def _pb_sim_opts() -> dict:
+    ss, y = st.session_state, data.now_kst().year
+    pick = ss.get("pbs_start", "하반기 첫날(7/1)")
+    md = PB_SIM_STARTS.get(pick)
+    start = date(y, *md) if md else ss.get("pbs_date", date(y, 7, 1))
+    return {"start": start, "seed": int(ss.get("pbs_seed", 10_000_000)), "risk": float(ss.get("pbs_risk", 1.5)),
+            "max_pos": int(ss.get("pbs_max", 8)), "rr": float(ss.get("pbs_rr", 3.0)),
+            "narr_only": bool(ss.get("pbs_narr", True)), "mkt": bool(ss.get("pbs_mkt", True))}
+
+
+def _pb_sim_run(df, histories, quotes, p, fins_all):
+    """눌림 타점 원칙대로 시작일부터 하루씩 사고판 1천만 원 모의 계좌."""
+    if not fins_all:
+        return None, "실적(영업이익) 자료를 받는 중이에요. 영업이익이 늘어난 종목만 사기 때문에 잠시 뒤 계좌가 계산돼요."
+    o = _pb_sim_opts()
+    story = {x["code"]: x for x in STOCKS}
+    meta = {}
+    for code in df.loc[df["code"].map(data.is_kr), "code"].unique():
+        if o["narr_only"] and code not in story:
+            continue
+        g = data.op_growth(fins_all.get(code))
+        if g.get("op_up") is not True:
+            continue
+        x = story.get(code) or {}
+        meta[code] = {"op_txt": g["op_txt"], "op_g": g.get("op_g"),
+                      "narr": " · ".join(t for t in [x.get("group"), x.get("desc")] if t) or "공부 자료 밖 종목"}
+    if not meta:
+        return None, "조건(영업이익 증가 + 공부 자료 종목)을 통과한 종목이 아직 없어요."
+    now = data.now_kst()
+    pk = tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float))))
+    key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), len(meta), tuple(sorted(o.items())), pk)
+    res = _PB_SIM_MEMO.get(key)
+    if res is None:
+        ih = load_indexes()
+        idx = {sym: (ih.get(sym) or (None,))[0] for sym in data.MARKETS.values()}
+        with st.spinner("1천만 원 모의 계좌로 시작일부터 하루씩 눌림 타점을 매매해 보는 중…"):
+            res = data.pb_sim(df, histories, quotes, o["start"], meta, idx, p,
+                              {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"], "rr_min": o["rr"],
+                               "market_filter": o["mkt"]})
+        _PB_SIM_MEMO.clear()
+        _PB_SIM_MEMO[key] = res
+    return (res, None) if res.get("ok") else (None, "시작일 이후 일봉이 부족해요.")
+
+
+def _won_c(v):
+    return "" if v is None or pd.isna(v) else f"color:{UP if v > 0 else DOWN if v < 0 else '#26343E'}"
+
+
+def _pb_sim_view(sim: dict | None, msg: str | None):
+    o = _pb_sim_opts()
+    with st.expander("⚙️ 모의 계좌 설정", expanded=False):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        pick = c1.selectbox("시작일", list(PB_SIM_STARTS), key="pbs_start")
+        if PB_SIM_STARTS[pick] is None:
+            c1.date_input("직접 고른 시작일", value=o["start"], min_value=date(data.now_kst().year - 1, 1, 2),
+                          max_value=data.now_kst().date(), key="pbs_date")
+        c2.number_input("시드(원)", 1_000_000, 1_000_000_000, 10_000_000, 1_000_000, key="pbs_seed")
+        c3.number_input("1회 위험(계좌 %)", 0.5, 3.0, 1.5, 0.5, key="pbs_risk", help="내 원칙 1.5%")
+        c4.number_input("동시 보유 최대", 3, 15, 8, 1, key="pbs_max", help="내 원칙 최대 8종목")
+        c5.number_input("진입 손익비 최소", 2.0, 6.0, 3.0, 0.5, key="pbs_rr", help="전고점까지 손익비. 3 = 3R 원칙")
+        c6, c7 = st.columns(2)
+        c6.toggle("공부 자료·리포트 종목만", value=True, key="pbs_narr",
+                  help="끄면 영업이익이 늘어난 보드 전 종목에서 골라요.")
+        c7.toggle("시장 60일선 아래면 신규 매수 쉬기", value=True, key="pbs_mkt", help="원칙: 코스피·코스닥 60일선 이하면 쉼")
+        st.caption("눌림 판정 기준(RS·눌림 폭·지지선 거리·거래대금·시총)은 위 ⚙️ 기준 칸 값을 그대로 써요.")
+    if not sim:
+        st.info(msg or "계산할 수 있는 종목이 없어요.")
+        return
+    col = UP if sim["pnl"] > 0 else DOWN if sim["pnl"] < 0 else "#26343E"
+    kr = sim.get("kospi_ret")
+    k = st.columns(4)
+    k[0].markdown(f'<div class="pf-k">평가금액</div><div class="pf-v">{sim["equity"]:,.0f}원</div>'
+                  f'<div class="pf-s">시드 <b>{sim["seed"]:,.0f}원</b> · {sim["start"]:%Y.%m.%d}~{sim["end"]:%m.%d}</div>',
+                  unsafe_allow_html=True)
+    k[1].markdown(f'<div class="pf-k">수익금 · 수익률</div><div class="pf-v" style="color:{col}">{sim["pnl"]:+,.0f}원</div>'
+                  f'<div class="pf-s">수익률 <b style="color:{col}">{sim["ret"]:+.2f}%</b>'
+                  + (f' · 같은 기간 코스피 <b>{kr:+.2f}%</b>' if kr is not None else "") + "</div>", unsafe_allow_html=True)
+    wr = f'{sim["wins"] / sim["closed"] * 100:.0f}%' if sim["closed"] else "-"
+    ar = f'{sim["avg_r"]:+.2f}R' if sim.get("avg_r") is not None else "-"
+    k[2].markdown(f'<div class="pf-k">승률 · 평균 R</div><div class="pf-v">{wr}</div>'
+                  f'<div class="pf-s">끝난 매매 <b>{sim["closed"]}건</b> · 평균 <b>{ar}</b> · '
+                  f'손익비(PF) <b>{sim["pf"]:.2f}</b></div>' if sim.get("pf") else
+                  f'<div class="pf-k">승률 · 평균 R</div><div class="pf-v">{wr}</div>'
+                  f'<div class="pf-s">끝난 매매 <b>{sim["closed"]}건</b> · 평균 <b>{ar}</b></div>', unsafe_allow_html=True)
+    stock_v = sim["equity"] - sim["cash"]
+    k[3].markdown(f'<div class="pf-k">실현손익 · 최대 낙폭</div><div class="pf-v">{sim["realized"]:+,.0f}원</div>'
+                  f'<div class="pf-s">MDD <b>{sim["mdd"]:.1f}%</b> · 주식 {stock_v / sim["equity"] * 100:.0f}% · '
+                  f'현금 {sim["cash"]:,.0f}원</div>', unsafe_allow_html=True)
+    if sim.get("market_known") and sim.get("market_off_days"):
+        st.caption(f"⛔ 기간 중 {sim['market_off_days']}거래일은 코스피·코스닥 중 60일선 아래가 있어 신규 매수를 쉬었어요(보유 종목 관리는 계속).")
+
+    cv = sim["curve"]
+    long = [cv.assign(구분="눌림 모의 계좌", 값=cv["equity"])]
+    if "kospi" in cv:
+        long.append(cv.assign(구분="코스피(같은 돈)", 값=cv["kospi"]))
+    long = pd.concat(long).rename(columns={"date": "날짜"})
+    ch = (alt.Chart(long).mark_line(interpolate="monotone").encode(
+        x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%m.%d", labelAngle=0, grid=False)),
+        y=alt.Y("값:Q", title="원", scale=alt.Scale(zero=False), axis=alt.Axis(format="~s")),
+        color=alt.Color("구분:N", scale=alt.Scale(domain=["눌림 모의 계좌", "코스피(같은 돈)"], range=["#5B47F5", "#B9B4D8"]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("값:Q", format=",.0f")])
+        .properties(height=260, width="container"))
+    st.altair_chart(ch)
+
+    t1, t2, t3 = st.tabs([f"📒 매매 일지 {len(sim['journal'])}", f"🧾 매매 내역 {len(sim['trades'])}",
+                          f"보유 종목 {len(sim['hold'])}"])
+    with t1:
+        if sim["journal"]:
+            jt = pd.DataFrame([{
+                "상태": "🟢 보유" if j["status"] == "보유" else ("✅ 수익" if j["pnl"] > 0 else "❌ 손실"),
+                "종목": f"{j['name']} · {j['code']}", "진입일": f"{j['entry_date']:%m/%d}", "매수가": j["entry_px"],
+                "수량": j["qty"], "비중": j["weight"], "손절가": j["stop0"], "손절폭": j["stop_pct"], "3R": j["t3"],
+                "진입 근거": f"{j['support']} 지지 · -{j['depth']:.1f}% {j['pb_days']}일 · 손익비 {j['rr']:.1f} · RS {j['rs']:.0f}"
+                             + (f" · 눌림 거래량 {j['dry']:.2f}배" if j.get("dry") == j.get("dry") and j.get("dry") is not None else ""),
+                "청산일": f"{j['exit_date']:%m/%d}" if j.get("exit_date") is not None else "-",
+                "청산가": j.get("exit_px") if j["status"] == "청산" else j.get("cur_px"),
+                "청산 이유": j.get("exit_why") or ("보유 중 · 손절가 " + f"{j.get('cur_stop', 0):,.0f}"
+                                                   + (" · 절반 익절 완료" if j.get("half") else "")),
+                "보유일": j.get("days"), "수익률": j.get("ret"), "R": j.get("r"), "손익": j.get("pnl"),
+                "펀더멘털": j.get("op_txt", ""), "내러티브": j.get("narr", "")} for j in sim["journal"]])
+            sty = jt.style.format({"매수가": "{:,.0f}", "수량": "{:,.0f}", "비중": "{:.1f}%", "손절가": "{:,.0f}",
+                                   "손절폭": "-{:.1f}%", "3R": "{:,.0f}", "청산가": "{:,.0f}", "보유일": "{:.0f}일",
+                                   "수익률": "{:+.2f}%", "R": "{:+.2f}R", "손익": "{:+,.0f}"}, na_rep="-") \
+                .map(_won_c, subset=["수익률", "R", "손익"])
+            st.dataframe(sty, hide_index=True, width="stretch", height=420,
+                         column_config={"종목": st.column_config.Column(pinned=True)})
+            st.download_button("📥 매매 일지 CSV", jt.to_csv(index=False).encode("utf-8-sig"),
+                               f"눌림_모의_매매일지_{sim['start']:%Y%m%d}.csv", "text/csv", key="pbs_dl_j")
+        else:
+            st.caption("아직 매매가 없어요 — 시작일 이후 조건을 모두 통과한 눌림 자리가 없었어요.")
+    with t2:
+        if sim["trades"]:
+            tr = pd.DataFrame([{"날짜": f"{x['date']:%Y-%m-%d}", "종목": x["name"], "구분": x["side"], "이유": x["why"],
+                                "가격": x["price"], "수량": x["qty"], "금액": x["amount"], "실현손익": x["pnl"], "R": x["r"]}
+                               for x in sim["trades"]])
+            sty = tr.style.format({"가격": "{:,.0f}", "수량": "{:,.0f}", "금액": "{:,.0f}", "실현손익": "{:+,.0f}",
+                                   "R": "{:+.2f}R"}, na_rep="") \
+                .map(_won_c, subset=["실현손익", "R"]).map(lambda v: f"color:{UP if v == '매수' else DOWN}", subset=["구분"])
+            st.dataframe(sty, hide_index=True, width="stretch", height=420)
+            st.download_button("📥 매매 내역 CSV", tr.to_csv(index=False).encode("utf-8-sig"),
+                               f"눌림_모의_매매내역_{sim['start']:%Y%m%d}.csv", "text/csv", key="pbs_dl_t")
+        else:
+            st.caption("아직 매매가 없어요.")
+    with t3:
+        if sim["hold"]:
+            tb = pd.DataFrame([{"종목": f"{x['name']} · {x['code']}", "편입": f"{x['opened']:%m/%d}", "수량": x["qty"],
+                                "매수가": x["avg"], "현재가": x["price"], "수익률": x["ret"], "평가손익": x["pnl"],
+                                "지금 손절가": x["stop"], "3R": x["t3"], "3R 절반 익절": "완료" if x["half"] else "-",
+                                "평가금액": x["value"], "비중": x["value"] / sim["equity"] * 100} for x in sim["hold"]])
+            st.dataframe(tb.style.format({"수량": "{:,.0f}", "매수가": "{:,.0f}", "현재가": "{:,.0f}", "수익률": "{:+.2f}%",
+                                          "평가손익": "{:+,.0f}", "지금 손절가": "{:,.0f}", "3R": "{:,.0f}",
+                                          "평가금액": "{:,.0f}", "비중": "{:.1f}%"}).map(_won_c, subset=["수익률", "평가손익"]),
+                         hide_index=True, width="stretch")
+        else:
+            st.caption("지금은 전부 현금이에요 — 조건이 모두 맞는 눌림 자리를 기다리는 중.")
+    st.caption(
+        f"🤖 규칙 — **진입**: 그날까지의 일봉만 보고 눌림 자리(추세·눌림 폭·지지선) + 그날 기준 RS ≥ 기준 + 손익비 ≥ {o['rr']:.1f} "
+        "+ 반등 캔들(양봉·고가권 마감 또는 전일 고가 돌파)이면 **그날 종가 매수**, 같은 날 여럿이면 손익비·눌림 거래량·RS·영업이익 순. "
+        f"**금액**: 계좌 × {o['risk']:.1f}% ÷ (매수가 − 손절가), 한 종목 최대 19% · 최대 {o['max_pos']}종목. "
+        "**청산**: 손절가(지지선·눌림 저점 − 0.5 ATR) 터치면 전부(갭 하락은 시가) · 3R 도달 절반 익절 후 손절 본절 · "
+        "+2R 본절, +4R → +1R, +5R → +2R … 손절가 끌어올림 · 나머지는 5일선이 50일선에 닿으면 종가 정리. "
+        f"수수료 0.015%·거래세 0.20% 반영 · 시총 3,000억↑ · 조건 통과 {sim['universe']}종목.\n\n"
+        "⚠️ 영업이익·공부 자료는 '지금' 기준이라 과거엔 몰랐던 정보가 섞여요(실제보다 좋게 나올 수 있음). 같은 날 손절·3R이 "
+        "둘 다 닿으면 손절로 봐요(보수적). 오늘 칸은 장중이면 종가에 바뀔 수 있어요. 모의 결과이고 매수 권유가 아니에요.")
+
+
+def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
     """신고가 돌파가 아니라, 모멘텀·실적 좋은 종목이 지지선까지 쉬어 갈 때의 손익비 좋은 자리."""
     _sec_h("🪃 눌림 타점", "모멘텀(RS)·실적(올해 영업이익↑) 종목이 지지선까지 쉬어 갈 때 — 거래량·수급·차트로 손익비 좋은 자리")
     d = data.PB_DEFAULTS
@@ -6301,6 +6473,12 @@ def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict):
                             help="원칙: 강해도 영업이익이 늘지 않으면 배제")
     p = {**d, "rs_min": int(rs_min), "rr_min": float(rr_min), "depth_min": float(dmin), "depth_max": float(dmax),
          "near_atr": float(near), "min_tv": float(min_tv) * 1e8, "min_cap": float(min_cap)}
+    pb_view = st.segmented_control("보기", ["🔎 오늘 타점", "🤖 1천만원 모의 매매"], default="🔎 오늘 타점",
+                                   key="pb_view", label_visibility="collapsed") or "🔎 오늘 타점"
+    if pb_view == "🤖 1천만원 모의 매매":
+        sim, msg = _pb_sim_run(df, histories, quotes, p, fins_all)
+        _pb_sim_view(sim, msg)
+        return
 
     hist = load_indexes()
     sigs, oks = [], []
@@ -6436,6 +6614,205 @@ def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict):
     else:
         st.info("차트를 받지 못했어요.")
 
+
+
+# ─────────────────────────── 📣 실적·지분 추적 ───────────────────────────
+TRACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_tracker.json")
+
+
+def _track_load() -> dict:
+    try:
+        import json as _json
+        with open(TRACK_FILE, encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _track_save(store: dict) -> str:
+    """새로 찾은 서프라이즈·지분 공시를 쌓아 둬요(채널 글이 밀려 사라져도 추적이 이어지게). GitHub 토큰이 있으면 거기도."""
+    import json as _json
+    try:
+        with open(TRACK_FILE, "w", encoding="utf-8") as f:
+            _json.dump(store, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+    tok = _secret("GITHUB_TOKEN")
+    if tok:
+        ok, msg = reports.save_github(store, tok, _secret("GITHUB_REPO", "kimgun124-boop/very"),
+                                      _secret("GITHUB_BRANCH") or None, path="user_tracker.json")
+        return msg
+    return "이 서버에만 저장(GITHUB_TOKEN 없음)"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_surprises(since_iso: str):
+    return tracker.collect_surprises(date.fromisoformat(since_iso))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_stakes(key: str, days: int, only_vc: bool):
+    return tracker.stake_increases(key, days, only_vc)
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=300)
+def load_hist_one(code: str) -> pd.DataFrame:
+    return data.fetch_history(code, count=320)[1]
+
+
+def _track_rows(items: list[dict], df: pd.DataFrame, histories: dict, quotes: dict, date_key: str = "date") -> pd.DataFrame:
+    """종목별: 발표(공시)일 종가 → 지금까지 수익률, 그 뒤 최고가, 52주 신고가 상태, RS, 오늘 등락."""
+    info = df.drop_duplicates("code").set_index("code")
+    need = tuple(sorted({x["code"] for x in items if x["code"] not in quotes}))
+    extra_q = load_quotes(need)[0] if need else {}
+    out = []
+    for x in items:
+        c = x["code"]
+        h = (histories.get(c) or (None, None, None))[1]
+        if h is None or h.empty:
+            h = load_hist_one(c)
+        q = quotes.get(c) or extra_q.get(c) or {}
+        price = q.get("price") or (float(h["close"].iloc[-1]) if h is not None and len(h) else None)
+        base = hi_after = None
+        h52 = None
+        if h is not None and len(h) and x.get(date_key):
+            dd = pd.to_datetime(h["date"]).dt.normalize()
+            d0 = pd.Timestamp(x[date_key])
+            on = h[dd <= d0]
+            base = float(on["close"].iloc[-1]) if len(on) else None
+            after = h[dd >= d0]
+            hi_after = float(pd.to_numeric(after["high"], errors="coerce").max()) if len(after) else None
+            h52 = float(pd.to_numeric(h["high"], errors="coerce").tail(250).max())
+        if price and hi_after:
+            hi_after = max(hi_after, float(q.get("high") or 0), price)
+        if price and h52:
+            h52 = max(h52, float(q.get("high") or 0), price)
+        r = info.loc[c] if c in info.index else None
+        out.append({**x, "price": price, "chg": q.get("change") if q.get("change") is not None else (r["change"] if r is not None else None),
+                    "base": base, "since": (price / base - 1) * 100 if price and base else None,
+                    "max_since": (hi_after / base - 1) * 100 if hi_after and base else None,
+                    "to_high": (h52 / price - 1) * 100 if price and h52 else None,
+                    "new_high": bool(price and h52 and float(q.get("high") or price) >= h52 * 0.999),
+                    "rs": r["rs"] if r is not None and "rs" in r else None,
+                    "group": r["group"] if r is not None and "group" in r else None,
+                    "on_board": c in info.index})
+    return pd.DataFrame(out)
+
+
+def render_tracker(df: pd.DataFrame, histories: dict, quotes: dict):
+    _sec_h("📣 실적·지분 추적", "텔레그램(스탁이지·AWAKE) 3분기 어닝 서프라이즈 + DART 대량보유 보고(VC·펀드 지분 확대)를 모아 주가를 따라가요")
+    y = data.now_kst().year
+    view = st.segmented_control("보기", ["🚀 3분기 어닝 서프라이즈", "🏦 VC·펀드 지분 확대"], default="🚀 3분기 어닝 서프라이즈",
+                                key="trk_view", label_visibility="collapsed") or "🚀 3분기 어닝 서프라이즈"
+    store = _track_load()
+    if view == "🚀 3분기 어닝 서프라이즈":
+        c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
+        since = c1.date_input("이날부터 발표", date(y, 10, 1), key="trk_since")
+        beat_min = c2.number_input("컨센 대비 최소(%)", -50.0, 200.0, 10.0, 5.0, key="trk_beat",
+                                   help="예상(컨센서스)보다 영업이익이 이만큼 이상 높으면 서프라이즈")
+        only_q3 = c3.toggle("3분기 실적만", value=True, key="trk_q3")
+        if c4.button("🔄 채널 새로 읽기", key="trk_reload"):
+            load_surprises.clear()
+        with st.spinner("텔레그램 채널(스탁이지·AWAKE)에서 어닝 서프라이즈 글을 모으는 중…"):
+            rows, errs = load_surprises(since.isoformat())
+        old = {f"{r['code']}|{r['quarter']}": r for r in store.get("surprises", [])}
+        new_keys = [k for k in (f"{r['code']}|{r['quarter']}" for r in rows) if k not in old]
+        for r in rows:
+            old[f"{r['code']}|{r['quarter']}"] = {**old.get(f"{r['code']}|{r['quarter']}", {}), **r}
+        if new_keys:
+            store["surprises"] = list(old.values())
+            store["updated"] = data.now_kst().isoformat(timespec="minutes")
+            _track_save(store)
+        for e in errs:
+            st.caption(f"⚠️ {e}")
+        items = [r for r in old.values() if r.get("beat") is not None and r["beat"] >= beat_min
+                 and (r.get("date") or "") >= since.isoformat()
+                 and (not only_q3 or str(r.get("quarter") or "").startswith("3Q"))]
+        if not items:
+            st.info("조건에 맞는 어닝 서프라이즈가 아직 없어요. 채널 글을 못 읽었으면 위 경고를 확인하고 '채널 새로 읽기'를 눌러 보세요.")
+            return
+        t = _track_rows(items, df, histories, quotes)
+        t = t.sort_values(["new_high", "since"], ascending=[False, False])
+        n_new = int(t["new_high"].sum())
+        n_up = int((t["since"] > 0).sum())
+        tiles = [_tile(None, "서프라이즈 종목", f"{len(t)}"), _tile(True if n_new else None, "🏔️ 지금 52주 신고가", f"{n_new}"),
+                 _tile(n_up >= len(t) / 2, "발표 후 오른 종목", f"{n_up}/{len(t)}"),
+                 _tile(None, "발표 후 평균", f"{t['since'].mean():+.1f}%" if t["since"].notna().any() else "-")]
+        st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+        view_t = pd.DataFrame([{
+            "상태": "🏔️ 신고가" if x["new_high"] else ("🔥 5% 이내" if (x["to_high"] or 99) <= 5 else ""),
+            "종목": f"{x['name']} · {x['code']}", "발표일": x["date"], "분기": x.get("quarter"),
+            "영업이익(억)": x.get("op"), "컨센 대비": x.get("beat"), "매출(억)": x.get("sales"),
+            "발표일 종가": x["base"], "현재가": x["price"], "오늘": x["chg"], "발표 후": x["since"], "발표 후 최고": x["max_since"],
+            "신고가까지": x["to_high"], "RS": x["rs"], "분류": x.get("group") or ("보드 밖" if not x["on_board"] else ""),
+            "출처": x["src"], "원문": (x.get("urls") or [x.get("url")])[0]} for x in t.to_dict("records")])
+        sty = view_t.style.format({"영업이익(억)": "{:,.0f}", "컨센 대비": "{:+.1f}%", "매출(억)": "{:,.0f}",
+                                   "발표일 종가": "{:,.0f}", "현재가": "{:,.0f}", "오늘": "{:+.2f}%", "발표 후": "{:+.1f}%",
+                                   "발표 후 최고": "{:+.1f}%", "신고가까지": "{:.1f}%", "RS": "{:.0f}"}, na_rep="-") \
+            .map(_won_c, subset=["오늘", "발표 후", "발표 후 최고"])
+        st.dataframe(sty, hide_index=True, width="stretch", height=480,
+                     column_config={"종목": st.column_config.Column(pinned=True),
+                                    "원문": st.column_config.LinkColumn("원문", display_text="열기")})
+        st.download_button("📥 CSV", view_t.to_csv(index=False).encode("utf-8-sig"), f"3Q_어닝서프라이즈_{data.now_kst():%Y%m%d}.csv",
+                           "text/csv", key="trk_dl_s")
+        st.caption("서프라이즈 = 채널 글의 '예상비/컨센 대비' 숫자(없으면 영업이익 ÷ 컨센 금액으로 계산). 분기 표기가 없으면 발표 시기로 정해요(10~11월 = 3분기). "
+                   "발표일 종가 = 그날(장 마감 뒤 발표면 반응은 다음 날부터) · 발표 후 최고 = 그 뒤 최고가 기준. 한 번 찾은 종목은 쌓아 둬서 채널 글이 밀려도 계속 따라가요. "
+                   "채널 자료는 자동 생성이라 틀릴 수 있어요 — 원문·DART로 확인하세요. 매수 권유가 아니에요.")
+        return
+
+    # ── VC·펀드 지분 확대 (DART)
+    key = _secret("DART_KEY") or st.session_state.get("dart_key_in", "")
+    if not key:
+        st.info("DART 대량보유 공시를 읽으려면 무료 OpenDART 인증키가 필요해요. opendart.fss.or.kr → 인증키 신청(바로 발급) 후 "
+                "Streamlit 앱 Settings → Secrets에 `DART_KEY = \"발급받은키\"` 한 줄을 넣으면 계속 써요. 지금 한 번만 쓰려면 아래에 넣어도 돼요.")
+        st.text_input("OpenDART 인증키", type="password", key="dart_key_in")
+        return
+    c1, c2, c3 = st.columns([1, 1, 1])
+    days = c1.selectbox("기간", [7, 14, 30, 60, 90], index=2, format_func=lambda d: f"최근 {d}일", key="trk_days")
+    only_vc = c2.toggle("VC·펀드·운용사만", value=True, key="trk_vc", help="끄면 보고자 상관없이 지분율이 늘어난 대량보유 보고 전부")
+    if c3.button("🔄 DART 새로 읽기", key="trk_dreload"):
+        load_stakes.clear()
+    with st.spinner("DART 대량보유 보고서에서 지분이 늘어난 종목을 찾는 중…"):
+        rows, err = load_stakes(key, int(days), bool(only_vc))
+    if err:
+        st.caption(f"⚠️ {err}")
+    old = {f"{r['code']}|{r['reporter']}|{r['date']}": r for r in store.get("stakes", [])}
+    fresh = [r for r in rows if f"{r['code']}|{r['reporter']}|{r['date']}" not in old]
+    if fresh:
+        for r in rows:
+            old[f"{r['code']}|{r['reporter']}|{r['date']}"] = r
+        store["stakes"] = sorted(old.values(), key=lambda x: x["date"], reverse=True)[:500]
+        _track_save(store)
+    cut = (data.now_kst().date() - pd.Timedelta(days=int(days))).isoformat()
+    items = [r for r in old.values() if r["date"] >= cut and (r.get("vc") or not only_vc)]
+    if not items:
+        st.info("기간 안에 VC·펀드가 지분을 늘린 대량보유 보고가 없어요.")
+        return
+    t = _track_rows(items, df, histories, quotes)
+    n_codes = t["code"].nunique()
+    multi = t.groupby("code")["reporter"].nunique()
+    tiles = [_tile(None, "공시", f"{len(t)}건 · {n_codes}종목"),
+             _tile(True if (multi >= 2).any() else None, "여러 곳이 같이 늘림", f"{int((multi >= 2).sum())}종목"),
+             _tile(True if t["new_high"].any() else None, "🏔️ 지금 52주 신고가", f"{int(t['new_high'].sum())}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    vt = pd.DataFrame([{
+        "상태": "🏔️ 신고가" if x["new_high"] else ("🔥 5% 이내" if (x["to_high"] or 99) <= 5 else ""),
+        "종목": f"{x['name']} · {x['code']}", "공시일": x["date"], "보고자": x["reporter"],
+        "보유비율": x.get("ratio"), "증감(%p)": x.get("ratio_chg"), "증감 주식수": x.get("shares_chg"), "사유": x.get("reason"),
+        "공시일 종가": x["base"], "현재가": x["price"], "공시 후": x["since"], "신고가까지": x["to_high"], "RS": x["rs"],
+        "원문": x["url"]} for x in t.sort_values(["date", "ratio_chg"], ascending=False).to_dict("records")])
+    sty = vt.style.format({"보유비율": "{:.2f}%", "증감(%p)": "{:+.2f}", "증감 주식수": "{:+,.0f}", "공시일 종가": "{:,.0f}",
+                           "현재가": "{:,.0f}", "공시 후": "{:+.1f}%", "신고가까지": "{:.1f}%", "RS": "{:.0f}"}, na_rep="-") \
+        .map(_won_c, subset=["공시 후"])
+    st.dataframe(sty, hide_index=True, width="stretch", height=480,
+                 column_config={"종목": st.column_config.Column(pinned=True),
+                                "원문": st.column_config.LinkColumn("원문", display_text="DART")})
+    st.download_button("📥 CSV", vt.to_csv(index=False).encode("utf-8-sig"), f"VC펀드_지분확대_{data.now_kst():%Y%m%d}.csv",
+                       "text/csv", key="trk_dl_v")
+    st.caption("DART 지분공시 중 '주식등의대량보유상황보고서'(5% 이상 보유자, 1%p 이상 변동 시 보고)에서 보유비율이 늘어난 것만. "
+               "VC·펀드 = 보고자 이름에 인베스트먼트·벤처·파트너스·캐피탈·자산운용·투자조합·펀드·사모·PE 등이 들어간 곳(증권·은행·보험·연기금 제외). "
+               "단순투자·경영참가 같은 보유 목적과 자금 출처는 원문에서 확인하세요. 매수 권유가 아니에요.")
 
 
 def render_buy(df: pd.DataFrame, quotes: dict):
@@ -8369,6 +8746,56 @@ def _ph(name: str, t0: float):
     return rss_mb()
 
 
+def _nxt_hours(now=None) -> bool:
+    """넥스트레이드 프리(08:00~08:50)·애프터(15:30~20:00) 시간 — KRX 시세가 멈춰 있는 동안."""
+    now = now or data.now_kst()
+    t = now.time()
+    return now.weekday() < 5 and (dtime(8, 0) <= t < dtime(8, 50) or dtime(15, 30) < t <= dtime(20, 0))
+
+
+def _nxt_live_highs(df: pd.DataFrame, quotes: dict) -> pd.DataFrame:
+    """(실시간 신고가) 넥장 시간엔 KRX 시세가 멈춰서 애프터·프리에서 52주 고가를 넘어도 보드에 안 떴어요(🏁 탭만 넥장 반영).
+    52주 고가 5% 안 국내 종목만 넥장 시세를 받아, 넥장이 더 최근이면 현재가·52주 고가·신고가 경과일을 고쳐요."""
+    if df.empty or not _nxt_hours() or "to_high" not in df:
+        return df
+    near = df[df["code"].map(data.is_kr) & (pd.to_numeric(df["to_high"], errors="coerce") <= 5)]
+    codes = tuple(sorted(near["code"].unique()))[:400]
+    if not codes:
+        return df
+    try:
+        nxt, _ = load_nxt_quotes(codes)
+    except Exception:  # noqa: BLE001
+        return df
+    today = data.now_kst().date()
+    df = df.copy()
+    hit = 0
+    for i in near.index:
+        c = df.at[i, "code"]
+        live, src, nhi = data._live_price(quotes.get(c), nxt.get(c), today)
+        if not live or src == "KRX":
+            continue
+        hi52 = float(df.at[i, "high52"] or 0)
+        top = max(float(nhi or 0), float(live))
+        df.at[i, "price"] = float(live)
+        prev = df.at[i, "prev"] if "prev" in df else None
+        if prev:
+            df.at[i, "change"] = (float(live) / float(prev) - 1) * 100
+        if top > hi52:
+            df.at[i, "high52"] = top
+            df.at[i, "days_since_high"] = 0
+            hi52 = top
+            hit += 1
+        df.at[i, "gap"] = (float(live) / hi52 - 1) * 100
+        df.at[i, "to_high"] = (hi52 / float(live) - 1) * 100
+        if "source" in df:
+            df.at[i, "source"] = src
+    NXT_LIVE["hits"], NXT_LIVE["checked"], NXT_LIVE["t"] = hit, len(codes), data.now_kst()
+    return df
+
+
+NXT_LIVE: dict = {}
+
+
 def render_board():
     _m0 = rss_mb()
     quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
@@ -8406,6 +8833,7 @@ def render_board():
     df = data.build_table(stocks_use, histories, quotes, shares_store["data"], load_fx(), bo_mode=bo_mode,
                           monthlies=load_monthlies(heavy), official52=load_official_52w(kr_board))
     df = mark_sector_first(df, histories)
+    df = _nxt_live_highs(df, quotes)
     _GC["n"] += 1
     if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
         gc.collect()
@@ -8433,7 +8861,9 @@ def render_board():
     interval = REFRESH[refresh_label]
     refresh_text = f"{refresh_label}마다 새로 불러와요." if interval else "자동 새로고침은 꺼져 있어요."
     st.markdown(
-        f'<div class="status">{data.now_kst():%m/%d %H:%M:%S} · {data.market_status(quotes)} · {refresh_text}</div>',
+        f'<div class="status">{data.now_kst():%m/%d %H:%M:%S} · {data.market_status(quotes)} · {refresh_text}'
+        + (f' · 넥장 반영(52주 고가 5% 안 {NXT_LIVE.get("checked", 0)}종목, 넥장 신고가 {NXT_LIVE.get("hits", 0)})'
+           if _nxt_hours() and NXT_LIVE.get("t") else "") + '</div>',
         unsafe_allow_html=True,
     )
     if data.MOCK:
@@ -8446,7 +8876,7 @@ def render_board():
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
     names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점"]
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
         try:
@@ -8456,7 +8886,7 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb = tabs
+    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -8479,7 +8909,8 @@ def render_board():
         (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
         (t_rec, lambda: render_recovery(df, histories, trends_all)),
         (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
-        (t_pb, lambda: render_pullback(df, histories, quotes)),
+        (t_pb, lambda: render_pullback(df, histories, quotes, fins_all)),
+        (t_trk, lambda: render_tracker(df, histories, quotes)),
     ]
     for tab, job in jobs:
         if is_open(tab):

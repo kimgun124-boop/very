@@ -4837,6 +4837,262 @@ def t126_sim(df: pd.DataFrame, histories: dict, quotes: dict, start: date, meta:
             "universe": len(closes), "start": days[0] if days else start_ts}
 
 
+# ─────────────────────────── 🪃 눌림 타점 모의 계좌(시드 1천만 원, 스스로 매매) ───────────────────────────
+# 시작일부터 하루씩 넘기며 '그날까지의 일봉만' 보고 눌림 타점(pullback_setup)이 뜨면 사고, 내 원칙대로 팔아요.
+#   진입  = 시장(코스피·코스닥 둘 다 60일선 위) + 그날 기준 RS(오닐식, 보드 국내 종목끼리) ≥ rs_min
+#           + 눌림 자리(추세·눌림 폭·지지선) + 손익비(전고점까지) ≥ rr_min + 반등 캔들 → 그날 종가 매수
+#   금액  = 계좌 × 위험% ÷ (매수가 − 손절가) · 한 종목 최대 비중 · 동시 보유 최대 N · 현금 한도
+#   청산  = 손절가 터치(갭이면 시가) 전부 · 3R 도달 절반 익절 → 손절 본절 · +4R부터 손절 +1R, +5R → +2R …
+#           나머지는 5일선이 50일선에 닿으면 종가 정리
+#   펀더멘털·내러티브 = 올해 영업이익 증가 + (선택) 공부 자료 종목 — meta로 넘겨 주세요
+PB_SIM_DEFAULTS = {"seed": 10_000_000, "risk_pct": 1.5, "max_pos": 8, "max_weight": 19.0, "rr_min": 3.0,
+                   "fee": 0.00015, "tax": 0.0020, "min_cap": 3000e8, "market_filter": True}
+
+
+def _rs_matrix(px: pd.DataFrame) -> pd.DataFrame:
+    """날짜 × 종목 종가 → 그날 기준 RS(1~99). 0.4×3M + 0.2×6M + 0.2×9M + 0.2×12M, 있는 기간만으로 가중치를 나눠요."""
+    num = pd.DataFrame(0.0, index=px.index, columns=px.columns)
+    den = pd.DataFrame(0.0, index=px.index, columns=px.columns)
+    for w, k in ((0.4, 63), (0.2, 126), (0.2, 189), (0.2, 252)):
+        r = px / px.shift(k) - 1
+        ok = r.notna()
+        num += r.fillna(0) * w
+        den += ok * w
+    raw = (num / den.where(den > 0)).where(den >= 0.4)          # 3개월치도 없으면 RS 없음
+    return (raw.rank(axis=1, pct=True) * 98 + 1).round()
+
+
+def pb_sim(df: pd.DataFrame, histories: dict, quotes: dict, start: date, meta: dict,
+           indexes: dict | None = None, p: dict | None = None, sim: dict | None = None) -> dict:
+    """meta = {코드: {"op_txt", "op_g", "narr"}}, indexes = {"KOSPI": 일봉, "KOSDAQ": 일봉}."""
+    p = {**PB_DEFAULTS, **(p or {})}
+    s = {**PB_SIM_DEFAULTS, **(sim or {})}
+    today = now_kst().date()
+    start_ts = pd.Timestamp(start)
+    info = df.drop_duplicates("code").set_index("code")
+
+    def name(c):
+        return str(info.at[c, "name"]) if "name" in info.columns and c in info.index else c
+
+    # 1) 일봉(마지막 칸 = 지금 세션) — RS는 보드 국내 종목 전체끼리, 매매는 meta 종목만
+    bars, closes = {}, {}
+    for code in info.index:
+        if not is_kr(code):
+            continue
+        hist = (histories.get(code) or (None, None, None))[1]
+        if hist is None or len(hist) < 80:
+            continue
+        try:
+            d_, o_, h_, l_, c_, v_ = _session_bars(hist, quotes.get(code), today)
+        except Exception:  # noqa: BLE001
+            continue
+        idx = pd.DatetimeIndex(pd.to_datetime(d_))
+        closes[code] = pd.Series(c_, index=idx).groupby(level=0).last()
+        if code in meta and len(c_) >= 200:
+            cap = info.at[code, "cap_krw"] if "cap_krw" in info.columns else None
+            if cap is None or pd.isna(cap) or float(cap) < s["min_cap"]:
+                continue
+            cs = pd.Series(c_)
+            ma = {k: cs.rolling(k).mean().to_numpy() for k in (5, 20, 50, 60, 120)}
+            prev_c = np.r_[np.nan, c_[:-1]]
+            prev_h = np.r_[np.nan, h_[:-1]]
+            rng = h_ - l_
+            dcr = np.where(rng > 0, (c_ - l_) / np.where(rng > 0, rng, 1) * 100, 50.0)
+            bounce = ((c_ > o_) & (dcr >= 60) & (c_ > prev_c)) | (c_ > prev_h)
+            trend = (ma[60] > ma[120]) & (ma[60] > np.r_[np.full(5, np.nan), ma[60][:-5]]) & (ma[20] > ma[60])
+            tv20 = pd.Series(c_ * v_).rolling(20, min_periods=10).mean().to_numpy()
+            bars[code] = {"d": idx, "pos": {dt: i for i, dt in enumerate(idx)}, "o": o_, "h": h_, "l": l_, "c": c_,
+                          "v": v_, "dd": d_, "ma5": ma[5], "ma50": ma[50], "pre": trend & bounce, "tv20": tv20}
+    if not bars:
+        return {"ok": False}
+    px = pd.DataFrame(closes).sort_index().ffill(limit=5)
+    rs = _rs_matrix(px)
+    days = [d for d in px.index if d >= start_ts and any(d in b["pos"] for b in bars.values())]
+    if not days:
+        return {"ok": False}
+
+    # 2) 시장: 코스피·코스닥 둘 다 그날 종가가 60일선 위여야 신규 매수 (원칙: 60일선 아래면 쉼)
+    mk_ok = pd.Series(True, index=px.index)
+    mk_known = False
+    for nm, idf in (indexes or {}).items():
+        if idf is None or len(idf) < 61:
+            continue
+        cl = pd.to_numeric(idf.set_index(pd.to_datetime(idf["date"]).dt.normalize())["close"], errors="coerce")
+        cl = cl.groupby(level=0).last()
+        ok = (cl > cl.rolling(60).mean()).reindex(px.index).ffill().fillna(False).astype(bool)
+        mk_ok &= ok
+        mk_known = True
+    if not s["market_filter"]:
+        mk_ok[:] = True
+
+    cash, pos, trades, curve, book = float(s["seed"]), {}, [], [], []
+
+    def equity_on(d):
+        v = cash
+        for c, hd in pos.items():
+            b = bars[c]
+            i = b["pos"].get(d)
+            v += hd["qty"] * (float(b["c"][i]) if i is not None else hd["last"])
+        return v
+
+    def sell(c, d, price, qty, why):
+        nonlocal cash
+        hd = pos[c]
+        qty = min(int(qty), hd["qty"])
+        if qty <= 0:
+            return
+        gross = qty * price
+        net = gross * (1 - s["fee"] - s["tax"])
+        cost = hd["cost"] * qty / hd["qty"]
+        pnl = net - cost
+        cash += net
+        hd["qty"] -= qty
+        hd["cost"] -= cost
+        hd["realized"] += pnl
+        hd["exits"].append((d, price, qty, why))
+        r_mult = pnl / (hd["risk_ps"] * qty) if hd["risk_ps"] > 0 else None
+        trades.append({"date": d, "code": c, "name": name(c), "side": "매도", "why": why, "price": price, "qty": qty,
+                       "amount": gross, "pnl": pnl, "r": r_mult})
+        if hd["qty"] <= 0:
+            j = hd["journal"]
+            sold = sum(x[2] for x in hd["exits"])
+            j.update(status="청산", exit_date=d, exit_px=sum(x[1] * x[2] for x in hd["exits"]) / sold,
+                     exit_why=" → ".join(dict.fromkeys(x[3] for x in hd["exits"])), pnl=hd["realized"],
+                     ret=hd["realized"] / hd["cost0"] * 100,
+                     r=hd["realized"] / hd["risk0"] if hd["risk0"] > 0 else None,
+                     days=len([x for x in days if hd["opened"] < x <= d]))
+            del pos[c]
+
+    for d in days:
+        exited_today = set()
+        # ── 보유 종목: 손절 → 3R 절반 → 5일선·50일선 → 손절가 끌어올리기
+        for c in list(pos):
+            hd, b = pos[c], bars[c]
+            i = b["pos"].get(d)
+            if i is None or d <= hd["opened"]:
+                continue
+            o, h, l, cl = (float(b[k][i]) for k in ("o", "h", "l", "c"))
+            hd["last"] = cl
+            if l <= hd["stop"]:
+                fill = o if o < hd["stop"] else hd["stop"]
+                lock = (hd["stop"] - hd["entry"]) / hd["risk_ps"]
+                why = "손절(지지선 이탈)" if lock < -0.05 else ("본절 정리" if lock < 0.5 else f"+{lock:.0f}R 잠금 정리")
+                sell(c, d, fill, hd["qty"], why)
+                exited_today.add(c)
+                continue
+            if not hd["half"] and h >= hd["t3"]:
+                sell(c, d, max(o, hd["t3"]), max(1, hd["qty"] // 2), "3R 도달 — 절반 익절")
+                hd["half"] = True
+                hd["stop"] = max(hd["stop"], hd["entry"])
+                if c not in pos:
+                    exited_today.add(c)
+                    continue
+            if hd["half"] and b["ma5"][i] == b["ma5"][i] and b["ma5"][i] <= b["ma50"][i]:
+                sell(c, d, cl, hd["qty"], "5일선이 50일선 터치 — 나머지 정리")
+                exited_today.add(c)
+                continue
+            hd["peak"] = max(hd["peak"], h)
+            peak_r = (hd["peak"] - hd["entry"]) / hd["risk_ps"]
+            if peak_r >= 4:
+                hd["stop"] = max(hd["stop"], hd["entry"] + (int(peak_r) - 3) * hd["risk_ps"])
+            elif peak_r >= 2:
+                hd["stop"] = max(hd["stop"], hd["entry"])
+        # ── 신규 매수
+        if mk_ok.get(d, True) and len(pos) < s["max_pos"]:
+            rs_row = rs.loc[d] if d in rs.index else None
+            cands = []
+            for c, b in bars.items():
+                if c in pos or c in exited_today:
+                    continue
+                i = b["pos"].get(d)
+                if i is None or i < 130 or not b["pre"][i]:
+                    continue
+                r_ = rs_row.get(c) if rs_row is not None else None
+                if not (r_ == r_ and r_ is not None and r_ >= p["rs_min"]):
+                    continue
+                if not (b["tv20"][i] >= p["min_tv"]):
+                    continue
+                lo = max(0, i - 259)
+                try:
+                    res = pullback_setup(b["dd"][lo:i + 1], b["o"][lo:i + 1], b["h"][lo:i + 1], b["l"][lo:i + 1],
+                                         b["c"][lo:i + 1], b["v"][lo:i + 1], p)
+                except Exception:  # noqa: BLE001
+                    res = None
+                if not res or res["pb_rr"] < s["rr_min"] or not res["pb_bounce"]:
+                    continue
+                score = (min(res["pb_rr"], 6) / 6 * 40 + (15 if res["pb_dry"] == res["pb_dry"] and res["pb_dry"] <= 0.9 else 0)
+                         + float(r_) / 99 * 20 + (10 if (res.get("pb_ud") or 0) >= 1.2 else 0)
+                         + min(meta[c].get("op_g") or 0, 100) / 10)
+                cands.append((score, c, i, float(r_), res))
+            for score, c, i, r_, res in sorted(cands, key=lambda x: -x[0]):
+                if len(pos) >= s["max_pos"]:
+                    break
+                b = bars[c]
+                price = float(b["c"][i])
+                stop = float(res["pb_stop"])
+                risk_ps = price - stop
+                if risk_ps <= 0:
+                    continue
+                eq = equity_on(d)
+                qty = int(min(eq * s["risk_pct"] / 100 / risk_ps, eq * s["max_weight"] / 100 / price,
+                              cash / (price * (1 + s["fee"]))))
+                if qty <= 0:
+                    continue
+                cost = qty * price * (1 + s["fee"])
+                cash -= cost
+                why = (f"눌림 매수 · {res['pb_support']} {res['pb_sup']:,.0f} 지지 · 고점 대비 -{res['pb_depth']:.1f}% "
+                       f"{res['pb_days']}일 · 손익비 {res['pb_rr']:.1f} · RS {r_:.0f}")
+                jr = {"code": c, "name": name(c), "status": "보유", "entry_date": d, "entry_px": price, "qty": qty,
+                      "stop0": stop, "stop_pct": risk_ps / price * 100, "t3": price + 3 * risk_ps, "target": res["pb_hi"],
+                      "rr": res["pb_rr"], "support": f"{res['pb_support']} {res['pb_sup']:,.0f}",
+                      "depth": res["pb_depth"], "pb_days": res["pb_days"], "dry": res["pb_dry"], "rs": r_,
+                      "weight": qty * price / eq * 100, "risk_won": qty * risk_ps, **meta.get(c, {})}
+                book.append(jr)
+                pos[c] = {"qty": qty, "cost": cost, "cost0": cost, "realized": 0.0, "entry": price, "stop": stop,
+                          "risk_ps": risk_ps, "risk0": qty * risk_ps, "t3": price + 3 * risk_ps, "half": False,
+                          "peak": price, "last": price, "opened": d, "exits": [], "journal": jr}
+                trades.append({"date": d, "code": c, "name": name(c), "side": "매수", "why": why, "price": price,
+                               "qty": qty, "amount": qty * price, "pnl": None, "r": None})
+        curve.append({"date": d, "equity": equity_on(d), "cash": cash})
+
+    cv = pd.DataFrame(curve)
+    kospi = (indexes or {}).get("KOSPI")
+    if kospi is not None and len(kospi) and len(cv):
+        ix = kospi.assign(date=pd.to_datetime(kospi["date"]).dt.normalize()).set_index("date")["close"]
+        ix = pd.to_numeric(ix, errors="coerce").groupby(level=0).last().reindex(cv["date"]).ffill().bfill()
+        if ix.notna().any() and ix.iloc[0]:
+            cv["kospi"] = (ix / ix.iloc[0] * s["seed"]).to_numpy()
+    eq_now = float(cv["equity"].iloc[-1])
+    mdd = float(((cv["equity"] / cv["equity"].cummax() - 1) * 100).min())
+    hold = []
+    for c, hd in pos.items():
+        val = hd["qty"] * hd["last"]
+        j = hd["journal"]
+        j.update(cur_px=hd["last"], cur_stop=hd["stop"], half=hd["half"], pnl=hd["realized"] + val - hd["cost"],
+                 ret=(hd["realized"] + val - hd["cost"]) / hd["cost0"] * 100,
+                 r=(hd["realized"] + val - hd["cost"]) / hd["risk0"] if hd["risk0"] > 0 else None,
+                 days=len([x for x in days if x > hd["opened"]]))
+        hold.append({"code": c, "name": name(c), "qty": hd["qty"], "avg": hd["entry"], "price": hd["last"],
+                     "value": val, "ret": (hd["last"] / hd["entry"] - 1) * 100, "pnl": val - hd["cost"],
+                     "stop": hd["stop"], "t3": hd["t3"], "half": hd["half"], "opened": hd["opened"], **meta.get(c, {})})
+    closed = [j for j in book if j["status"] == "청산"]
+    wins = [j for j in closed if j["pnl"] > 0]
+    losses = [j for j in closed if j["pnl"] <= 0]
+    rs_ = [j["r"] for j in closed if j.get("r") is not None]
+    gross_w, gross_l = sum(j["pnl"] for j in wins), -sum(j["pnl"] for j in losses)
+    return {"ok": True, "curve": cv, "hold": sorted(hold, key=lambda x: -x["value"]), "trades": trades[::-1],
+            "journal": book[::-1], "cash": cash, "equity": eq_now, "seed": s["seed"],
+            "ret": (eq_now / s["seed"] - 1) * 100, "pnl": eq_now - s["seed"],
+            "realized": sum(x["pnl"] for x in trades if x["pnl"] is not None),
+            "closed": len(closed), "wins": len(wins), "mdd": mdd,
+            "avg_r": float(np.mean(rs_)) if rs_ else None,
+            "avg_win": gross_w / len(wins) if wins else None, "avg_loss": -gross_l / len(losses) if losses else None,
+            "pf": gross_w / gross_l if gross_l > 0 else None,
+            "kospi_ret": (float(cv["kospi"].iloc[-1]) / s["seed"] - 1) * 100 if "kospi" in cv else None,
+            "universe": len(bars), "start": days[0], "end": days[-1], "market_known": mk_known,
+            "market_off_days": int((~mk_ok.reindex(days).fillna(True)).sum())}
+
+
 def t126_size(equity: float | None, price: float | None, stop: float | None, risk_pct: float, weight: int) -> dict:
     """손실 먼저: 손절까지 거리로 '이번 거래 최대 금액'(계좌 × 위험% ÷ 손절 거리)을 정하고 1:2:6으로 나눠요."""
     out = {"stop_pct": None, "total": None, "amount": None, "shares": None}
