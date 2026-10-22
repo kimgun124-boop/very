@@ -1,0 +1,39 @@
+{
+ "surprises": [
+  {
+   "date": "2026-10-21",
+   "name": "엘에스일렉트릭",
+   "code": "010120",
+   "op": 2335.0,
+   "sales": null,
+   "cons": null,
+   "beat": 12.1,
+   "yoy": 131.7,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18693",
+   "post_id": 18693,
+   "urls": [
+    "https://t.me/maddingStock/18693"
+   ]
+  },
+  {
+   "date": "2026-10-19",
+   "name": "파두",
+   "code": "440110",
+   "op": 363.0,
+   "sales": null,
+   "cons": null,
+   "beat": 14.2,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18623",
+   "post_id": 18623,
+   "urls": [
+    "https://t.me/maddingStock/18623"
+   ]
+  }
+ ],
+ "updated": "2026-10-22T12:06+09:00"
+}
