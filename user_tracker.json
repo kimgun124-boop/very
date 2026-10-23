@@ -33,7 +33,41 @@
    "urls": [
     "https://t.me/maddingStock/18623"
    ]
+  },
+  {
+   "date": "2026-10-22",
+   "name": "삼성E&A",
+   "code": "028050",
+   "op": 5006.0,
+   "sales": null,
+   "cons": null,
+   "beat": 100.9,
+   "yoy": 183.6,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18734",
+   "post_id": 18734,
+   "urls": [
+    "https://t.me/maddingStock/18734"
+   ]
+  },
+  {
+   "date": "2026-10-22",
+   "name": "IPARK현대산업개발",
+   "code": "294870",
+   "op": 1658.0,
+   "sales": null,
+   "cons": null,
+   "beat": 12.1,
+   "yoy": 127.1,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18734",
+   "post_id": 18734,
+   "urls": [
+    "https://t.me/maddingStock/18734"
+   ]
   }
  ],
- "updated": "2026-10-22T12:06+09:00"
+ "updated": "2026-10-23T09:25+09:00"
 }
