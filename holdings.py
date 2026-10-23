@@ -636,12 +636,59 @@ def masters_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, flow_df
                 items.append(("warn", "깡토 · 시간 손절", f"매수 후 {held}거래일인데 1R도 못 감 — 목표 없이 옆으로 가면 2~3주에서 끊는 규칙"))
         except (ValueError, TypeError):
             pass
+    # 너쟁이(추노) 관점: 수익 쿠션 · 타임컷 · 글로벌 피어 · 밸류 쿠션
+    try:
+        import views as _v
+        items += nj_view(h, m, bars, ctx, stop_pct, max_r, _v)
+    except Exception:  # noqa: BLE001
+        pass
     # 쟁거: 돌파 당일 급등 · 거래량 실린 하락일
     if len(c) > 2:
         chg = (c[-1] / c[-2] - 1) * 100
         v50 = np.nanmean(v[-51:-1])
         if chg <= -3 and v50 and v[-1] >= v50 * 1.5:
             items.append(("bad", "쟁거 · 거래량 실린 하락일", f"{chg:+.1f}% · 거래량 {v[-1] / v50:.1f}배 — 절반 덜고, 되돌리는 거래량 실린 상승일이 나오면 다시 채움"))
+    return items
+
+
+def nj_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, stop_pct: float, max_r, _v) -> list:
+    """너쟁이 관점 항목. 손절·익절 기준은 효석 원칙 그대로 두고, '재량'으로 보태는 점검만 해요."""
+    items = []
+    price, avg = _f(m.get("price")), _f(h.get("avg"))
+    if not price or not avg:
+        return items
+    pnl = (price / avg - 1) * 100
+    r_now = pnl / stop_pct if stop_pct else None
+    # ① 수익 쿠션: 한 번 1R 넘게 갔다가 평단 근처(0.3R 아래)로 밀리면 쿠션 훼손
+    if max_r is not None and max_r >= 1 and r_now is not None and r_now < 0.3:
+        items.append(("bad", "너쟁이 · 쿠션 훼손", f"매수 후 최고 {max_r:.1f}R → 지금 {r_now:+.1f}R — 쿠션이 평단을 위협하면 "
+                      "희망 회로 없이 최대한 정리"))
+    elif r_now is not None and r_now >= 1:
+        items.append(("good", "너쟁이 · 수익 쿠션", f"쿠션 {pnl:+.1f}%({r_now:.1f}R) — 위에서 흔들려도 견딜 수 있는 자리"))
+    elif r_now is not None and r_now < 0.5:
+        items.append(("info", "너쟁이 · 쿠션 없음", f"쿠션 {pnl:+.1f}% — 휩소에 민감하게: 아이디어 훼손·시장 악화면 1~2%라도 덜어내기"))
+    # ② 타임컷: 매수 후 5거래일 넘게 0.5R도 못 가면
+    if h.get("buy_date") and bars is not None and len(bars):
+        try:
+            held = int((pd.to_datetime(bars["date"]) > pd.Timestamp(h["buy_date"])).sum())
+        except (ValueError, TypeError):
+            held = None
+        if held is not None and held >= 5 and (max_r or 0) < 0.5:
+            items.append(("warn", "너쟁이 · 타임컷", f"매수 후 {held}거래일, 최고 {max_r or 0:.1f}R — 아이디어대로면 며칠 안에 올라야. "
+                          "안 오르면 2~3%라도 정리 검토"))
+    # ③ 글로벌 피어: 내 분류의 해외 피어가 같이 꺾였는지
+    pr = (ctx.get("peers") or {}).get(m.get("group"))
+    if pr:
+        lab = pr.get("verdict", "")
+        st_ = "bad" if lab.startswith("🔴") else ("good" if lab.startswith("🟢") else ("info" if lab.startswith("🟡") else "info"))
+        pb = pr.get("peer") or {}
+        items.append((st_, "너쟁이 · 글로벌 피어", f"{lab} — 해외 피어({pr.get('peer_groups')}) 5일 {pb.get('r5', 0):+.1f}% · "
+                      f"20일선 위 {pb.get('a20', 0):.0f}%"))
+    # ④ 밸류 쿠션: 싸면 피라미딩 여유, 비싸면 추가 매수 신중·일부 익절
+    per, peg = _v.fwd_per(m.get("_fins"), price)
+    if per is not None:
+        st_, txt = _v.value_cushion(per, peg)
+        items.append((st_, "너쟁이 · 밸류 쿠션", txt))
     return items
 
 
@@ -947,7 +994,9 @@ AI_JUDGE_RULES = """[효석 매매 원칙 — 판단의 기준. 원칙이 AI의 
 - 수급(외국인·기관 특히 연기금·투신)은 보너스. 가격은 오르는데 외국인+기관이 팔고 개인만 사면 경계.
 - 추세 계좌와 가치 계좌는 섞지 않음. 추세 계좌에서 '싸졌다'며 버티기·추가 매수 금지.
 - 가치 계좌 종목은 손절선이 아니라 가치우파(하락 멈춤·횡보·우상향) 확인 후 분할매수, 가치훼손이면 매도로 판단.
-"""
+
+[참고 관점 — 깡토 × 너쟁이(추노) 인터뷰. 위 원칙과 충돌하면 위 원칙이 우선, 재량 판단에 보태는 용도]
+""" + __import__("views").AI_VIEWS + "\n"
 
 AI_JUDGE_PROMPT = """너는 효석의 추세추종 원칙을 그대로 적용하는 보유 종목 점검 보조야. 예측하지 말고, 위 원칙과 아래 숫자·뉴스로
 '지금 원칙상 어떤 상태이고 어떻게 대응하는 게 원칙에 맞는지'만 판단해.

@@ -161,6 +161,7 @@ import theme
 import chart_draw
 import recovery
 import tracker
+import views
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -1283,6 +1284,21 @@ def rss_mb() -> float:
         return 0.0
 
 
+def _free_extra():
+    """(메모리) 모의 계좌·피어 계산 결과와 보드 밖 종목 일봉 기억을 비워요 — 다시 열면 새로 계산해요."""
+    for nm in ("_PB_SIM_MEMO", "_T126_SIM_MEMO", "_PEER_MEMO"):
+        d = globals().get(nm)
+        if isinstance(d, dict):
+            d.clear()
+    for nm in ("load_hist_one", "load_surprises", "load_stakes"):
+        f = globals().get(nm)
+        if f is not None and hasattr(f, "clear"):
+            try:
+                f.clear()
+            except Exception:
+                pass
+
+
 def mem_guard(keep: set | None = None):
     """(메모리) 한도에 가까우면 차트·뉴스 기억, 작은 종목 기록, 화면 밖 일봉, 옛 데이터를 비워요."""
     m = rss_mb()
@@ -1293,6 +1309,7 @@ def mem_guard(keep: set | None = None):
         load_evidence.clear()
     except Exception:
         pass
+    _free_extra()
     S = _hist_store()
     with S["lock"]:
         S["light"].clear()
@@ -3176,6 +3193,7 @@ def _hold_context(df: pd.DataFrame) -> dict:
             "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
                        for n, sym in data.MARKETS.items()},
             "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
+            "peers": {p["group"]: p for p in load_peers(df)},
             "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
 
 
@@ -6656,9 +6674,12 @@ def load_stakes(key: str, days: int, only_vc: bool):
     return tracker.stake_increases(key, days, only_vc)
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=300)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=60)
 def load_hist_one(code: str) -> pd.DataFrame:
-    return data.fetch_history(code, count=320)[1]
+    """보드 밖 종목(서프라이즈·지분 공시) 일봉 — 추적에 필요한 날짜·고가·종가만, 최대 60종목."""
+    h = data.fetch_history(code, count=300)[1]
+    keep = [c for c in ("date", "high", "close") if c in h]
+    return h[keep].astype({c: "float32" for c in keep if c != "date"}) if len(h) else h
 
 
 def _track_rows(items: list[dict], df: pd.DataFrame, histories: dict, quotes: dict, date_key: str = "date") -> pd.DataFrame:
@@ -6813,6 +6834,108 @@ def render_tracker(df: pd.DataFrame, histories: dict, quotes: dict):
     st.caption("DART 지분공시 중 '주식등의대량보유상황보고서'(5% 이상 보유자, 1%p 이상 변동 시 보고)에서 보유비율이 늘어난 것만. "
                "VC·펀드 = 보고자 이름에 인베스트먼트·벤처·파트너스·캐피탈·자산운용·투자조합·펀드·사모·PE 등이 들어간 곳(증권·은행·보험·연기금 제외). "
                "단순투자·경영참가 같은 보유 목적과 자금 출처는 원문에서 확인하세요. 매수 권유가 아니에요.")
+
+
+# ─────────────────────────── 📚 관점(깡토 × 너쟁이) · 🌏 글로벌 피어 · 🪜 증거 쌓기 ───────────────────────────
+_PEER_MEMO: dict = {}
+
+
+def load_peers(df: pd.DataFrame, histories: dict | None = None) -> list[dict]:
+    """분류별 국내 vs 해외 피어 vs 수요처(5분 기억). 일봉은 이미 받아 둔 보드 일봉을 그대로 써요(새로 받지 않음)."""
+    now = data.now_kst()
+    key = (now.date(), now.hour * 12 + now.minute // 5, len(df))
+    if key not in _PEER_MEMO:
+        h = histories if histories is not None else _hist_store()["data"]
+        try:
+            res = views.peer_table(df, h)
+        except Exception:  # noqa: BLE001
+            res = []
+        _PEER_MEMO.clear()
+        _PEER_MEMO[key] = res
+    return _PEER_MEMO[key]
+
+
+def _views_box(keys: tuple[str, ...] | None = None, title: str = "📚 관점 노트 — 깡토 × 너쟁이(추노)"):
+    with st.expander(title):
+        for k, t, x in views.NJ_VIEWS:
+            if keys is None or k in keys:
+                st.markdown(f"- **{t}** — {x}")
+        st.caption(f"출처: {views.NJ_SRC} · 효석 원칙(리스크관리 > 멘탈 > 종목 > 타점)이 항상 우선이고, 이 관점은 재량 참고예요.")
+
+
+def _pct(v, d=1):
+    return "-" if v is None or v != v else f"{v:+.{d}f}%"
+
+
+def render_peers(df: pd.DataFrame, histories: dict):
+    _sec_h("🌏 글로벌 피어", "한국 밸류체인 분류 ↔ 해외 같은 업종(피어)·수요처 — 우리만 빠지는지, 글로벌로 같이 움직이는지")
+    rows = load_peers(df, histories)
+    if not rows:
+        st.info("해외 피어 일봉을 아직 못 받았어요. 잠시 뒤 다시 열어 보세요.")
+        return
+    cnt = pd.Series([r["verdict"][:1] for r in rows]).value_counts()
+    tiles = [_tile(True if cnt.get("🟢", 0) else None, "🟢 글로벌 섹터 액션", f"{cnt.get('🟢', 0)}"),
+             _tile(None, "🟡 한국만 약함", f"{cnt.get('🟡', 0)}"),
+             _tile(False if cnt.get("🔴", 0) else None, "🔴 글로벌 동반 약세", f"{cnt.get('🔴', 0)}"),
+             _tile(None, "🟠 국내만 강함", f"{cnt.get('🟠', 0)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    order = {"🔴": 0, "🟡": 1, "🟢": 2, "🟠": 3, "⚪": 4, "자": 5}
+    rows = sorted(rows, key=lambda r: (order.get(r["verdict"][:1], 9), -(r["kr"] or {}).get("r5", 0)))
+    t = pd.DataFrame([{
+        "판정": r["verdict"], "분류": r["group"], "산업": r["sector"],
+        "🇰🇷 5일": (r["kr"] or {}).get("r5"), "🇰🇷 20일": (r["kr"] or {}).get("r20"), "🇰🇷 20일선 위": (r["kr"] or {}).get("a20"),
+        "🌏 피어 5일": (r["peer"] or {}).get("r5"), "🌏 피어 20일": (r["peer"] or {}).get("r20"),
+        "🌏 20일선 위": (r["peer"] or {}).get("a20"), "🌏 신고가 5% 안": (r["peer"] or {}).get("near"),
+        "🛒 수요처 20일": (r["demand"] or {}).get("r20"), "해외 피어": r["peer_names"], "수요처": r["demand_groups"],
+        "해석": r["why"]} for r in rows])
+    pc = ["🇰🇷 5일", "🇰🇷 20일", "🌏 피어 5일", "🌏 피어 20일", "🛒 수요처 20일"]
+    sty = t.style.format({**{k: "{:+.1f}%" for k in pc}, "🇰🇷 20일선 위": "{:.0f}%", "🌏 20일선 위": "{:.0f}%",
+                          "🌏 신고가 5% 안": "{:.0f}%"}, na_rep="-").map(_won_c, subset=pc)
+    st.dataframe(sty, hide_index=True, width="stretch", height=520, column_config={"판정": st.column_config.Column(pinned=True)})
+    st.caption("수익률 = 바구니 종목들의 중앙값 · 해외는 각 시장의 마지막 거래일 종가 기준(미국은 우리 시간 새벽 마감). "
+               "🟡 한국만 약함 = 국내 바구니 5일 -2% 이하·20일선 아래가 많은데 해외 피어는 20일선 위 60%↑·20일 상승. "
+               "피어 = 같은 일을 하는 해외 기업(보드의 해외 분류), 수요처 = 그 분류가 파는 곳(예: 후공정 → 엔비디아·TSMC·하이퍼스케일러). "
+               "해외 피어가 없는 분류(조선·화장품·건설 등)는 빠져요.")
+    _views_box(("시장", "쿠션"), "📚 너쟁이 관점 — 왜 해외 피어를 보나")
+
+
+def render_ladder(df: pd.DataFrame, histories: dict, fins_all=None):
+    _sec_h("🪜 증거 쌓기", "실적 서프라이즈 → 국내 섹터 액션 → 글로벌 피어 → 리포트·뉴스 — 증거가 쌓일수록 비중을 늘리는 자리(피라미딩)")
+    peers = load_peers(df, histories)
+    store = _track_load()
+    sur = store.get("surprises", [])
+    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    lad = views.evidence_ladder(df, peers, sur, USER_STORE.get("reports", []), fins_all or {}, leaders)
+    if lad.empty:
+        st.info("계산할 분류가 없어요.")
+        return
+    c1, c2 = st.columns([1, 3])
+    min_stage = c1.selectbox("보기", [2, 1, 3, 4, 0], format_func=lambda n: f"증거 {n}개 이상" if n else "전체", key="lad_min")
+    show = lad[lad["stage"] >= min_stage]
+    cnt = lad["stage"].value_counts()
+    tiles = [_tile(True if cnt.get(4, 0) else None, "증거 4/4", f"{cnt.get(4, 0)}"), _tile(None, "증거 3", f"{cnt.get(3, 0)}"),
+             _tile(None, "증거 2", f"{cnt.get(2, 0)}"),
+             _tile(None, "실적 서프라이즈 기록", f"{len(sur)}종목" if sur else "📣 탭에서 모으기")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    if show.empty:
+        st.caption("이 기준에 맞는 분류가 없어요.")
+        return
+    mk = lambda b: "✅" if b else "·"
+    t = pd.DataFrame([{
+        "단계": f"{x['stage']}/4 · {x['stage_txt']}", "분류": x["group"], "산업": x["sector"],
+        "① 실적": f"{mk(x['실적'])} {x['sur_txt']}".strip(), "② 섹터": f"{mk(x['섹터'])} {x['sect_txt']}",
+        "③ 글로벌": f"{mk(x['글로벌'])} {x['glob_txt']}", "④ 근거": f"{mk(x['근거'])} {x['rep_txt']}".strip(),
+        "대장주": x["leader"], "RS": x["lead_rs"], "신고가까지": x["lead_to_high"], "예상 PER": x["per"], "PEG": x["peg"],
+        "밸류": views.value_cushion(x["per"], x["peg"])[1].split(" — ")[-1] if x["per"] else "-"} for x in show.to_dict("records")])
+    sty = t.style.format({"RS": "{:.0f}", "신고가까지": "{:.1f}%", "예상 PER": "{:.1f}", "PEG": "{:.2f}"}, na_rep="-")
+    st.dataframe(sty, hide_index=True, width="stretch", height=520, column_config={"분류": st.column_config.Column(pinned=True)})
+    st.caption("증거 4가지 — ① 실적: 📣 탭에 쌓인 어닝 서프라이즈(컨센 상회)가 이 분류에 있음 · ② 섹터: 최근 5일 신고가 2종목↑ 또는 "
+               "평소 대비 거래대금 1.5배↑ 양봉 2종목↑ 또는 주도섹터 · ③ 글로벌: 해외 피어 20일선 위 60%↑·20일 상승 · "
+               "④ 근거: 최근 30일 📥 리포트에 이 분류 종목이 있음. 단계 = 증거 개수 → 원칙의 3유닛(6% → 12% → 18%, 종목당 위험 1.5%) "
+               "안에서 증거가 하나 늘 때마다 한 유닛씩(너쟁이: 정보가 구체화될수록 피라미딩). 대장주 = 분류 안 RS·시총·거래대금 1위. "
+               "PEG = 예상 PER ÷ 올해 EPS 증가율(1 이하면 성장 대비 싼 편). 손절·시장 60일선 원칙은 그대로예요. 매수 권유가 아니에요.")
+    _views_box(("발굴", "비중", "선별", "트리거"), "📚 너쟁이 관점 — 증거가 쌓일 때마다 비중을")
+    _views_box(None)
 
 
 def render_buy(df: pd.DataFrame, quotes: dict):
@@ -8734,7 +8857,7 @@ VIEW_CODES: dict = {"kr": (), "all": (), "heavy": ()}
 _GC = _memo_store().setdefault("gc", {"n": 0, "mb": 0.0})   # 새로고침해도 세는 수가 이어지게
 
 
-MEM_CODE_TAG = "10/18-k"
+MEM_CODE_TAG = "10/23-a"
 _STORE_ROOTS[:] = [lambda: _hist_store()["data"], lambda: _monthly_store()["items"], lambda: _bg_store()["items"],
                    lambda: getattr(data, "_trend_cache", {}), lambda: getattr(data, "_fin_cache", {}),
                    lambda: getattr(data, "_metrics_memo", {}), lambda: _memo_store()]
@@ -8876,7 +8999,7 @@ def render_board():
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
     names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분"]
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분", "🪜 증거 쌓기", "🌏 글로벌 피어"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
         try:
@@ -8886,7 +9009,7 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk = tabs
+    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk, t_lad, t_peer = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -8911,6 +9034,8 @@ def render_board():
         (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
         (t_pb, lambda: render_pullback(df, histories, quotes, fins_all)),
         (t_trk, lambda: render_tracker(df, histories, quotes)),
+        (t_lad, lambda: render_ladder(df, histories, fins_all)),
+        (t_peer, lambda: render_peers(df, histories)),
     ]
     for tab, job in jobs:
         if is_open(tab):
