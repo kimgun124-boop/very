@@ -737,27 +737,6 @@ st.markdown(
 [data-testid="stSidebar"] .st-key-sb_box_sector button[kind="primary"] p { color: #FFFFFF !important; }
 [data-testid="stSidebar"] .st-key-sb_box_sector button:hover { border-color: #16212B; }
 [data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-weight: 700; color: #16212B; }
-/* ── 메인 탭: 기본 · 종목 시그널 · 섹터 흐름 3묶음으로 나눠 보이게 ── */
-.st-key-main_tabs [role="tablist"] { gap: 0.3rem; border-bottom: 2px solid #DCE3E7; padding-bottom: 0; }
-.st-key-main_tabs [role="tab"] {
-  position: relative; --gc: #51616C; --gt: #F1F4F6;
-  background: var(--gt); border: 1px solid #E3E8EB; border-top: 3px solid var(--gc); border-bottom: none;
-  border-radius: 8px 8px 0 0; padding: 1.15rem 0.85rem 0.45rem !important; overflow: visible !important; }
-.st-key-main_tabs [role="tab"]:nth-child(n+5):nth-child(-n+7) { --gc: #E0672B; --gt: #FDF3EC; }
-.st-key-main_tabs [role="tab"]:nth-child(n+8) { --gc: #1F66C9; --gt: #EEF4FC; }
-.st-key-main_tabs [role="tab"]:nth-child(5),
-.st-key-main_tabs [role="tab"]:nth-child(8) { margin-left: 0.9rem; }
-.st-key-main_tabs [role="tab"]::before {
-  position: absolute; top: 0.2rem; left: 0.85rem; font-size: 0.64rem; font-weight: 800;
-  letter-spacing: 0.02em; color: var(--gc); white-space: nowrap; content: ""; z-index: 2; }
-.st-key-main_tabs [role="tab"]:nth-child(1)::before { content: "기본"; }
-.st-key-main_tabs [role="tab"]:nth-child(5)::before { content: "종목 시그널"; }
-.st-key-main_tabs [role="tab"]:nth-child(8)::before { content: "섹터 흐름"; }
-.st-key-main_tabs [role="tab"] p { color: #3A4852; font-size: 0.98rem !important; }
-.st-key-main_tabs [role="tab"][aria-selected="true"] { background: var(--gc) !important; border-color: var(--gc); }
-.st-key-main_tabs [role="tab"][aria-selected="true"] p,
-.st-key-main_tabs [role="tab"][aria-selected="true"]::before { color: #FFFFFF !important; }
-.st-key-main_tabs .react-aria-SelectionIndicator, .st-key-main_tabs [data-baseweb="tab-highlight"], .st-key-main_tabs [data-baseweb="tab-border"] { display: none; }
 .ch-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.35rem 0.7rem; margin: 0.3rem 0 0.4rem; }
 .ch-head { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.8rem 1rem; margin: 0.6rem 0 0.7rem !important; }
 .ch-head b { font-size: 1.7rem; font-weight: 800; color: #16212B; letter-spacing: -0.02em; }
@@ -817,15 +796,15 @@ st.markdown(
 .rp-badge.off { border-color: #E3C7A0; color: #9A6417; background: #FDF6EC; }
 [class*="st-key-rp_box_"] { background: #FFFFFF; border-radius: 12px !important; }
 /* 메인 탭 색칠이 탭 안쪽의 작은 탭(차트·실적·뉴스 등)에는 번지지 않게 */
-.st-key-main_tabs [role="tabpanel"] [role="tab"], .st-key-main_tabs [role="tabpanel"] [role="tab"]:nth-child(n) {
+.st-key-main_body [role="tab"], .st-key-main_body [role="tab"]:nth-child(n) {
   --gc: #16212B; --gt: transparent; background: transparent !important; border: none !important;
   border-bottom: 2px solid transparent !important; border-radius: 0 !important; margin-left: 0 !important;
   padding: 0.4rem 0.8rem !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"]::before { content: none !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] { background: transparent !important;
+.st-key-main_body [role="tab"]::before { content: none !important; }
+.st-key-main_body [role="tab"][aria-selected="true"] { background: transparent !important;
   border-bottom: 2px solid #16212B !important; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] p { color: #16212B !important; font-weight: 800; }
-.st-key-main_tabs [role="tabpanel"] [role="tab"] p { font-size: 0.9rem !important; }
+.st-key-main_body [role="tab"][aria-selected="true"] p { color: #16212B !important; font-weight: 800; }
+.st-key-main_body [role="tab"] p { font-size: 0.9rem !important; }
 /* 잠금 화면 */
 .st-key-lock_box { background: #FFFFFF; border-radius: 14px !important; max-width: 560px; }
 .lk-title { font-size: 1.2rem; font-weight: 800; color: #16212B; }
@@ -836,14 +815,14 @@ st.markdown(
 .lk-code em { font-style: normal; font-size: 0.82rem; color: #7A5A00; }
 /* 보유 종목 탭 · 한눈에 표 */
 .st-key-hold_tabs [role="tablist"] { flex-wrap: wrap; gap: 0.35rem !important; border-bottom: none !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"],
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"]:nth-child(n) {
+.st-key-main_body .st-key-hold_tabs [role="tab"],
+.st-key-main_body .st-key-hold_tabs [role="tab"]:nth-child(n) {
   border: 1px solid #DCE3E7 !important; border-radius: 999px !important; background: #FFFFFF !important;
   padding: 0.35rem 0.85rem !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] {
+.st-key-main_body .st-key-hold_tabs [role="tab"][aria-selected="true"] {
   background: #16212B !important; border-color: #16212B !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] p { color: #FFFFFF !important; }
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"] p { font-size: 0.92rem !important; font-weight: 700; }
+.st-key-main_body .st-key-hold_tabs [role="tab"][aria-selected="true"] p { color: #FFFFFF !important; }
+.st-key-main_body .st-key-hold_tabs [role="tab"] p { font-size: 0.92rem !important; font-weight: 700; }
 .ho-wrap { overflow-x: auto; background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: 0.3rem 0.5rem; }
 .ho-tbl { width: 100%; border-collapse: collapse; font-size: 0.9rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ho-tbl th { font-size: 0.76rem; color: #6B7A84; text-align: right; padding: 0.55rem 0.6rem; border-bottom: 2px solid #E3E8EB; }
@@ -9162,6 +9141,71 @@ def _mkt_status_txt() -> str:
         return ""
 
 
+# ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────
+NAV_GROUPS = [
+    ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
+    ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
+    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
+    ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매"]),
+    ("🔭 섹터 흐름", ["💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
+    ("🚦 시장·이벤트", ["🚦 시장 신호", "🧭 시나리오", "📣 실적·지분"]),
+]
+NAV_DESC = {
+    "📋 리스트": "공부 자료 속 종목 전체 — 현재가·신고가 거리·수급", "⭐ 내 종목": "내(친구) 관심종목과 포트폴리오",
+    "🕯️ 차트": "종목 검색 → 일·주·월봉 차트", "📥 리포트": "리포트를 넣으면 종목이 보드에 반영",
+    "💼 내 보유": "보유 종목을 내 원칙으로 점검", "👀 보유 살피기": "보유 종목 실시간 수급·뉴스 + AI 판단",
+    "🏁 신고가 후보": "넥장까지 반영한 진짜 돌파·찍고 밀림", "🏔️ 신고가": "역사적·52주 신고가를 섹터별로",
+    "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
+    "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
+    "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
+    "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
+    "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
+    "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
+    "🚦 시장 신호": "FTD·분산일로 본 시장 국면 + 견조주", "🧭 시나리오": "시장 시나리오별 대응", "📣 실적·지분": "3분기 어닝 서프라이즈 · VC·펀드 지분 확대",
+}
+_NAV_OF = {t: gi for gi, (_, ts) in enumerate(NAV_GROUPS) for t in ts}
+
+
+def _nav_pick_group():
+    ss = st.session_state
+    gi = [g for g, _ in NAV_GROUPS].index(ss.get("nav_group") or NAV_GROUPS[0][0])
+    last = ss.setdefault("nav_last", {})
+    ss["main_tab_sel"] = last.get(gi) or NAV_GROUPS[gi][1][0]
+
+
+def _nav_pick_tab(gi: int):
+    ss = st.session_state
+    t = ss.get(f"nav_tab_{gi}")
+    if t:
+        ss["main_tab_sel"] = t
+        ss.setdefault("nav_last", {})[gi] = t
+
+
+def main_nav() -> str:
+    """1줄: 6개 묶음 카드 · 2줄: 고른 묶음의 탭 알약 · 3줄: 지금 탭 한 줄 설명. 보고 있는 탭만 계산해요."""
+    ss = st.session_state
+    cur = ss.get("main_tab_sel")
+    if cur not in _NAV_OF:
+        cur = NAV_GROUPS[0][1][0]
+        ss["main_tab_sel"] = cur
+    gi = _NAV_OF[cur]
+    ss["nav_group"] = NAV_GROUPS[gi][0]               # 다른 곳(차트 링크 등)에서 탭을 바꿔도 묶음이 따라가요
+    ss[f"nav_tab_{gi}"] = cur
+    ss.setdefault("nav_last", {})[gi] = cur
+    with st.container(key="main_nav"):
+        try:
+            st.segmented_control("묶음", [g for g, _ in NAV_GROUPS], key="nav_group", on_change=_nav_pick_group,
+                                 label_visibility="collapsed", required=True, width="stretch")
+        except TypeError:          # 예전 Streamlit(width 없음)
+            st.segmented_control("묶음", [g for g, _ in NAV_GROUPS], key="nav_group", on_change=_nav_pick_group,
+                                 label_visibility="collapsed", required=True)
+        st.segmented_control("탭", NAV_GROUPS[gi][1], key=f"nav_tab_{gi}", on_change=_nav_pick_tab, args=(gi,),
+                             label_visibility="collapsed", required=True)
+        st.markdown(f'<div class="nav-desc"><b>{html.escape(cur)}</b> — {html.escape(NAV_DESC.get(cur, ""))}</div>',
+                    unsafe_allow_html=True)
+    return cur
+
+
 def render_board():
     _m0 = rss_mb()
     quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
@@ -9241,53 +9285,37 @@ def render_board():
     render_market(df)
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
-    names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분", "🪜 증거 쌓기", "🌏 글로벌 피어", "🚦 시장 신호", "🎯 초기 매수"]
-    with st.container(key="main_tabs"):
-        # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
-        try:
-            tabs = st.tabs(names, key="main_tab_sel", on_change="rerun")
-            lazy = True
-        except TypeError:          # 예전 Streamlit
-            tabs = st.tabs(names)
-            lazy = False
-    MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk, t_lad, t_peer, t_msig, t_ee = tabs
-
-    def is_open(t) -> bool:
-        return (not lazy) or bool(getattr(t, "open", True))
-
-    jobs = [
-        (t_list, lambda: render_list(df, histories, quote_error, shares_store, fins_all)),
-        (t_watch, lambda: render_watch_tab(df, quotes, histories)),
-        (t_hold, lambda: render_holdings_tab(df, quotes)),
-        (t_mon, lambda: render_monitor_tab(df, quotes)),
-        (t_chart, lambda: render_chart_tab(df, quotes)),
-        (t_rep, lambda: render_reports_tab()),
-        (t_ath, lambda: render_ath(df, quotes)),
-        (t_nh, lambda: render_nh_candidates(df, histories, quotes)),
-        (t_vs, lambda: render_volume_surge(df, histories, quotes)),
-        (t_ia, lambda: render_industry_action(df, histories, quotes)),
-        (t_126, lambda: render_126(df, histories, quotes, fins_all)),
-        (t_buy, lambda: render_buy(df, quotes)),
-        (t_money, lambda: render_money(df)),
-        (t_eng, lambda: render_engine(df, trends_all, leaders_now, fins_all)),
-        (t_next, lambda: render_next(df, fins_all, trends_all, leaders_now)),
-        (t_rec, lambda: render_recovery(df, histories, trends_all)),
-        (t_scn, lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all)),
-        (t_pb, lambda: render_pullback(df, histories, quotes, fins_all)),
-        (t_trk, lambda: render_tracker(df, histories, quotes)),
-        (t_lad, lambda: render_ladder(df, histories, fins_all)),
-        (t_peer, lambda: render_peers(df, histories)),
-        (t_msig, lambda: render_market_signal(df)),
-        (t_ee, lambda: render_early(df, histories, quotes, fins_all)),
-    ]
-    for tab, job in jobs:
-        if is_open(tab):
-            _t0 = rss_mb()
-            with tab:
-                job()
-            _PHASE["탭"] = (_t0, rss_mb())
+    jobs = {
+        "📋 리스트": lambda: render_list(df, histories, quote_error, shares_store, fins_all),
+        "⭐ 내 종목": lambda: render_watch_tab(df, quotes, histories),
+        "💼 내 보유": lambda: render_holdings_tab(df, quotes),
+        "👀 보유 살피기": lambda: render_monitor_tab(df, quotes),
+        "🕯️ 차트": lambda: render_chart_tab(df, quotes),
+        "📥 리포트": lambda: render_reports_tab(),
+        "🏔️ 신고가": lambda: render_ath(df, quotes),
+        "🏁 신고가 후보": lambda: render_nh_candidates(df, histories, quotes),
+        "💥 거래량 폭발": lambda: render_volume_surge(df, histories, quotes),
+        "🏭 인더스트리 액션": lambda: render_industry_action(df, histories, quotes),
+        "⚖️ 1:2:6 매매": lambda: render_126(df, histories, quotes, fins_all),
+        "🎯 매수 후보": lambda: render_buy(df, quotes),
+        "💰 거래대금": lambda: render_money(df),
+        "🚀 급상승": lambda: render_engine(df, trends_all, leaders_now, fins_all),
+        "🔭 차기 주도": lambda: render_next(df, fins_all, trends_all, leaders_now),
+        "🌱 회복 리더": lambda: render_recovery(df, histories, trends_all),
+        "🧭 시나리오": lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all),
+        "🪃 눌림 타점": lambda: render_pullback(df, histories, quotes, fins_all),
+        "📣 실적·지분": lambda: render_tracker(df, histories, quotes),
+        "🪜 증거 쌓기": lambda: render_ladder(df, histories, fins_all),
+        "🌏 글로벌 피어": lambda: render_peers(df, histories),
+        "🚦 시장 신호": lambda: render_market_signal(df),
+        "🎯 초기 매수": lambda: render_early(df, histories, quotes, fins_all),
+    }
+    MAIN_TABS_LAZY["v"] = True
+    cur = main_nav()
+    with st.container(key="main_body"):
+        _t0 = rss_mb()
+        jobs.get(cur, jobs["📋 리스트"])()
+        _PHASE["탭"] = (_t0, rss_mb())
     _t0 = rss_mb()
     _TRIM_T[0] = 0.0 if rss_mb() - (_PHASE.get("_low") or 1e9) > 150 else _TRIM_T[0]   # 많이 늘었으면 바로 정리
     trim_maybe()

@@ -120,38 +120,62 @@ CSS = f"""
 .stApp .chip-names {{ color: var(--sub); }}
 .stApp .radar-empty {{ color: var(--sub); }}
 
-/* ── 메인 탭: 3묶음 그대로, 카드형 알약으로 ── */
-.st-key-main_tabs [role="tablist"] {{ gap: 0.35rem !important; border-bottom: none !important; padding: 0.35rem 0.1rem 0.7rem !important; }}
-.st-key-main_tabs [data-baseweb="tab-border"], .st-key-main_tabs [data-testid="stTabs"] > div > div:has(> [role="tablist"]) + div:empty {{ display: none !important; }}
-.st-key-main_tabs [role="tab"] {{ --gc: {PRI}; --gt: {PRI_SOFT};
-  background: var(--card) !important; border: 1px solid var(--line) !important; border-radius: 12px !important;
-  padding: 1.15rem 0.8rem 0.45rem !important; white-space: nowrap; box-shadow: 0 1px 2px rgba(16,24,40,.03); transition: .15s; }}
-.st-key-main_tabs [role="tab"]:nth-child(n+5):nth-child(-n+7) {{ --gc: {G2}; --gt: #FEF3C7; }}
-.st-key-main_tabs [role="tab"]:nth-child(n+8) {{ --gc: {G3}; --gt: #DBEAFE; }}
-.st-key-main_tabs [role="tab"]:hover {{ border-color: var(--gc) !important; background: var(--gt) !important; }}
-.st-key-main_tabs [role="tab"]::before {{ color: var(--gc); }}
-.st-key-main_tabs [role="tab"] p {{ color: #374151 !important; font-weight: 700; }}
-.st-key-main_tabs [role="tab"][aria-selected="true"] {{ background: var(--gc) !important; border-color: var(--gc) !important;
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--gc) 35%, transparent); }}
-.st-key-main_tabs [role="tab"][aria-selected="true"] p,
-.st-key-main_tabs [role="tab"][aria-selected="true"]::before {{ color: #FFFFFF !important; }}
+/* ── 메인 메뉴: 1줄 = 6개 묶음 카드, 2줄 = 묶음 안 탭 알약 ── */
+.st-key-main_nav {{ background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 0.7rem 0.75rem 0.8rem;
+  box-shadow: 0 1px 2px rgba(16,24,40,.03); margin: 0.2rem 0 0.9rem; gap: 0.45rem !important; }}
+.st-key-nav_group, .st-key-nav_group [data-testid="stButtonGroup"] {{ width: 100% !important; }}
+.st-key-nav_group [role="radiogroup"] {{ display: grid !important; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0.45rem; width: 100%; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ --gc: {PRI}; --gt: {PRI_SOFT};
+  min-height: 3.1rem; border-radius: 12px !important; border: 1px solid var(--line) !important; background: #FAFAFD !important;
+  border-top: 3px solid var(--gc) !important; margin: 0 !important; transition: .15s; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:nth-child(2) {{ --gc: #0F9D8A; --gt: #E6F7F4; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:nth-child(3) {{ --gc: #F08A24; --gt: #FEF1E4; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:nth-child(4) {{ --gc: #E5484D; --gt: #FDECEC; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:nth-child(5) {{ --gc: {G3}; --gt: #E3EEFF; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:nth-child(6) {{ --gc: #64748B; --gt: #EEF2F6; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{ font-size: 1.02rem !important; font-weight: 800 !important; color: #374151 !important; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:hover {{ background: var(--gt) !important; border-color: var(--gc) !important; }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-selected="true"], .stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-selected="true"]:hover {{ background: var(--gc) !important; border-color: var(--gc) !important;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--gc) 30%, transparent); }}
+.stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-selected="true"] p {{ color: #FFFFFF !important; }}
+[class*="st-key-nav_tab_"] [role="radiogroup"] {{ display: flex !important; flex-wrap: wrap !important; gap: 0.4rem; }}
+.stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ border-radius: 999px !important; border: 1px solid var(--line) !important;
+  background: #FFFFFF !important; margin: 0 !important; padding: 0.3rem 0.95rem !important; min-height: 2.3rem; }}
+.stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{ font-size: 0.95rem !important; font-weight: 700 !important; color: #374151 !important; }}
+.stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"]:hover {{ border-color: var(--nc) !important; }}
+.stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-selected="true"], .stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-selected="true"]:hover {{ background: var(--nt) !important; border-color: var(--nc) !important; }}
+.stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-selected="true"] p {{ color: var(--nc) !important; font-weight: 800 !important; }}
+.st-key-nav_tab_0 {{ --nc: {PRI_INK}; --nt: {PRI_SOFT}; }}
+.st-key-nav_tab_1 {{ --nc: #0B7A6B; --nt: #E6F7F4; }}
+.st-key-nav_tab_2 {{ --nc: #C0620F; --nt: #FEF1E4; }}
+.st-key-nav_tab_3 {{ --nc: #C4282D; --nt: #FDECEC; }}
+.st-key-nav_tab_4 {{ --nc: #1D4ED8; --nt: #E3EEFF; }}
+.st-key-nav_tab_5 {{ --nc: #334155; --nt: #EEF2F6; }}
+.nav-desc {{ font-size: 0.82rem; color: var(--sub); padding: 0.05rem 0.25rem 0.2rem; line-height: 1.5; }}
+.nav-desc b {{ color: #374151; }}
+@media (max-width: 900px) {{ .st-key-nav_group [role="radiogroup"] {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+  .stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ min-height: 2.6rem; }}
+  .stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ padding: 0.3rem 0.3rem !important; }}
+  .stApp .st-key-main_nav .st-key-nav_group [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{ font-size: 0.86rem !important; white-space: normal; line-height: 1.2; }}
+  .stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ padding: 0.25rem 0.75rem !important; min-height: 2.1rem; }}
+  .stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{ font-size: 0.88rem !important; }} }}
 /* 탭 안쪽 작은 탭: 보라 밑줄 */
-.st-key-main_tabs [role="tabpanel"] [role="tab"], .st-key-main_tabs [role="tabpanel"] [role="tab"]:nth-child(n) {{
+.st-key-main_body [role="tab"], .st-key-main_body [role="tab"]:nth-child(n) {{
   background: transparent !important; border: none !important; border-bottom: 2px solid transparent !important;
   border-radius: 0 !important; box-shadow: none !important; padding: 0.45rem 0.85rem !important; }}
-.st-key-main_tabs [role="tabpanel"] [role="tab"]:hover {{ background: transparent !important; }}
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] {{ background: transparent !important;
+.st-key-main_body [role="tab"]:hover {{ background: transparent !important; }}
+.st-key-main_body [role="tab"][aria-selected="true"] {{ background: transparent !important;
   border-bottom: 2px solid var(--pri) !important; box-shadow: none !important; }}
-.st-key-main_tabs [role="tabpanel"] [role="tab"][aria-selected="true"] p {{ color: var(--pri-ink) !important; }}
-.st-key-main_tabs [role="tabpanel"] [role="tablist"] {{ border-bottom: 1px solid var(--line) !important; padding: 0 !important; gap: 0.2rem !important; }}
+.st-key-main_body [role="tab"][aria-selected="true"] p {{ color: var(--pri-ink) !important; }}
+.st-key-main_body [role="tablist"] {{ border-bottom: 1px solid var(--line) !important; padding: 0 !important; gap: 0.2rem !important; }}
 /* 보유 종목 칩 탭 */
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"],
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"]:nth-child(n) {{
+.st-key-main_body .st-key-hold_tabs [role="tab"],
+.st-key-main_body .st-key-hold_tabs [role="tab"]:nth-child(n) {{
   border: 1px solid var(--line) !important; border-radius: 999px !important; background: var(--card) !important; }}
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] {{
+.st-key-main_body .st-key-hold_tabs [role="tab"][aria-selected="true"] {{
   background: var(--pri) !important; border-color: var(--pri) !important; }}
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tab"][aria-selected="true"] p {{ color: #FFFFFF !important; }}
-.st-key-main_tabs [role="tabpanel"] .st-key-hold_tabs [role="tablist"] {{ border-bottom: none !important; }}
+.st-key-main_body .st-key-hold_tabs [role="tab"][aria-selected="true"] p {{ color: #FFFFFF !important; }}
+.st-key-main_body .st-key-hold_tabs [role="tablist"] {{ border-bottom: none !important; }}
 /* 그 밖의 일반 탭 */
 [data-testid="stTabs"] [role="tablist"] {{ border-bottom-color: var(--line); }}
 [data-testid="stTabs"] [data-baseweb="tab-highlight"], [data-testid="stTabs"] .react-aria-SelectionIndicator {{ background: var(--pri) !important; }}
@@ -257,7 +281,6 @@ CSS = f"""
   .brand {{ padding: 0.75rem 0.95rem; }}
   .brand-t {{ font-size: 1.15rem; }}
   .brand-s, .brand-r {{ display: none; }}
-  .st-key-main_tabs [role="tab"] {{ padding: 1.05rem 0.7rem 0.4rem !important; }}
   .st-key-desk_kpis [data-testid="stMetric"] {{ padding-left: 1rem; }}
   .st-key-desk_kpis [data-testid="stMetric"]::before {{ display: none; }}
 }}
