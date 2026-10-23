@@ -1266,7 +1266,8 @@ def rss_mb() -> float:
 
 def _free_extra():
     """(메모리) 모의 계좌·피어 계산 결과와 보드 밖 종목 일봉 기억을 비워요 — 다시 열면 새로 계산해요."""
-    for nm in ("_PB_SIM_MEMO", "_T126_SIM_MEMO", "_PEER_MEMO", "_MKT_MEMO"):
+    _memo_store().get("tab", {}).clear()
+    for nm in ("_PB_SIM_MEMO", "_T126_SIM_MEMO", "_PEER_MEMO", "_MKT_MEMO", "_T126_MEMO"):
         d = globals().get(nm)
         if isinstance(d, dict):
             d.clear()
@@ -1545,6 +1546,37 @@ def _first_high_ago(hist, lookback: int = 20) -> int | None:
 def _memo_store() -> dict:
     """(속도) app.py는 새로고침마다 처음부터 다시 실행돼서 보통 변수는 사라져요 → 계산 기억은 여기에 둬요."""
     return {"first": {}, "leader": {}}
+
+
+_DATA_VER = {"v": None}
+
+
+def set_data_ver(df: pd.DataFrame, interval: int | None):
+    """(속도) 이번 새로고침의 데이터 버전 = 새로고침 간격 단위 시각 + 보이는 종목 구성.
+    같은 버전 안에서는 탭을 오가거나 버튼을 눌러도 무거운 계산을 다시 하지 않아요(다른 사람 화면과도 같이 써요)."""
+    sec = max(20, int(interval or 60))
+    try:
+        comp = hash(tuple(df["code"]))
+    except Exception:  # noqa: BLE001
+        comp = len(df)
+    _DATA_VER["v"] = (int(time.time() // sec), len(df), comp)
+
+
+def tab_memo(name: str, key, fn):
+    """같은 데이터 버전 + 같은 key면 지난 계산을 그대로 돌려줘요. 이름마다 마지막 1개만 기억(메모리 작게)."""
+    store = _memo_store().setdefault("tab", {})
+    k = (_DATA_VER["v"], key)
+    hit = store.get(name)
+    if hit is not None and hit[0] == k:
+        return hit[1]
+    val = fn()
+    store[name] = (k, val)
+    return val
+
+
+def lead_groups(df: pd.DataFrame):
+    """data.leading_groups를 데이터 버전마다 한 번만."""
+    return tab_memo(f"leading_groups_{len(df)}", (recent_days, min_count), lambda: data.leading_groups(df, recent_days, min_count))
 
 
 def mark_sector_first(df: pd.DataFrame, histories: dict) -> pd.DataFrame:
@@ -2384,7 +2416,7 @@ def _chip_leader(df: pd.DataFrame, group: str) -> str:
 
 
 def render_radar(df: pd.DataFrame):
-    leaders = data.leading_groups(df, recent_days, min_count)
+    leaders = lead_groups(df)
     if leaders:
         body = "".join(
             f'<div class="chip"><div class="chip-top">'
@@ -3172,7 +3204,7 @@ def _hold_context(df: pd.DataFrame) -> dict:
             "market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
             "idx_rs": {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
                        for n, sym in data.MARKETS.items()},
-            "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
+            "leaders": {g for g, _ in lead_groups(df)},
             "peers": {p["group"]: p for p in load_peers(df)},
             "mkt_sig": {n: (m and {k: m[k] for k in ("state", "state_txt", "em", "day", "dd", "q50", "q80")}) for n, m in market_signals().items()},
             "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
@@ -5406,8 +5438,9 @@ def render_next(df: pd.DataFrame, fins, trends, leaders: set):
                    "가능성 = 이익 가속 40 · 시총 대비 수급 30 · 신고가 근처 비율 30 (섹터끼리 백분위, 비중은 제가 정한 값)")
     if fins is None or trends is None:
         st.info("업종 실적·수급을 받는 중이에요(처음 1~2분).")
-    res = data.next_leader_sectors(df, fins, trends, leaders,
-                                   {"near_pct": near_pct, "near_rs": near_rs, "min_near": min_near}, include_all=True)
+    res = tab_memo("next_lead", (near_pct, near_rs, min_near, fins is None, trends is None, len(fins or {}), len(trends or {}), len(leaders)),
+                   lambda: data.next_leader_sectors(df, fins, trends, leaders,
+                                                    {"near_pct": near_pct, "near_rs": near_rs, "min_near": min_near}, include_all=True))
     if res.empty:
         st.info("섹터를 판정할 데이터가 아직 없어요.")
         return
@@ -5808,10 +5841,11 @@ def render_recovery(df: pd.DataFrame, histories: dict, trends):
 
     # ③ 섹터: 누가 먼저 싹트나
     kr = df[df["code"].map(data.is_kr) & df["price"].notna()]
-    closes = data._closes_frame(kr, histories, kr["code"])
     idx_reb = recovery.index_ret(idx_df, ph["low_date"])
     idx_fall = ph["dd"]
-    sdf = recovery.stock_recovery(kr, closes, trends, ph["high_date"], ph["low_date"], idx_reb)
+    sdf = tab_memo("rec_stock", (str(ph["high_date"]), str(ph["low_date"]), idx_reb, len(kr), len(trends or {})),
+                   lambda: recovery.stock_recovery(kr, data._closes_frame(kr, histories, kr["code"]), trends,
+                                                   ph["high_date"], ph["low_date"], idx_reb))
     if sdf.empty:
         st.info("종목 일봉이 아직 부족해요. 잠시 뒤 다시 열어 주세요.")
         return
@@ -6055,7 +6089,7 @@ def render_money_confirm(df: pd.DataFrame, a_groups, b_groups, a_name: str, b_na
 
 def render_money_radar(df: pd.DataFrame, leaders: set):
     st.markdown("#### 📡 섹터 간 돈의 이동")
-    r, sm = data.sector_money_radar(df, leaders, {"fresh_days": recent_days})
+    r, sm = tab_memo("money_radar", (recent_days, len(leaders)), lambda: data.sector_money_radar(df, leaders, {"fresh_days": recent_days}))
     if r.empty:
         st.caption("거래대금 데이터가 아직 부족해요.")
         return
@@ -6279,7 +6313,7 @@ def _pb_fig(code: str, quote: dict | None, r: dict):
 
 
 PB_SIM_STARTS = {"하반기 첫날(7/1)": (7, 1), "올해 첫 거래일(1/2)": (1, 2), "4월 1일": (4, 1), "직접 고르기": None}
-_PB_SIM_MEMO: dict = {}
+_PB_SIM_MEMO: dict = _memo_store().setdefault("pb_sim", {})      # (속도) 새로고침해도 남는 기억
 
 
 def _pb_sim_opts() -> dict:
@@ -6492,7 +6526,7 @@ def render_pullback(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=No
               for name, sym in data.MARKETS.items()}
 
     with st.spinner("눌림 자리 찾는 중…"):
-        pre = data.pullback_screen(df, histories, quotes, p)
+        pre = tab_memo("pb_screen", (tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float, str, bool)))), len(histories)), lambda: data.pullback_screen(df, histories, quotes, p))
     fins, trends = {}, {}
     if not pre.empty and "pb_rr" in pre:
         codes = tuple(pre["code"])
@@ -6818,7 +6852,7 @@ def render_tracker(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 # ─────────────────────────── 📚 관점(깡토 × 너쟁이) · 🌏 글로벌 피어 · 🪜 증거 쌓기 ───────────────────────────
-_PEER_MEMO: dict = {}
+_PEER_MEMO: dict = _memo_store().setdefault("peer", {})      # (속도) 새로고침해도 남는 기억
 
 
 def load_peers(df: pd.DataFrame, histories: dict | None = None) -> list[dict]:
@@ -6885,7 +6919,7 @@ def render_ladder(df: pd.DataFrame, histories: dict, fins_all=None):
     peers = load_peers(df, histories)
     store = _track_load()
     sur = store.get("surprises", [])
-    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    leaders = {g for g, _ in lead_groups(df)}
     lad = views.evidence_ladder(df, peers, sur, USER_STORE.get("reports", []), fins_all or {}, leaders)
     if lad.empty:
         st.info("계산할 분류가 없어요.")
@@ -6920,7 +6954,7 @@ def render_ladder(df: pd.DataFrame, histories: dict, fins_all=None):
 
 
 # ─────────────────────────── 🚦 시장 신호(FTD·분산일) · 🎯 초기 매수(리 태너) ───────────────────────────
-_MKT_MEMO: dict = {}
+_MKT_MEMO: dict = _memo_store().setdefault("mkt", {})      # (속도) 새로고침해도 남는 기억
 
 
 def load_index_long(sym: str) -> pd.DataFrame:
@@ -7165,7 +7199,7 @@ def render_buy(df: pd.DataFrame, quotes: dict):
     idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
               for name, sym in data.MARKETS.items()}
     market_text = " · ".join(parts)
-    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    leaders = {g for g, _ in lead_groups(df)}
     intraday = data.market_status(quotes).startswith("장중")
 
     pre = data.buy_screen(df, market_ok, market_text, leaders, p, fins=None, intraday=intraday, idx_rs=idx_rs)
@@ -7317,8 +7351,9 @@ def render_checks(df: pd.DataFrame, quote_error: str | None, shares_store: dict 
         st.caption(f"🖥️ 서버 메모리 {mb:,.0f}MB / 한도 {MEM_LIMIT:,.0f}MB"
                    + (f" · 빠듯해서(기준 {MEM_SOFT:,}MB) 뒤쪽 새로 받기를 잠시 멈췄어요" if mb > MEM_SOFT else ""))
         with st.expander("🖥️ 메모리 쓰임새(창고별)"):
-            st.caption(" · ".join(f"{n} {v:,.1f}MB" for n, v in mem_report() if v >= 0.3)
-                       + f" · 새로 받기 멈춤 {MEM_SOFT:,}MB · 기억 비우기 {MEM_HARD:,}MB")
+            if st.toggle("창고별 크기 계산하기(몇 초 걸려요)", key="mem_rep_on"):
+                st.caption(" · ".join(f"{n} {v:,.1f}MB" for n, v in mem_report() if v >= 0.3)
+                           + f" · 새로 받기 멈춤 {MEM_SOFT:,}MB · 기억 비우기 {MEM_HARD:,}MB")
             ph = [(k, v) for k, v in _PHASE.items() if not k.startswith("_")]
             if ph:
                 st.caption("지난 새로고침 단계별: " + " → ".join(f"{k} {b - a:+.0f}MB" for k, (a, b) in ph)
@@ -8044,17 +8079,21 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
             "- 카드를 누르면 앱 안 차트가 열려요. 매수 판단은 🎯 매수 후보 탭의 원칙으로 한 번 더 걸러요.")
     if nxt_err:
         st.caption(f"⚠️ {nxt_err} — 이번엔 KRX 시세로만 판정했어요.")
-    cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
-    bar_fixed = _nh_fix_bars(cand, histories) if not cand.empty else {}
-    if bar_fixed:                          # 깨진 봉을 고쳤으면 그 종목은 다시 계산
+    def _nh_calc():
         cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
-    if not cand.empty:                     # 후보만 월봉을 받아 역사적/52주 신고가를 가려요
-        mcodes = tuple(sorted(cand["code"].head(250)))
-        with st.spinner("후보 종목의 상장 이후 월봉을 확인하는 중이에요(역사적 신고가 구분)."):
-            monthlies = load_cand_monthlies(mcodes)
-        if monthlies:
-            cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, monthlies=monthlies,
-                                      codes=list(cand["code"]))
+        bar_fixed = _nh_fix_bars(cand, histories) if not cand.empty else {}
+        if bar_fixed:                          # 깨진 봉을 고쳤으면 그 종목은 다시 계산
+            cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
+        if not cand.empty:                     # 후보만 월봉을 받아 역사적/52주 신고가를 가려요
+            mcodes = tuple(sorted(cand["code"].head(250)))
+            with st.spinner("후보 종목의 상장 이후 월봉을 확인하는 중이에요(역사적 신고가 구분)."):
+                monthlies = load_cand_monthlies(mcodes)
+            if monthlies:
+                cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, monthlies=monthlies,
+                                          codes=list(cand["code"]))
+        return cand
+    _pk = tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float, str, bool))))
+    cand = tab_memo("nh_cand", (_pk, len(codes) if codes is not None else -1, len(histories), len(nxt or {})), _nh_calc).copy()
     if cand.empty:
         st.info("지금 조건에 맞는 신고가 후보가 없어요.")
         return
@@ -8226,7 +8265,7 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
         max_to_high = e3.slider("신고가까지 % 이내만 (100=전체)", 5, 100, 100, 5, key="vs_toh")
     quiet, recent = quiet or int(d["quiet"]), recent or int(d["recent"])
     p = {"quiet": quiet, "recent": recent, "mult": mult, "quiet_cap": quiet_cap, "min_tv": min_tv * 1e8}
-    res = data.volume_surges(df, histories, quotes, p, only_quiet=only_quiet)
+    res = tab_memo("vs", (tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float, str, bool)))), only_quiet, len(histories)), lambda: data.volume_surges(df, histories, quotes, p, only_quiet=only_quiet))
     if not res.empty:
         if only_up:
             res = res[res["vs_peak_up"] == True]  # noqa: E712
@@ -8451,9 +8490,9 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
 
     _sec_h("🏭 섹터 인더스트리 액션", "섹터 안 거래량이 같이 붙는 날 → 그중 저항·신고가를 넘는 종목")
     p = _ia_params()
-    leaders = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    leaders = {g for g, _ in lead_groups(df)}
     pot = data.potential_groups(df, leaders)
-    scan = data.industry_action_scan(df, histories, quotes, p)
+    scan = tab_memo("ia_scan", (tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float, str, bool)))), len(histories)), lambda: data.industry_action_scan(df, histories, quotes, p))
     if scan.empty:
         st.info("일봉이 아직 부족해요. 잠시 뒤 다시 볼게요.")
         return
@@ -8609,7 +8648,8 @@ def render_buy_alert(df: pd.DataFrame, histories: dict, quotes: dict):
          "dcr_min": ss.get("ia_dcr", d["dcr_min"]), "min_cap": ss.get("ia_cap", d["min_cap"]),
          "max_ext": ss.get("ia_ext", d["max_ext"])}
     try:
-        sig = data.ia_buy_signals(df, histories, quotes, load_indexes(), p, recent_days, min_count)
+        sig = tab_memo("ia_buy", (tuple(sorted(p.items())), recent_days, min_count),
+                       lambda: data.ia_buy_signals(df, histories, quotes, load_indexes(), p, recent_days, min_count))
     except Exception as exc:  # noqa: BLE001 — 알림 계산이 실패해도 보드는 떠야 해요
         st.caption(f"매수 알림 계산 실패: {exc.__class__.__name__}")
         return
@@ -8666,7 +8706,7 @@ T126_CSS = """
 </style>
 """
 
-_T126_MEMO: dict = {}
+_T126_MEMO: dict = _memo_store().setdefault("t126", {})      # (속도) 새로고침해도 남는 기억
 
 
 def _t126_dots(stage: int, exits) -> str:
@@ -8806,7 +8846,7 @@ def _t126_chart(ind: pd.DataFrame, events: list, name: str):
 
 
 T126_SIM_STARTS = {"올해 첫 거래일(1/2)": (1, 2), "4월 1일": (4, 1), "7월 1일": (7, 1), "직접 고르기": None}
-_T126_SIM_MEMO: dict = {}
+_T126_SIM_MEMO: dict = _memo_store().setdefault("t126_sim", {})      # (속도) 새로고침해도 남는 기억
 
 
 def _t126_sim_opts() -> dict:
@@ -9244,6 +9284,7 @@ def render_board():
                           monthlies=load_monthlies(heavy), official52=load_official_52w(kr_board))
     df = mark_sector_first(df, histories)
     df = _nxt_live_highs(df, quotes)
+    set_data_ver(df, REFRESH.get(refresh_label))
     _GC["n"] += 1
     if _GC["n"] % 3 == 0:          # (메모리) 세 번에 한 번 쓰지 않는 메모리 정리
         gc.collect()
@@ -9279,7 +9320,7 @@ def render_board():
     if data.MOCK:
         st.info("가짜 데이터로 보여주는 테스트 모드예요. 실제 시세를 보려면 STOCK_MOCK 설정 없이 실행하세요.")
 
-    leaders_now = {g for g, _ in data.leading_groups(df, recent_days, min_count)}
+    leaders_now = {g for g, _ in lead_groups(df)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
     _TRENDS_BG["v"] = trends_all
     render_market(df)
