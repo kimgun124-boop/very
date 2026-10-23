@@ -162,6 +162,7 @@ import chart_draw
 import recovery
 import tracker
 import views
+import market as msig
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -1286,7 +1287,7 @@ def rss_mb() -> float:
 
 def _free_extra():
     """(메모리) 모의 계좌·피어 계산 결과와 보드 밖 종목 일봉 기억을 비워요 — 다시 열면 새로 계산해요."""
-    for nm in ("_PB_SIM_MEMO", "_T126_SIM_MEMO", "_PEER_MEMO"):
+    for nm in ("_PB_SIM_MEMO", "_T126_SIM_MEMO", "_PEER_MEMO", "_MKT_MEMO"):
         d = globals().get(nm)
         if isinstance(d, dict):
             d.clear()
@@ -3194,6 +3195,7 @@ def _hold_context(df: pd.DataFrame) -> dict:
                        for n, sym in data.MARKETS.items()},
             "leaders": {g for g, _ in data.leading_groups(df, recent_days, min_count)},
             "peers": {p["group"]: p for p in load_peers(df)},
+            "mkt_sig": {n: (m and {k: m[k] for k in ("state", "state_txt", "em", "day", "dd", "q50", "q80")}) for n, m in market_signals().items()},
             "sector_x": dict(zip(sm_money["sector"], sm_money["x"])) if len(sm_money) else {}}
 
 
@@ -6938,6 +6940,237 @@ def render_ladder(df: pd.DataFrame, histories: dict, fins_all=None):
     _views_box(None)
 
 
+# ─────────────────────────── 🚦 시장 신호(FTD·분산일) · 🎯 초기 매수(리 태너) ───────────────────────────
+_MKT_MEMO: dict = {}
+
+
+def load_index_long(sym: str) -> pd.DataFrame:
+    """지수 일봉 약 6년(1,500거래일, 1시간 기억) + 오늘 실시간 일봉(2분 기억)을 합쳐요. 지수 2개라 메모리는 1MB도 안 돼요."""
+    long_ = swr(("idx_long", sym), 3600, lambda: data.fetch_history(sym, count=1500)[1], "지수 6년 일봉을 받는 중이에요.")
+    short = (load_indexes().get(sym) or (None,))[0]
+    parts = [x for x in (long_, short) if x is not None and len(x)]
+    if not parts:
+        return data.empty_frame()
+    out = pd.concat(parts, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+    return out.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
+
+
+def market_signals(p: dict | None = None) -> dict:
+    """{코스피/코스닥: msig.analyze 결과} — 2분마다 다시 계산."""
+    p = p or {}
+    now = data.now_kst()
+    key = (now.date(), now.hour * 30 + now.minute // 2, tuple(sorted(p.items())))
+    if key not in _MKT_MEMO:
+        res = {}
+        for name, sym in data.MARKETS.items():
+            try:
+                res[name] = msig.analyze(load_index_long(sym), p)
+            except Exception:  # noqa: BLE001
+                res[name] = None
+        _MKT_MEMO.clear()
+        _MKT_MEMO[key] = res
+    return _MKT_MEMO[key]
+
+
+def _mkt_card(name: str, m: dict | None) -> str:
+    if not m:
+        return f'<div class="pf-k">{name}</div><div class="pf-v">-</div><div class="pf-s">지수 일봉을 받는 중</div>'
+    sub = []
+    if m["state"] == "rally":
+        sub.append(f"반등 시도 <b>Day {m['day']}</b>" + (f" · 바닥 {m['low']:,.2f}" if m.get("low") else ""))
+    lf = m.get("last_ftd")
+    if lf:
+        sub.append(f"최근 FTD <b>{pd.Timestamp(lf['date']):%y.%m.%d}</b> {lf['result']}")
+    sub.append(f"분산일 <b>{m['dd']}개</b>(25일) · 평소 {m['q50']:.0f}개 · 상위 {100 - (m['dd_pct_rank'] or 0):.0f}%"
+               + (" · 책 기준 경고(5개↑)" if m["book_warn"] else ""))
+    sub.append(f"52주 고점 대비 <b>{m['draw']:+.1f}%</b>")
+    return (f'<div class="pf-k">{name}</div><div class="pf-v">{m["em"]} {m["state_txt"]}</div>'
+            f'<div class="pf-s">{"<br>".join(sub)}</div>')
+
+
+def render_market_signal(df: pd.DataFrame):
+    _sec_h("🚦 시장 신호", "오닐의 분산일·FTD로 지금 시장이 어디쯤인지 — 상승 추세 · 상승 둔화 · 조정 국면 · 반등 시도")
+    d = msig.MKT_DEFAULTS
+    with st.expander("⚙️ 기준"):
+        c1, c2, c3, c4 = st.columns(4)
+        ftd = c1.selectbox("FTD 상승 폭", [1.25, 1.5, 2.0, 1.0], format_func=lambda x: f"+{x}%" + {1.25: " (IBD)", 2.0: " (책 개정판)",
+                                                                                              1.0: " (책 초판)"}.get(x, ""), key="ms_ftd")
+        day = c2.selectbox("FTD 가장 빠른 날", [4, 3], format_func=lambda x: f"Day {x}" + (" (강한 장)" if x == 3 else ""), key="ms_day")
+        corr = c3.selectbox("조정 국면 기준(고점 대비)", [10.0, 8.0, 15.0, 20.0], format_func=lambda x: f"-{x:.0f}%"
+                            + (" (하락장)" if x == 20 else ""), key="ms_corr")
+        ddp = c4.selectbox("분산일 하락 폭", [0.2, 0.5, 1.0], format_func=lambda x: f"-{x}%" + (" (책)" if x == 0.2 else ""), key="ms_dd")
+    p = {"ftd_pct": float(ftd), "ftd_day": int(day), "corr_pct": float(corr), "dd_pct": float(ddp)}
+    sig = market_signals(p)
+    k = st.columns(2)
+    for col, (name, m) in zip(k, sig.items()):
+        col.markdown(_mkt_card(name, m), unsafe_allow_html=True)
+    ms = [m for m in sig.values() if m]
+    if not ms:
+        st.info("지수 일봉을 받는 중이에요.")
+        return
+    worst = max(ms, key=lambda m: {"corr": 3, "rally": 2, "press": 1, "up": 0}[m["state"]])
+    head, body = msig.action_text(worst)
+    st.markdown(f"<div class='verdict'><b>{head}</b><br>{body}</div>", unsafe_allow_html=True)
+    if not all(m["has_vol"] for m in ms):
+        st.caption("⚠️ 지수 거래량을 못 받은 날이 있어 분산일·FTD 거래량 조건을 일부 건너뛰었어요.")
+
+    pick = st.segmented_control("지수", list(sig), default=list(sig)[0], key="ms_pick", label_visibility="collapsed") or list(sig)[0]
+    m = sig.get(pick)
+    if m:
+        sr = m["series"].tail(250).copy()
+        sr["국면"] = sr["state"].map(msig.STATE_TXT)
+        base = alt.Chart(sr).encode(x=alt.X("date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, grid=False)))
+        line = base.mark_line(color="#26343E", strokeWidth=1.6).encode(
+            y=alt.Y("close:Q", title=None, scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("close:Q", format=",.2f"), "국면:N",
+                     alt.Tooltip("dd:Q", title="분산일")])
+        band = base.mark_rect(opacity=.13).encode(
+            x2="date:T", color=alt.Color("국면:N", scale=alt.Scale(domain=list(msig.STATE_TXT.values()),
+                                                                  range=["#1B8A4B", "#E0A100", "#C0262E", "#E8730C"]),
+                                         legend=alt.Legend(orient="top", title=None)))
+        fd = pd.DataFrame([{"date": pd.Timestamp(f["date"]), "close": float(sr.set_index("date")["close"].get(pd.Timestamp(f["date"]), np.nan)),
+                            "결과": f["result"]} for f in m["ftds"] if pd.Timestamp(f["date"]) >= sr["date"].iloc[0]])
+        layers = [line]
+        if len(fd):
+            layers.append(alt.Chart(fd).mark_point(shape="triangle-up", size=140, filled=True, color="#5B47F5").encode(
+                x="date:T", y="close:Q", tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d", title="FTD"), "결과:N"]))
+        dl = pd.DataFrame([{"date": pd.Timestamp(x["date"]), "close": float(sr.set_index("date")["close"].get(pd.Timestamp(x["date"]), np.nan)),
+                            "종류": x["kind"]} for x in m["dd_list"]])
+        if len(dl):
+            layers.append(alt.Chart(dl).mark_point(shape="triangle-down", size=90, filled=True, color="#C0262E").encode(
+                x="date:T", y="close:Q", tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "종류:N"]))
+        st.altair_chart(alt.layer(*layers).properties(height=300, width="container"))
+        st.caption("▲ 보라 = FTD · ▼ 빨강 = 지금 살아 있는 분산일 · 배경색 = 그날의 국면")
+        t1, t2 = st.tabs([f"📉 분산일 {m['dd']}개", f"🚀 FTD 기록 {len(m['ftds'])}"])
+        with t1:
+            if m["dd_list"]:
+                st.dataframe(pd.DataFrame([{"날짜": f"{pd.Timestamp(x['date']):%Y-%m-%d}", "종류": x["kind"], "등락": x["chg"],
+                                            "거래량(전날 대비)": x["vol_x"], "남은 날": f"{x['left']}일"} for x in m["dd_list"]])
+                             .style.format({"등락": "{:+.2f}%", "거래량(전날 대비)": "{:.2f}배"}, na_rep="-"),
+                             hide_index=True, width="stretch")
+            else:
+                st.caption("지금 살아 있는 분산일이 없어요(또는 조정·반등 시도 국면이라 세지 않아요).")
+            st.caption(f"분산일 = 전날보다 거래량이 늘며 {p['dd_pct']}% 넘게 내린 날 + 정체일(거래량은 늘었는데 0.3% 못 오르고 아래쪽 마감). "
+                       "25거래일 지나거나 그 뒤 지수가 그날 종가보다 5% 넘게 오르면 지우고, FTD가 나오면 0으로. "
+                       f"한국 보정: 같은 지수의 지난 상승 국면에서 25일 분산일 개수는 보통 {m['q50']:.0f}개, 상위 20%가 {m['q80']:.0f}개 — "
+                       "이보다 많으면 '상승 둔화'로 봐요(깡토 백테스트: 책 기준 4~5개는 코스피에서 상승장 아무 날의 87%가 해당해 의미가 약함).")
+        with t2:
+            fs = msig.ftd_stats(m["ftds"])
+            if fs.get("n"):
+                st.markdown(f"지난 약 6년 {pick} FTD **{fs['n']}번** 중 60일 안에 랠리 저점을 안 깬 것 **{fs['ok']}번({fs['rate']:.0f}%)** · "
+                            f"60일 뒤 수익률 중앙값 **{fs['r60']:+.1f}%**" if fs.get("r60") is not None else "")
+            if m["ftds"]:
+                st.dataframe(pd.DataFrame([{"FTD": f"{pd.Timestamp(f['date']):%Y-%m-%d}", "바닥": f"{pd.Timestamp(f['low_date']):%m/%d}",
+                                            "Day": f["day"], "당일": f["chg"], "거래량": f["vol_x"], "바닥까지 하락": f["draw"],
+                                            "결과": f["result"] + (f" ({pd.Timestamp(f['fail_date']):%m/%d})" if f["fail_date"] is not None else ""),
+                                            "5일 뒤": f["r5"], "20일 뒤": f["r20"], "60일 뒤": f["r60"]} for f in m["ftds"]])
+                             .style.format({"당일": "{:+.2f}%", "거래량": "{:.2f}배", "바닥까지 하락": "{:.1f}%", "5일 뒤": "{:+.1f}%",
+                                            "20일 뒤": "{:+.1f}%", "60일 뒤": "{:+.1f}%"}, na_rep="-")
+                             .map(_won_c, subset=["5일 뒤", "20일 뒤", "60일 뒤"]), hide_index=True, width="stretch", height=320)
+            st.caption(f"FTD = 조정(고점 -{p['corr_pct']:.0f}%↑) 뒤 가장 낮은 저가 다음 처음 오른 날(랠리 데이) = Day 1, Day {p['ftd_day']} 이후 "
+                       f"+{p['ftd_pct']}%↑ 상승 + 거래량 전날보다 증가. 실패 = 그 뒤 랠리 저점 이탈. "
+                       "깡토 백테스트(1990~2026): 하락장 바닥 뒤엔 항상 FTD(코스피 25/25)였지만 하락장 FTD의 절반 가까이는 실패 — FTD는 '허락'이지 '공격'이 아님.")
+
+    # 하락장에서 볼 종목: 견조주 vs 과대낙폭
+    st.markdown("#### 🛡️ 버티는 종목 vs 무너진 종목")
+    kr = df[df["code"].map(data.is_kr)].copy()
+    kr["gap"] = pd.to_numeric(kr["gap"], errors="coerce")
+    tv = pd.to_numeric(kr.get("tv20"), errors="coerce") if "tv20" in kr else pd.Series(np.nan, index=kr.index)
+    kr = kr[(tv >= 10e8) & (pd.to_numeric(kr["price"], errors="coerce") >= 1000) & kr["gap"].notna()]
+    if len(kr) >= 20:
+        q90 = kr["gap"].quantile(0.9)
+        strong = kr[kr["gap"] >= q90].sort_values(["gap", "rs"], ascending=[False, False]).head(30)
+        crash = kr[kr["gap"] <= -60].sort_values("gap").head(30)
+        a, b = st.columns(2)
+        with a:
+            st.markdown(f"**🛡️ 견조주 — 52주 고점에 가장 가까운 상위 10%** ({len(kr[kr['gap'] >= q90])}종목)")
+            st.dataframe(strong[["name", "group", "gap", "rs", "change"]].rename(columns={"name": "종목", "group": "분류", "gap": "고점 대비",
+                                                                                        "rs": "RS", "change": "오늘"})
+                         .style.format({"고점 대비": "{:+.1f}%", "RS": "{:.0f}", "오늘": "{:+.2f}%"}, na_rep="-").map(_won_c, subset=["오늘"]),
+                         hide_index=True, width="stretch", height=320)
+        with b:
+            st.markdown(f"**⚠️ 과대낙폭 — 고점 대비 -60% 넘게** ({int((kr['gap'] <= -60).sum())}종목)")
+            if len(crash):
+                st.dataframe(crash[["name", "group", "gap", "rs", "change"]].rename(columns={"name": "종목", "group": "분류", "gap": "고점 대비",
+                                                                                           "rs": "RS", "change": "오늘"})
+                             .style.format({"고점 대비": "{:+.1f}%", "RS": "{:.0f}", "오늘": "{:+.2f}%"}, na_rep="-").map(_won_c, subset=["오늘"]),
+                             hide_index=True, width="stretch", height=320)
+            else:
+                st.caption("고점 대비 -60% 넘게 빠진 종목이 없어요.")
+        st.caption("깡토 백테스트(2018.10~2026.10, 하락장 날 56번): 과대낙폭(하위 10%, 평균 -67%)은 1개월 반등이 컸지만 1년 뒤 중앙값 -19.9%·오른 비율 29%. "
+                   "견조주(상위 10%, 평균 -8%)는 1년 +16.7%, FTD 뒤 반년은 17번 중 15번 과대낙폭을 앞섬. 과대낙폭을 산다면 짧게·나올 자리 먼저·물타기 금지. "
+                   "거래대금 20일 평균 10억↑·주가 1,000원↑ 종목만.")
+    _views_box_kt()
+
+
+def _views_box_kt():
+    with st.expander("📚 관점 노트 — 깡토(분산일·FTD·하락장) × 리 태너"):
+        for k, t, x in views.KT_VIEWS:
+            st.markdown(f"- **{t}** — {x}")
+        for k, t, x in views.LT_VIEWS:
+            if k in ("시장",):
+                st.markdown(f"- **[리 태너] {t}** — {x}")
+        st.caption(f"출처: {views.KT_SRC} · {views.LT_SRC}")
+
+
+def render_early(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
+    _sec_h("🎯 초기 매수", "리 태너 — 표준 피벗보다 싸게 사는 자리: 하락 추세선 돌파 · 손잡이 저점(조용한 거래량) · Shakeout +3")
+    d = msig.EE_DEFAULTS
+    with st.expander("⚙️ 기준"):
+        c1, c2, c3, c4 = st.columns(4)
+        rs_min = c1.number_input("RS 최소", 50, 99, 70, key="ee_rs")
+        shake = c2.selectbox("Shakeout 회복 폭(첫 저점 +)", [5.0, 3.0, 10.0], format_func=lambda x: f"+{x:.0f}%", key="ee_shake",
+                             help="태너: 30달러 미만 +10%, 30~60달러 +3달러(약 5~10%), 60달러 초과 +5%")
+        near = c3.number_input("피벗까지 최대 거리(%)", 3.0, 30.0, d["near_pivot"], 1.0, key="ee_near")
+        need_op = c4.toggle("올해 영업이익 증가만", value=True, key="ee_op")
+    p = {"shake_pct": float(shake), "near_pivot": float(near)}
+    sig = market_signals()
+    mk = [m for m in sig.values() if m]
+    states = " · ".join(f"{n} {m['em']} {m['state_txt']}" for n, m in sig.items() if m)
+    bad_mkt = any(m["state"] in ("corr", "rally") for m in mk)
+    today = data.now_kst().date()
+    rows = []
+    with st.spinner("베이스 안 초기 매수 자리 찾는 중…"):
+        for r in df[df["code"].map(data.is_kr)].to_dict("records"):
+            if (r.get("rs") or 0) < rs_min:
+                continue
+            hist = (histories.get(r["code"]) or (None, None, None))[1]
+            if hist is None or len(hist) < 120:
+                continue
+            try:
+                dd_, o_, h_, l_, c_, v_ = data._session_bars(hist, quotes.get(r["code"]), today)
+                res = msig.early_entry(dd_, o_, h_, l_, c_, v_, p)
+            except Exception:  # noqa: BLE001
+                res = None
+            if res:
+                og = data.op_growth((fins_all or {}).get(r["code"]))
+                if need_op and og.get("op_up") is not True:
+                    continue
+                rows.append({**r, **res, "op_txt": og.get("op_txt")})
+    tiles = [_tile(not bad_mkt if mk else None, "시장 국면", states or "-"), _tile(True if rows else None, "초기 매수 신호", f"{len(rows)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    if bad_mkt:
+        st.warning("조정·반등 시도 국면이 있어요 — 태너도 FTD 전엔 새 매수를 아주 작게(또는 쉬고), 원칙상 60일선 아래면 쉬는 장이에요. 아래는 공부·대기용.")
+    if not rows:
+        st.caption("지금은 조건에 맞는 초기 매수 자리가 없어요.")
+    else:
+        t = pd.DataFrame([{"종목": f"{x['name']} · {x['code']}", "신호": x["ee_kind"], "현재가": x["price"], "표준 피벗": x["ee_pivot"],
+                           "피벗보다 싸게": x["ee_below"], "손절(-7%)": x["ee_stop"], "베이스 깊이": x["ee_depth"], "베이스 길이": x["ee_len"],
+                           "거래량(3일/50일)": x["ee_dry"], "RS": x.get("rs"), "영업이익": x.get("op_txt"), "분류": x.get("group"),
+                           "근거": x["ee_why"]} for x in sorted(rows, key=lambda x: -(x.get("rs") or 0))])
+        st.dataframe(t.style.format({"현재가": "{:,.0f}", "표준 피벗": "{:,.0f}", "피벗보다 싸게": "{:.1f}%", "손절(-7%)": "{:,.0f}",
+                                     "베이스 깊이": "-{:.0f}%", "베이스 길이": "{:.0f}일", "거래량(3일/50일)": "{:.2f}배", "RS": "{:.0f}"}, na_rep="-"),
+                     hide_index=True, width="stretch", height=420, column_config={"종목": st.column_config.Column(pinned=True)})
+    st.caption("표준 피벗 = 베이스 왼쪽 고점(최근 15~65거래일). 초기 매수 = 그보다 낮은 가격에서 먼저 사는 자리 — 같은 7% 손절이어도 손절가가 낮아져 "
+               "정상 흔들림에 덜 털려요. 태너는 돌파 거래량(+50%)을 확인하기 전에, 미리 정한 가격에 스톱 주문으로 사요. "
+               "실패하면 7%까지 기다리지 않고 2~3%에서도 정리. 효석 원칙(주도섹터·RS·영업이익·시장 60일선)과 같이 보세요. 매수 권유가 아니에요.")
+    with st.expander("📚 관점 노트 — 리 태너(오닐 CAN SLIM)"):
+        for k, tt, x in views.LT_VIEWS:
+            st.markdown(f"- **{tt}** — {x}")
+        st.caption(f"출처: {views.LT_SRC}")
+
+
 def render_buy(df: pd.DataFrame, quotes: dict):
     """내 매매 원칙을 모두 통과한 국내 종목. 산업·태그 필터와 관계없이 보드 전체에서 찾아요."""
     _sec_h("🎯 매수 후보", "내 원칙을 모두 통과한 국내 종목만")
@@ -8919,6 +9152,16 @@ def _nxt_live_highs(df: pd.DataFrame, quotes: dict) -> pd.DataFrame:
 NXT_LIVE: dict = {}
 
 
+def _mkt_status_txt() -> str:
+    """상태 줄에 붙이는 시장 국면(🚦 탭과 같은 계산)."""
+    try:
+        sig = market_signals()
+        return " · 🚦 " + " · ".join(f"{n} {m['em']} {m['state_txt']}" + (f" D{m['day']}" if m["state"] == "rally" else "")
+                                    for n, m in sig.items() if m)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def render_board():
     _m0 = rss_mb()
     quotes, quote_error = load_quotes(KR_CODES + EXTRA_CODES)
@@ -8986,7 +9229,7 @@ def render_board():
     st.markdown(
         f'<div class="status">{data.now_kst():%m/%d %H:%M:%S} · {data.market_status(quotes)} · {refresh_text}'
         + (f' · 넥장 반영(52주 고가 5% 안 {NXT_LIVE.get("checked", 0)}종목, 넥장 신고가 {NXT_LIVE.get("hits", 0)})'
-           if _nxt_hours() and NXT_LIVE.get("t") else "") + '</div>',
+           if _nxt_hours() and NXT_LIVE.get("t") else "") + _mkt_status_txt() + '</div>',
         unsafe_allow_html=True,
     )
     if data.MOCK:
@@ -8999,7 +9242,7 @@ def render_board():
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
     names = ["📋 리스트", "⭐ 내 종목", "💼 내 보유", "👀 보유 살피기", "🕯️ 차트", "📥 리포트", "🏔️ 신고가", "🏁 신고가 후보", "💥 거래량 폭발", "🏭 인더스트리 액션", "⚖️ 1:2:6 매매", "🎯 매수 후보",
-             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분", "🪜 증거 쌓기", "🌏 글로벌 피어"]
+             "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🧭 시나리오", "🪃 눌림 타점", "📣 실적·지분", "🪜 증거 쌓기", "🌏 글로벌 피어", "🚦 시장 신호", "🎯 초기 매수"]
     with st.container(key="main_tabs"):
         # (속도) 보고 있는 탭만 계산해요. 예전엔 11개 탭을 매번 전부 계산했어요.
         try:
@@ -9009,7 +9252,7 @@ def render_board():
             tabs = st.tabs(names)
             lazy = False
     MAIN_TABS_LAZY["v"] = lazy
-    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk, t_lad, t_peer = tabs
+    t_list, t_watch, t_hold, t_mon, t_chart, t_rep, t_ath, t_nh, t_vs, t_ia, t_126, t_buy, t_money, t_eng, t_next, t_rec, t_scn, t_pb, t_trk, t_lad, t_peer, t_msig, t_ee = tabs
 
     def is_open(t) -> bool:
         return (not lazy) or bool(getattr(t, "open", True))
@@ -9036,6 +9279,8 @@ def render_board():
         (t_trk, lambda: render_tracker(df, histories, quotes)),
         (t_lad, lambda: render_ladder(df, histories, fins_all)),
         (t_peer, lambda: render_peers(df, histories)),
+        (t_msig, lambda: render_market_signal(df)),
+        (t_ee, lambda: render_early(df, histories, quotes, fins_all)),
     ]
     for tab, job in jobs:
         if is_open(tab):

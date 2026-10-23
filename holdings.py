@@ -642,6 +642,11 @@ def masters_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, flow_df
         items += nj_view(h, m, bars, ctx, stop_pct, max_r, _v)
     except Exception:  # noqa: BLE001
         pass
+    # 리 태너(오닐 CAN SLIM) 매도·추가 규칙
+    try:
+        items += lt_view(h, m, bars, ctx)
+    except Exception:  # noqa: BLE001
+        pass
     # 쟁거: 돌파 당일 급등 · 거래량 실린 하락일
     if len(c) > 2:
         chg = (c[-1] / c[-2] - 1) * 100
@@ -689,6 +694,81 @@ def nj_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, stop_pct: fl
     if per is not None:
         st_, txt = _v.value_cushion(per, peg)
         items.append((st_, "너쟁이 · 밸류 쿠션", txt))
+    return items
+
+
+def lt_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict) -> list:
+    """리 태너 규칙 참고 항목: +10% 뒤 12~14% 트레일링 · 8주 보유 예외 · +50% 뒤 주봉 10주선 · 10일선 저가 이탈 · 추가 매수 범위."""
+    items = []
+    ms = {k: x for k, x in (ctx.get("mkt_sig") or {}).items() if x}
+    if ms:
+        bad = any(x["state"] in ("corr", "rally") for x in ms.values())
+        items.append(("bad" if any(x["state"] == "corr" for x in ms.values()) else ("warn" if bad or any(x["state"] == "press" for x in ms.values()) else "good"),
+                      "오닐 · 시장 국면", " · ".join(f"{k} {x['em']} {x['state_txt']}" + (f" Day {x['day']}" if x["state"] == "rally" else "")
+                                                  + f"(분산일 {x['dd']})" for k, x in ms.items())
+                      + (" — FTD 전엔 추가 매수 보류, 쿠션 없는 종목부터 정리" if bad else "")))
+    price, avg = _f(m.get("price")), _f(h.get("avg"))
+    if not price or not avg or bars is None or len(bars) < 60:
+        return items
+    dts = pd.to_datetime(bars["date"])
+    c = pd.to_numeric(bars["close"], errors="coerce").to_numpy(dtype=float)
+    hi = pd.to_numeric(bars["high"], errors="coerce").to_numpy(dtype=float)
+    lo = pd.to_numeric(bars["low"], errors="coerce").to_numpy(dtype=float)
+    v = pd.to_numeric(bars["volume"], errors="coerce").to_numpy(dtype=float)
+    since = np.ones(len(c), dtype=bool)
+    if h.get("buy_date"):
+        try:
+            since = (dts >= pd.Timestamp(h["buy_date"])).to_numpy()
+        except (ValueError, TypeError):
+            pass
+    if not since.any():
+        return items
+    top = float(np.nanmax(hi[since]))
+    gain_max = (top / avg - 1) * 100
+    pnl = (price / avg - 1) * 100
+    # ① +10% 전엔 최초 손절, 뒤엔 최고가 -12~14% 트레일링
+    if gain_max >= 10:
+        t12, t14 = top * 0.88, top * 0.86
+        st_ = "bad" if price < t14 else ("warn" if price < t12 else "good")
+        items.append((st_, "리 태너 · 트레일링", f"매수 후 최고 +{gain_max:.0f}% → 최고가 {top:,.0f} 대비 -12~14% = {t14:,.0f}~{t12:,.0f}"
+                      + (" 이탈" if price < t14 else (" 근처" if price < t12 else " 위"))))
+    else:
+        items.append(("info", "리 태너 · 트레일링", f"아직 +10% 전(최고 +{gain_max:.1f}%) — 최초 손절 기준 유지(태너: -7%, 장중 스톱은 -9%)"))
+    # ② 8주 보유 예외: 매수(돌파) 뒤 15거래일 안에 +20%
+    idx = np.flatnonzero(since)
+    first = idx[0]
+    w3 = hi[first:first + 15]
+    if len(w3) and (np.nanmax(w3) / avg - 1) * 100 >= 20:
+        end = dts.iloc[first] + pd.Timedelta(weeks=8)
+        left = (end - pd.Timestamp.now()).days
+        items.append(("good", "리 태너 · 8주 보유", f"매수 뒤 3주 안에 +20% — 대형 성장주 후보: {end:%m/%d}까지(남은 {max(left, 0)}일) 목표 도달해도 보유 검토"
+                      if left > 0 else "매수 뒤 3주 안에 +20%였던 종목 — 8주 보유 기간 지남, 일반 매도 규칙으로"))
+    # ③ +50% 뒤 주봉: 10주선 첫 이탈 + 거래량 40%↑
+    if gain_max >= 50:
+        wk = pd.DataFrame({"c": c, "v": v}, index=dts).resample("W-FRI").agg({"c": "last", "v": "sum"}).dropna()
+        if len(wk) >= 12:
+            ma10 = wk["c"].rolling(10).mean()
+            vavg = wk["v"].rolling(10).mean().shift(1)
+            br = wk["c"].iloc[-1] < ma10.iloc[-1]
+            vx = wk["v"].iloc[-1] / vavg.iloc[-1] if vavg.iloc[-1] else np.nan
+            items.append(("bad" if br and vx >= 1.4 else ("warn" if br else "good"), "리 태너 · 주봉 10주선",
+                          f"+50% 넘은 종목 → 주봉으로 관리: 10주선 {ma10.iloc[-1]:,.0f} " + ("아래" if br else "위")
+                          + (f", 주간 거래량 평균의 {vx:.1f}배" if vx == vx else "") + (" — 중요 매도 신호" if br and vx >= 1.4 else "")))
+    # ④ 크리스 캐처: 10일선 아래 마감한 날의 저가 이탈
+    ma10d = pd.Series(c).rolling(10).mean().to_numpy()
+    below = [i for i in range(len(c) - 6, len(c) - 1) if c[i] < ma10d[i]]
+    if below and gain_max >= 10:
+        j = below[-1]
+        trig = lo[j]
+        items.append(("bad" if price < trig else "warn", "캐처 · 10일선",
+                      f"{dts.iloc[j]:%m/%d} 10일선 아래 마감 — 그날 저가 {trig:,.0f} " + ("이탈: 매도 신호" if price < trig else "깨면 매도(스톱은 조금 아래)")))
+    # ⑤ 추가 매수 범위: 마지막 매수가(모르면 평단) +6% 안
+    last_buy = _f(h.get("last_buy")) or avg
+    if pnl > 0:
+        gap = (price / last_buy - 1) * 100
+        items.append(("good" if gap <= 6 else "info", "리 태너 · 추가 매수 범위",
+                      f"마지막 매수가 대비 {gap:+.1f}% — " + ("6% 안: 새 매수 신호면 정상 크기(직전 보유의 20%)" if gap <= 6
+                                                        else "6% 넘음: 추가하면 절반 크기 또는 생략(평단이 현재가에 붙는 것 방지)")))
     return items
 
 
@@ -995,7 +1075,7 @@ AI_JUDGE_RULES = """[효석 매매 원칙 — 판단의 기준. 원칙이 AI의 
 - 추세 계좌와 가치 계좌는 섞지 않음. 추세 계좌에서 '싸졌다'며 버티기·추가 매수 금지.
 - 가치 계좌 종목은 손절선이 아니라 가치우파(하락 멈춤·횡보·우상향) 확인 후 분할매수, 가치훼손이면 매도로 판단.
 
-[참고 관점 — 깡토 × 너쟁이(추노) 인터뷰. 위 원칙과 충돌하면 위 원칙이 우선, 재량 판단에 보태는 용도]
+[참고 관점 — 깡토 × 너쟁이(추노) 인터뷰 · 리 태너 강연 · 깡토 분산일/FTD·하락장 백테스트. 위 원칙과 충돌하면 위 원칙이 우선, 재량 판단에 보태는 용도]
 """ + __import__("views").AI_VIEWS + "\n"
 
 AI_JUDGE_PROMPT = """너는 효석의 추세추종 원칙을 그대로 적용하는 보유 종목 점검 보조야. 예측하지 말고, 위 원칙과 아래 숫자·뉴스로
