@@ -161,6 +161,7 @@ import theme
 import chart_draw
 import recovery
 import tracker
+import cashflow
 import views
 import market as msig
 
@@ -9181,6 +9182,158 @@ def _mkt_status_txt() -> str:
         return ""
 
 
+# ─────────────────────────── 💵 현금창출 기업 ───────────────────────────
+@st.cache_data(show_spinner=False, max_entries=2)
+def _cf_metrics(mtime: float) -> tuple[list[dict], str | None, str]:
+    """cashflow_screen.json(분기마다 GitHub Actions가 갱신) → 종목별 지표. 파일이 바뀔 때만 다시 계산."""
+    raw = cashflow.load()
+    out = []
+    for code, rec in (raw.get("items") or {}).items():
+        try:
+            m = cashflow.metrics(code, rec)
+        except Exception:  # noqa: BLE001
+            m = None
+        if m:
+            out.append(m)
+    return out, raw.get("updated"), raw.get("source") or cashflow.SRC
+
+
+def _cf_eok(v):
+    return "-" if v is None or v != v else f"{v:,.0f}"
+
+
+def render_cashflow(df: pd.DataFrame):
+    _sec_h("💵 현금창출 기업", "적게 투자하면서도 성장하고, 번 이익이 꾸준히 현금(FCF)으로 쌓이는 기업 — 고유가·고금리 장기화 대비")
+    try:
+        mtime = os.path.getmtime(cashflow.OUT_FILE)
+    except OSError:
+        mtime = 0.0
+    mets, updated, src = _cf_metrics(mtime)
+    if not mets:
+        st.info("아직 재무 자료 파일(cashflow_screen.json)이 없어요. GitHub → Actions → '💵 현금창출 기업 재무 갱신' → Run workflow 를 "
+                "한 번 누르면 10분쯤 뒤에 채워져요(그 뒤로는 매달 6·21일 자동).")
+        return
+
+    with st.expander("⚙️ 기준 바꾸기", expanded=False):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        th = {
+            "cagr": c1.number_input("매출 연평균 성장 ≥ (%)", 0.0, 50.0, cashflow.DEFAULTS["cagr"], 1.0, key="cf_cagr"),
+            "capex_s": c2.number_input("CAPEX/매출 ≤ (%)", 1.0, 30.0, cashflow.DEFAULTS["capex_s"], 1.0, key="cf_cs",
+                                       help="4년 합산 CAPEX(유형+무형자산 취득) ÷ 4년 합산 매출"),
+            "capex_ocf": c3.number_input("CAPEX/영업현금 ≤ (%)", 10.0, 100.0, cashflow.DEFAULTS["capex_ocf"], 5.0, key="cf_co",
+                                         help="번 현금 중 설비에 다시 들어간 비율(4년 합산)"),
+            "de": c4.number_input("차입금/자본 ≤ (%)", 0.0, 200.0, cashflow.DEFAULTS["de"], 5.0, key="cf_de",
+                                  help="순현금(현금 > 차입금)이면 이 기준과 상관없이 통과"),
+            "icr": c5.number_input("이자보상배율 ≥ (배)", 0.0, 100.0, cashflow.DEFAULTS["icr"], 1.0, key="cf_icr",
+                                   help="최근 연도 영업이익 ÷ 이자비용"),
+        }
+        inc_fin = st.toggle("금융·지주도 포함", value=False, key="cf_fin",
+                            help="은행·증권·보험·지주는 영업현금흐름과 차입금의 의미가 달라서 기본은 빼요")
+
+    board = df.drop_duplicates("code").set_index("code") if len(df) else pd.DataFrame()
+    rows = []
+    for m in mets:
+        if m["fin"] and not inc_fin:
+            continue
+        g, n_ok, chk = cashflow.grade(m, th)
+        b = board.loc[m["code"]] if m["code"] in board.index else None
+        rows.append({**m, "grade": g, "n_ok": n_ok, "chk": chk,
+                     "price": None if b is None else b.get("price"), "to_high": None if b is None else b.get("to_high"),
+                     "chg": None if b is None else b.get("change")})
+    if not rows:
+        st.info("조건에 맞는 종목이 없어요.")
+        return
+    cnt = {k: sum(1 for r in rows if r["grade"] == k) for k in ("1군", "2군", "함정")}
+    tiles = [_tile(True if cnt["1군"] else None, "🥇 1군 — 5개 기준 모두 통과", f"{cnt['1군']}"),
+             _tile(None, "🥈 2군 — 하나만 아쉬움", f"{cnt['2군']}"),
+             _tile(False if cnt["함정"] else None, "⚠️ 성장은 좋은데 현금이 안 남음", f"{cnt['함정']}"),
+             _tile(None, "분석 종목", f"{len(rows)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+
+    views_ = {"🥇 1군": ["1군"], "🥈 2군": ["2군"], "⚠️ 함정": ["함정"], "전체": ["1군", "2군", "함정", "-"]}
+    c1, c2 = st.columns([2.2, 1])
+    pick = c1.segmented_control("보기", list(views_), default="🥇 1군", key="cf_view", label_visibility="collapsed") or "🥇 1군"
+    sort_by = c2.selectbox("정렬", ["FCF 증가폭", "매출 성장률", "FCF 마진", "순현금", "CAPEX 적은 순"], key="cf_sort",
+                           label_visibility="collapsed")
+    sel = [r for r in rows if r["grade"] in views_[pick]]
+    keyf = {"FCF 증가폭": lambda r: -(r["fcf_trend"] or -1e9), "매출 성장률": lambda r: -(r["cagr"] or -1e9),
+            "FCF 마진": lambda r: -(r["fcf_margin"] or -1e9), "순현금": lambda r: -(r["net_cash"] or -1e12),
+            "CAPEX 적은 순": lambda r: (r["capex_s"] if r["capex_s"] is not None else 1e9)}[sort_by]
+    sel.sort(key=lambda r: (-r["n_ok"], keyf(r)) if pick == "전체" else keyf(r))
+    if not sel:
+        st.info("이 묶음에 해당하는 종목이 없어요. 위 '기준 바꾸기'에서 기준을 조정해 보세요.")
+        return
+
+    mark = lambda v: "✅" if v is True else ("❌" if v is False else "·")  # noqa: E731
+    yrs = sel[0]["years"]
+    tbl = pd.DataFrame([{
+        "종목": f"{r['name']} · {r['code']}", "분류": r["group"], "등급": r["grade"],
+        "성장": mark(r["chk"]["성장"]), "저CAPEX": mark(r["chk"]["저CAPEX"]), "FCF+": mark(r["chk"]["FCF 연속+"]),
+        "FCF↑": mark(r["chk"]["FCF 증가"]), "재무": mark(r["chk"]["재무"]),
+        "매출 성장(연)": r["cagr"], f"{r['years'][-1]} 매출(억)": r["sales"][-1],
+        "FCF 추이(억)": [v if v is not None else 0 for v in r["fcf"]],
+        f"{r['years'][-1]} FCF(억)": r["fcf"][-1], "FCF 마진": r["fcf_margin"], "CAPEX/매출": r["capex_s"],
+        "순현금(억)": r["net_cash"], "이자보상(배)": None if r["icr"] is None else min(r["icr"], 999),
+        "올해 성장(연환산)": r["p_growth"], "올해 FCF(억)": r["p_fcf"],
+        "현재가": r["price"], "신고가까지": r["to_high"],
+    } for r in sel])
+    pct = lambda lab: st.column_config.NumberColumn(lab, format="%.1f%%")  # noqa: E731
+    eok = lambda lab: st.column_config.NumberColumn(lab, format="%,.0f")  # noqa: E731
+    st.dataframe(tbl, hide_index=True, width="stretch", height=min(560, 40 + 35 * len(tbl)),
+                 column_config={
+                     "종목": st.column_config.Column(pinned=True),
+                     "FCF 추이(억)": st.column_config.BarChartColumn(f"FCF 추이 {yrs[0]}→{yrs[-1]}", y_min=None),
+                     "매출 성장(연)": pct("매출 성장(연)"), "FCF 마진": pct("FCF 마진"), "CAPEX/매출": pct("CAPEX/매출"),
+                     "올해 성장(연환산)": pct("올해 성장(연환산)"), "신고가까지": pct("신고가까지"),
+                     f"{yrs[-1]} 매출(억)": eok(f"{yrs[-1]} 매출(억)"), f"{yrs[-1]} FCF(억)": eok(f"{yrs[-1]} FCF(억)"),
+                     "순현금(억)": eok("순현금(억)"), "올해 FCF(억)": eok("올해 FCF(억)"), "현재가": eok("현재가"),
+                     "이자보상(배)": st.column_config.NumberColumn("이자보상(배)", format="%.0f"),
+                 })
+    st.download_button("📥 CSV", tbl.drop(columns=["FCF 추이(억)"]).to_csv(index=False).encode("utf-8-sig"),
+                       f"현금창출기업_{pick[2:]}_{data.now_kst():%Y%m%d}.csv", "text/csv", key="cf_dl")
+
+    # ── 종목 자세히
+    names = {f"{r['name']} · {r['code']}": r for r in sel}
+    choice = st.selectbox("🔎 종목 자세히", list(names), key="cf_pick")
+    r = names[choice]
+    long = []
+    for i, y in enumerate(r["years"]):
+        for lab, arr in (("영업현금흐름", r["ocf"]), ("CAPEX", r["capex"]), ("FCF", r["fcf"])):
+            if arr[i] is not None:
+                long.append({"연도": y, "항목": lab, "억원": arr[i]})
+    cl, cr = st.columns([1.5, 1])
+    with cl:
+        if long:
+            ch = alt.Chart(pd.DataFrame(long)).mark_bar().encode(
+                x=alt.X("연도:N", title=None), xOffset=alt.XOffset("항목:N", sort=["영업현금흐름", "CAPEX", "FCF"]),
+                y=alt.Y("억원:Q", title="억원"),
+                color=alt.Color("항목:N", sort=["영업현금흐름", "CAPEX", "FCF"],
+                                scale=alt.Scale(range=["#8A979F", "#E8A33D", "#6C5CE7"]), legend=alt.Legend(orient="top", title=None)),
+                tooltip=["연도", "항목", alt.Tooltip("억원:Q", format=",.0f")]).properties(height=260)
+            st.altair_chart(ch, width="stretch")
+    with cr:
+        c = r["chk"]
+        lines = [
+            f"{mark(c['성장'])} **성장** 매출 {_cf_eok(r['sales'][0])} → {_cf_eok(r['sales'][-1])}억 "
+            f"(연 {r['cagr']:+.1f}%)" if r["cagr"] is not None else f"{mark(c['성장'])} **성장** 자료 부족",
+            f"{mark(c['저CAPEX'])} **저CAPEX** 매출의 {r['capex_s']:.1f}% · 영업현금의 "
+            f"{(r['capex_ocf'] or 0):.0f}%" if r["capex_s"] is not None else f"{mark(c['저CAPEX'])} **저CAPEX** 자료 부족",
+            f"{mark(c['FCF 연속+'])} **FCF 연속 플러스** {r['fcf_pos']}/{r['fcf_n']}년",
+            f"{mark(c['FCF 증가'])} **FCF 증가** " + " → ".join(_cf_eok(v) for v in r["fcf"]) + "억",
+            f"{mark(c['재무'])} **재무** 현금 {_cf_eok(r['cash'])} · 차입금 {_cf_eok(r['debt'])}억"
+            + (f" · 이자보상 {min(r['icr'], 999):.0f}배" if r["icr"] is not None else ""),
+        ]
+        if r["part"]:
+            lines.append(f"📅 **{r['part']} 누적** 매출 {_cf_eok(r['p_sales'])} · 영업이익 {_cf_eok(r['p_op'])} · "
+                         f"FCF {_cf_eok(r['p_fcf'])}억" + (f" (매출 연환산 {r['p_growth']:+.0f}%)" if r["p_growth"] is not None else ""))
+        st.markdown("\n\n".join(lines))
+        st.caption(f"{'연결' if r['mc'] == 'C' else '개별'} 기준 · 재무상태 {r['bs_at']}")
+    st.caption(f"자료: {src}" + (f" · 갱신 {updated[:16].replace('T', ' ')}" if updated else "")
+               + " · FCF = 영업활동현금흐름 − 유형·무형자산 취득 · 성장/CAPEX/FCF는 최근 4개 연도 기준, '올해'는 반기·분기 누적. "
+               "1군 = 5개 기준 모두 통과 · 2군 = 4개 통과 + 최근 FCF 플러스 · 함정 = 매출은 크는데 FCF가 마이너스거나 투자 부담이 큼. "
+               "조선처럼 선수금으로 현금이 들어오는 업종은 숫자가 좋게 나올 수 있으니 사업 구조를 같이 보세요. 매수 권유가 아니에요.")
+
+
 # ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
@@ -9188,7 +9341,7 @@ NAV_GROUPS = [
     ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매"]),
     ("🔭 섹터 흐름", ["💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
-    ("🚦 시장·이벤트", ["🚦 시장 신호", "🧭 시나리오", "📣 실적·지분"]),
+    ("🚦 시장·이벤트", ["🚦 시장 신호", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
 NAV_DESC = {
     "📋 리스트": "공부 자료 속 종목 전체 — 현재가·신고가 거리·수급", "⭐ 내 종목": "내(친구) 관심종목과 포트폴리오",
@@ -9202,6 +9355,7 @@ NAV_DESC = {
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
     "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
     "🚦 시장 신호": "FTD·분산일로 본 시장 국면 + 견조주", "🧭 시나리오": "시장 시나리오별 대응", "📣 실적·지분": "3분기 어닝 서프라이즈 · VC·펀드 지분 확대",
+    "💵 현금창출": "저CAPEX·매출 성장·FCF 증가·낮은 부채 — 스스로 번 현금으로 크는 기업",
 }
 _NAV_OF = {t: gi for gi, (_, ts) in enumerate(NAV_GROUPS) for t in ts}
 
@@ -9346,6 +9500,7 @@ def render_board():
         "🧭 시나리오": lambda: render_scenario(df, histories, trends_all, leaders_now, fins_all),
         "🪃 눌림 타점": lambda: render_pullback(df, histories, quotes, fins_all),
         "📣 실적·지분": lambda: render_tracker(df, histories, quotes),
+        "💵 현금창출": lambda: render_cashflow(df),
         "🪜 증거 쌓기": lambda: render_ladder(df, histories, fins_all),
         "🌏 글로벌 피어": lambda: render_peers(df, histories),
         "🚦 시장 신호": lambda: render_market_signal(df),
