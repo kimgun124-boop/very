@@ -164,6 +164,7 @@ import tracker
 import cashflow
 import views
 import market as msig
+import bear_check
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -9334,6 +9335,235 @@ def render_cashflow(df: pd.DataFrame):
                "조선처럼 선수금으로 현금이 들어오는 업종은 숫자가 좋게 나올 수 있으니 사업 구조를 같이 보세요. 매수 권유가 아니에요.")
 
 
+# ─────────────────────────── 📉 하락장 점검(제주바람 섹터 점검 자료) ───────────────────────────
+def _bc_pick() -> dict | None:
+    """저장된 점검 + 이번 접속에 올린 점검 중 고른 날짜의 자료."""
+    extra = st.session_state.setdefault("bc_extra", {})
+    dates = sorted(set(bear_check.list_dates()) | set(extra), reverse=True)
+    if not dates:
+        return None
+    pick = dates[0]
+    if len(dates) > 1:
+        pick = st.selectbox("점검 날짜", dates, key="bc_date",
+                            format_func=lambda x: f"{x} (최신)" if x == dates[0] else x)
+    return extra.get(pick) or bear_check.load(pick)
+
+
+def _bc_upload():
+    with st.expander("📤 새 점검 자료 넣기(HTML)"):
+        up = st.file_uploader("'하락장 섹터 점검' HTML 파일", type=["html", "htm"], key="bc_up")
+        if not up:
+            st.caption("새 날짜의 점검 HTML을 넣으면 그 날짜가 위 '점검 날짜'에 추가돼요. GITHUB_TOKEN이 있으면 저장소에도 저장돼요.")
+            return
+        d = bear_check.parse_html(up.getvalue())
+        if not d:
+            st.error("이 파일에서 점검 데이터를 찾지 못했어요. 같은 형식(하락장 섹터 점검)의 HTML인지 확인해 주세요.")
+            return
+        st.session_state.setdefault("bc_extra", {})[d["base"]] = d
+        try:
+            bear_check.save_local(d)
+        except OSError:
+            pass
+        token = _secret("GITHUB_TOKEN")
+        if token and st.session_state.get("bc_saved") != d["base"]:
+            ok, msg = reports.save_github(d, token, _secret("GITHUB_REPO", "kimgun124-boop/very"),
+                                          path=bear_check.repo_path(d))
+            if ok:
+                st.session_state["bc_saved"] = d["base"]
+            st.success(f"{d['base']} 점검을 넣었어요. {msg}") if ok else st.warning(msg)
+        else:
+            st.success(f"{d['base']} 점검을 넣었어요" + ("" if token else " (GITHUB_TOKEN이 없어 이번 접속에서만 보여요)") + ".")
+
+
+def _bc_idx_card(name: str, m: dict) -> None:
+    c = lambda v: UP if v > 0 else DOWN if v < 0 else "#26343E"
+    d = lambda s: (s or "-")[2:].replace("-", ".")
+    ftd = (m.get("ftds") or [None])[-1]
+    cells = [
+        ("종가", f"{m['close']:,.2f}", f"<span style='color:{c(m['chg_1d'])}'>{m['chg_1d']:+.2f}%</span>"),
+        ("52주 고점 대비", f"<span style='color:{c(m['dd'])}'>{m['dd']:+.1f}%</span>", f"고점 {d(m['high_date'])}"),
+        ("고점 후", f"{m['days_since_high']}거래일", f"{m.get('calendar_days_since_high', '-')}일"),
+    ]
+    top = "".join(f"<div style='flex:1;min-width:0'><div style='font-size:.78rem;color:#51616C;font-weight:700'>{k}</div>"
+                  f"<div style='font-size:1.25rem;font-weight:900;letter-spacing:-.02em;white-space:nowrap'>{v}</div>"
+                  f"<div style='font-size:.78rem;color:#7A8A94'>{s}</div></div>" for k, v, s in cells)
+    ma = " · ".join(f"{n} <b style='color:{c(m[k])}'>{m[k]:+.1f}%</b>" for n, k in
+                    (("20일선", "ma20_gap"), ("50일선", "ma50_gap"), ("200일선", "ma200_gap")))
+    lines = [
+        ma,
+        f"분산일 <b>{m['dist_days']}개</b> <span style='color:#7A8A94'>({', '.join(m.get('dist_dates') or [])})</span>",
+        (f"최근 FTD <b>{d(ftd['date'])}</b> (Day {ftd['day']}, +{ftd['gain']:.1f}%)" if ftd else "FTD 없음")
+        + (f" · 반등 시도 <b>Day {m['rally_day']}</b>" if m.get("rally_day") else " · 반등 시도 없음"),
+        f"저점 {m['low_close']:,.2f} ({d(m['low_date'])}, {m['low_dd']:+.1f}%) · 첫 하락장 진입 {d(m.get('first_bear_date'))}",
+    ]
+    st.markdown(
+        f"<div style='background:#FFFFFF;border:1px solid #E5E7EB;border-radius:12px;padding:.8rem 1rem;margin-bottom:.6rem'>"
+        f"<div style='font-weight:800;margin-bottom:.4rem'>{html.escape(name)} {'🐻 하락장' if m.get('bear') else ''}</div>"
+        f"<div style='display:flex;gap:.6rem;margin-bottom:.5rem'>{top}</div>"
+        f"<div style='font-size:.84rem;line-height:1.6;color:#26343E'>{'<br>'.join(lines)}</div></div>",
+        unsafe_allow_html=True)
+
+
+def render_bear_check(df: pd.DataFrame):
+    _sec_h("📉 하락장 점검", "하락장 과대낙폭 vs 버티는 종목 — 섹터별로 어디가 무너지고 어디가 버티는지")
+    D = _bc_pick()
+    _bc_upload()
+    if not D:
+        st.info("저장된 점검 자료가 없어요. 위 '새 점검 자료 넣기'로 HTML을 넣어 주세요.")
+        return
+    st.caption(f"기준일 **{D['base']}** · 대상 {D.get('N', '-')}종목 · 출처: {bear_check.SRC} (copyright by 제주바람)")
+
+    # 01 시장 위치
+    st.markdown("##### 01 시장 위치")
+    st.caption("종목보다 시장이 먼저. 분산일·FTD는 자료 작성자의 자체 계산이에요.")
+    mk = D.get("market") or {}
+    cols = st.columns(max(1, len(mk)))
+    for col, (name, m) in zip(cols, mk.items()):
+        with col:
+            _bc_idx_card(name, m)
+    br = D.get("breadth") or {}
+    if br:
+        a, b, c = st.columns(3)
+        a.metric("20일선 위 종목", f"{br.get('above_ma20', 0):.1f}%")
+        b.metric("50일선 위 종목", f"{br.get('above_ma50', 0):.1f}%")
+        c.metric("200일선 위 종목", f"{br.get('above_ma200', 0):.1f}%")
+    l, r = st.columns(2)
+    with l:
+        mon = [{"지수": n, "월": x[0], "수익률": x[1]} for n, m in mk.items() for x in (m.get("monthly") or [])]
+        if mon:
+            md = pd.DataFrame(mon)
+            st.altair_chart(alt.Chart(md).mark_bar(cornerRadius=2).encode(
+                x=alt.X("월:N", title=None, axis=alt.Axis(labelAngle=0)), xOffset="지수:N",
+                y=alt.Y("수익률:Q", title="월간 %"),
+                color=alt.condition("datum.수익률 > 0", alt.value(UP), alt.value(DOWN)),
+                opacity=alt.Opacity("지수:N", scale=alt.Scale(range=[1.0, 0.55]), legend=alt.Legend(orient="top", title=None)),
+                tooltip=["지수", "월", alt.Tooltip("수익률:Q", format="+.1f")],
+            ).properties(height=220, title="월간 등락"), width="stretch")
+    with r:
+        hl = D.get("hl") or {}
+        if hl.get("dates"):
+            hd = pd.DataFrame({"날짜": hl["dates"], "신고가": hl["hi"], "신저가": [-x for x in hl["lo"]]}) \
+                .melt("날짜", var_name="구분", value_name="종목 수")
+            st.altair_chart(alt.Chart(hd).mark_bar(cornerRadius=2).encode(
+                x=alt.X("날짜:N", title=None, sort=None, axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("종목 수:Q", title="신고가(+) / 신저가(−)"),
+                color=alt.Color("구분:N", scale=alt.Scale(domain=["신고가", "신저가"], range=[UP, DOWN]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["날짜", "구분", alt.Tooltip("종목 수:Q", format="d")],
+            ).properties(height=220, title="52주 신고가·신저가 종목 수"), width="stretch")
+
+    # 02 그룹 경계값
+    st.markdown("##### 02 그룹 경계값")
+    bd = D.get("bounds") or {}
+    if bd:
+        a, b, c, e = st.columns(4)
+        a.metric(f"과대낙폭 경계 (하위 {bd.get('n_crash', '-')}종목)", f"{bd['crash_cut']:+.1f}%", f"평균 {bd['crash_avg']:+.1f}%", delta_color="off")
+        b.metric(f"견조 경계 (상위 {bd.get('n_strong', '-')}종목)", f"{bd['strong_cut']:+.1f}%", f"평균 {bd['strong_avg']:+.1f}%", delta_color="off")
+        c.metric("전체 낙폭 중앙값", f"{bd['all_med']:+.1f}%")
+        bt = D.get("backtest") or {}
+        e.metric("깡토 백테스트 평균", f"{bt.get('crash_avg_dd', -67):+.0f}% / {bt.get('strong_avg_dd', -8):+.0f}%", "과대낙폭 / 견조", delta_color="off")
+    if D.get("boundsText"):
+        st.caption(D["boundsText"])
+
+    sec = pd.DataFrame(D.get("sectors") or [])
+    if len(sec):
+        sec = sec.sort_values("버팀지수", ascending=False)
+        # 03 섹터 지도
+        st.markdown("##### 03 섹터 지도")
+        st.caption("가로 = 버팀지수(섹터 안 견조 비율 − 과대낙폭 비율, %p) · 세로 = 섹터 낙폭 중앙값 · 크기 = 섹터 시가총액 합. 오른쪽 위일수록 버티는 섹터.")
+        base = alt.Chart(sec).encode(
+            x=alt.X("버팀지수:Q", title="버팀지수(%p)"), y=alt.Y("낙폭중앙값:Q", title="낙폭 중앙값(%)", scale=alt.Scale(zero=False)))
+        pts = base.mark_circle(opacity=0.65, stroke="#FFFFFF", strokeWidth=1).encode(
+            size=alt.Size("시총합:Q", legend=None, scale=alt.Scale(range=[60, 2200])),
+            color=alt.Color("버팀지수:Q", scale=alt.Scale(scheme="redblue", domainMid=0, reverse=True), legend=None),
+            tooltip=["대분류", "종목수", alt.Tooltip("버팀지수:Q", format="+.1f"), alt.Tooltip("낙폭중앙값:Q", format="+.1f"),
+                     "과대낙폭수", "견조수", alt.Tooltip("시총합:Q", format=",.0f", title="시총합(억)")])
+        txt = base.mark_text(dy=-11, fontSize=11, fontWeight=600, color="#26343E").encode(text="대분류:N")
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#9CA3AF", strokeDash=[3, 3]).encode(x="x:Q")
+        st.altair_chart((zero + pts + txt).properties(height=420), width="stretch")
+
+        # 04 점유율
+        st.markdown("##### 04 과대낙폭 점유율 vs 견조 점유율")
+        st.caption("과대낙폭(또는 견조) 그룹 전체에서 그 섹터가 차지하는 비중. 버팀지수 순.")
+        sh = sec[["대분류", "과대낙폭점유율", "견조점유율"]].rename(columns={"과대낙폭점유율": "과대낙폭", "견조점유율": "견조"}) \
+            .melt("대분류", var_name="그룹", value_name="점유율")
+        st.altair_chart(alt.Chart(sh).mark_bar(cornerRadius=2).encode(
+            y=alt.Y("대분류:N", sort=list(sec["대분류"]), title=None), yOffset="그룹:N",
+            x=alt.X("점유율:Q", title="그룹 안 비중(%)"),
+            color=alt.Color("그룹:N", scale=alt.Scale(domain=["과대낙폭", "견조"], range=[DOWN, UP]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["대분류", "그룹", alt.Tooltip("점유율:Q", format=".1f")],
+        ).properties(height=max(300, 26 * len(sec))), width="stretch")
+
+        # 05 섹터 집계표
+        st.markdown("##### 05 섹터 집계표")
+        cols5 = ["대분류", "종목수", "버팀지수", "과대낙폭수", "과대낙폭비율", "견조수", "견조비율", "낙폭중앙값", "낙폭평균",
+                 "시총가중낙폭", "꼬리비율", "인기주붕괴수", "신고가후보수", "RS중앙값", "200일선위비율", "거래대금변화", "고점일중앙값", "시총합"]
+        t5 = sec[[c for c in cols5 if c in sec.columns]].rename(columns={"시총합": "시총합(억)"})
+        pc = ["과대낙폭비율", "견조비율", "낙폭중앙값", "낙폭평균", "시총가중낙폭", "꼬리비율", "200일선위비율"]
+        st.dataframe(t5.style.format({**{c: "{:.1f}%" for c in pc}, "버팀지수": "{:+.1f}", "RS중앙값": "{:.0f}",
+                                      "거래대금변화": "{:.2f}", "시총합(억)": "{:,.0f}"}, na_rep="-")
+                     .map(_won_c, subset=["버팀지수"]), hide_index=True, width="stretch",
+                     height=min(760, 36 * (len(t5) + 1) + 4))
+        st.caption("머리글을 누르면 정렬돼요. 거래대금변화 = 최근 거래대금 ÷ 평소(1보다 작으면 거래가 말라감).")
+
+    board = df.drop_duplicates("code").set_index("code") if len(df) and "code" in df.columns else pd.DataFrame()
+
+    # 06 섹터별 대표 종목
+    reps_ = pd.DataFrame(D.get("reps") or [])
+    if len(reps_):
+        st.markdown("##### 06 섹터별 대표 종목")
+        st.caption("각 섹터의 과대낙폭·견조 그룹에서 20일 평균 거래대금 상위 3종목씩 기계적으로 뽑음(결과를 보고 고르지 않음).")
+        order = list(sec["대분류"]) if len(sec) else sorted(reps_["대분류"].unique())
+        rows = []
+        for s_ in order:
+            sub = reps_[reps_["대분류"] == s_]
+            if not len(sub):
+                continue
+            fmt_ = lambda g: " · ".join(f"{r['종목명']}({r['dd_52w']:+.0f}%)"
+                                        for _, r in sub[sub["그룹"] == g].sort_values("순위").iterrows()) or "-"
+            rows.append({"섹터": s_, "🛡️ 견조": fmt_("견조"), "⚠️ 과대낙폭": fmt_("과대낙폭")})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=min(760, 36 * (len(rows) + 1) + 4),
+                     column_config={"🛡️ 견조": st.column_config.TextColumn(width="large"),
+                                    "⚠️ 과대낙폭": st.column_config.TextColumn(width="large")})
+
+    # 07 전 종목
+    stx = pd.DataFrame(D.get("stocks") or [])
+    if len(stx):
+        st.markdown("##### 07 과대낙폭 · 견조 전 종목")
+        c1, c2 = st.columns([1, 2])
+        g = c1.segmented_control("그룹", ["과대낙폭", "견조"], default="과대낙폭", key="bc_g", label_visibility="collapsed") or "과대낙폭"
+        secs = sorted(stx["sec"].dropna().unique(), key=str)
+        sf = c2.selectbox("섹터", ["전체 섹터"] + secs, key="bc_sec", label_visibility="collapsed")
+        v = stx[stx["g"] == g]
+        if sf != "전체 섹터":
+            v = v[v["sec"] == sf]
+        v = v.sort_values("dd", ascending=(g == "과대낙폭"))
+        has_gap = len(board) and "gap" in board.columns
+        now_gap = [float(pd.to_numeric(board.at[c, "gap"], errors="coerce")) if has_gap and c in board.index else float("nan")
+                   for c in v["code"]]
+        t7 = pd.DataFrame({
+            "종목": v["name"], "차트": [f"?chart={c}" for c in v["code"]], "코드": v["code"],
+            "시장": v["mkt"].map({"KOSPI": "코스피", "KOSDAQ": "코스닥"}).fillna(v["mkt"]),
+            "대분류": v["sec"], "소분류": v["sub"], "뱃지": v["tags"].map(bear_check.tag_label),
+            "고점 대비": v["dd"], "지금 고점 대비": pd.Series(now_gap, index=v.index, dtype="float64"),
+            "고점일": v["hd"], "고점후 거래일": v["dsh"], "코스피 고점후": v["ddk"], "20일": v["r20"], "50일": v["r50"],
+            "RS": v["rs"], "200일선 위": v["ma200"].map(lambda x: "●" if x else "·"),
+            "거래대금(억)": v["to"], "거래대금 변화": v["tor"], "시총(억)": v["cap"],
+        })
+        pcs = ["고점 대비", "지금 고점 대비", "코스피 고점후", "20일", "50일"]
+        st.dataframe(t7.style.format({**{c: "{:+.1f}%" for c in pcs}, "RS": "{:.0f}", "거래대금(억)": "{:,.0f}",
+                                      "거래대금 변화": "{:.2f}", "시총(억)": "{:,.0f}"}, na_rep="-")
+                     .map(_won_c, subset=["코스피 고점후", "20일", "50일"]),
+                     hide_index=True, width="stretch", height=min(640, 36 * (len(t7) + 1) + 4),
+                     column_config={"차트": st.column_config.LinkColumn("차트", display_text="🕯️")})
+        n_in = int(t7["지금 고점 대비"].notna().sum())
+        st.caption(f"{len(t7)}종목 · 보드에 있는 종목 {n_in}개는 '지금 고점 대비'에 보드 실시간 값을 같이 보여줘요(점검일 이후 변화 확인용). "
+                   "뱃지: " + " · ".join(f"**{a}** {b}" for a, b in bear_check.TAG_TXT.values()))
+
+    st.caption(bear_check.NOTE + " 효석 원칙(시장 → 주도섹터 → 종목, 리스크관리 우선)이 항상 먼저예요.")
+
+
 # ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
@@ -9341,7 +9571,7 @@ NAV_GROUPS = [
     ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매"]),
     ("🔭 섹터 흐름", ["💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
-    ("🚦 시장·이벤트", ["🚦 시장 신호", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
+    ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
 NAV_DESC = {
     "📋 리스트": "공부 자료 속 종목 전체 — 현재가·신고가 거리·수급", "⭐ 내 종목": "내(친구) 관심종목과 포트폴리오",
@@ -9354,7 +9584,7 @@ NAV_DESC = {
     "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
     "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
-    "🚦 시장 신호": "FTD·분산일로 본 시장 국면 + 견조주", "🧭 시나리오": "시장 시나리오별 대응", "📣 실적·지분": "3분기 어닝 서프라이즈 · VC·펀드 지분 확대",
+    "🚦 시장 신호": "FTD·분산일로 본 시장 국면 + 견조주", "📉 하락장 점검": "과대낙폭 vs 버티는 종목 — 섹터 점검(제주바람)", "🧭 시나리오": "시장 시나리오별 대응", "📣 실적·지분": "3분기 어닝 서프라이즈 · VC·펀드 지분 확대",
     "💵 현금창출": "저CAPEX·매출 성장·FCF 증가·낮은 부채 — 스스로 번 현금으로 크는 기업",
 }
 _NAV_OF = {t: gi for gi, (_, ts) in enumerate(NAV_GROUPS) for t in ts}
@@ -9504,6 +9734,7 @@ def render_board():
         "🪜 증거 쌓기": lambda: render_ladder(df, histories, fins_all),
         "🌏 글로벌 피어": lambda: render_peers(df, histories),
         "🚦 시장 신호": lambda: render_market_signal(df),
+        "📉 하락장 점검": lambda: render_bear_check(df),
         "🎯 초기 매수": lambda: render_early(df, histories, quotes, fins_all),
     }
     MAIN_TABS_LAZY["v"] = True
