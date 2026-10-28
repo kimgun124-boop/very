@@ -4407,6 +4407,7 @@ def market_health(histories: dict, quotes: dict, days: int = 120) -> pd.DataFram
 
 
 DEPOSIT_URL = "https://finance.naver.com/sise/sise_deposit.naver"
+DEPOSIT_DIAG: dict = {}
 
 
 def fetch_deposits(pages: int = 3) -> pd.DataFrame:
@@ -4423,9 +4424,13 @@ def fetch_deposits(pages: int = 3) -> pd.DataFrame:
         rows = []
         for pg in range(1, pages + 1):
             try:
-                r = requests.get(DEPOSIT_URL, params={"page": pg}, headers=HEADERS, timeout=8)
+                r = requests.get(DEPOSIT_URL, params={"page": pg}, timeout=8,
+                                 headers={**HEADERS, "Referer": "https://finance.naver.com/sise/"})
                 txt = r.content.decode("euc-kr", "ignore")
-            except Exception:  # noqa: BLE001
+                DEPOSIT_DIAG.update(status=r.status_code, size=len(txt), url=r.url, trs=txt.count("<tr"),
+                                    head=re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt))[:300])
+            except Exception as exc:  # noqa: BLE001
+                DEPOSIT_DIAG.update(error=f"{type(exc).__name__}: {exc}"[:200])
                 break
             for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", txt, flags=re.S):
                 m = re.search(r"(\d{2})\.(\d{2})\.(\d{2})", tr)
@@ -4436,6 +4441,7 @@ def fetch_deposits(pages: int = 3) -> pd.DataFrame:
                 if len(nums) >= 3:        # 예탁금, 증감, 신용잔고, 증감, ...
                     rows.append({"date": pd.Timestamp(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))),
                                  "deposit": nums[0], "credit": nums[2]})
+        DEPOSIT_DIAG["rows"] = len(rows)
         if not rows:
             return pd.DataFrame(columns=cols)
         t = pd.DataFrame(rows).drop_duplicates("date").sort_values("date")
