@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+SCOUT_VERSION = "2026-10-28-ibdexp"   # app.py가 이 값으로 새 파일인지 확인해요
+
 import numpy as np
 import pandas as pd
 
@@ -104,11 +106,14 @@ def index_phase(m: dict | None, susp_pct: float = 0.8, ftd_fresh: int = 15) -> d
             ph, why = "day3", f"오늘이 3일차 {chg:+.2f}% — 강세로 끝나면 다음 날 시초가부터 정찰병(장중이면 종가 확인)"
         else:
             ph, why = "rally12", f"반등 {day}일차" + (f" {chg:+.2f}%" if chg is not None else "")
+        if day in (2, 3) and chg is not None and chg >= 1.25 and m.get("vol_up"):
+            why += " · 큰 상승+거래량 증가지만 IBD 기준(Day 4 이후)으론 아직 FTD 아님 — 일부 서비스는 '이른 FTD'로 셈"
     elif s == "press":
         ph, why = "press", f"분산일 {m['dd']}개(평소 {m['q50']:.0f}개)"
     else:
         lf = m.get("last_ftd")
         fresh = False
+        n_after = None
         if lf and lf.get("result") == "⏳ 진행 중" and sr is not None and len(sr):
             n_after = int((pd.to_datetime(sr["date"]) > pd.Timestamp(lf["date"])).sum())
             fresh = n_after <= ftd_fresh
@@ -117,7 +122,8 @@ def index_phase(m: dict | None, susp_pct: float = 0.8, ftd_fresh: int = 15) -> d
         ph = "ftd" if fresh else "up"
         if not fresh:
             why = f"52주 고점 대비 {m['draw']:+.1f}% · 분산일 {m['dd']}개"
-    return {"phase": ph, "why": why, **{k: PLAYBOOK[ph][k] for k in ("em", "title", "rank")}}
+    na = locals().get("n_after")
+    return {"phase": ph, "why": why, "n_after": na, **{k: PLAYBOOK[ph][k] for k in ("em", "title", "rank")}}
 
 
 def combine(phases: dict) -> tuple[str | None, str]:

@@ -261,8 +261,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
-            "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for")
-DATA_VERSION = "2026-10-28-deposits"   # data.py의 DATA_VERSION과 같아야 해요
+            "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER")
+DATA_VERSION = "2026-10-28-ibdexp"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -282,12 +282,20 @@ _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
             "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "AI_VIEWS")}
+_MOD_VER = {"msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-10-28-ibdexp")}
+
+
+def _old_ver(alias, mod) -> bool:
+    v = _MOD_VER.get(alias)
+    return bool(v) and getattr(mod, v[0], None) != v[1]
+
+
 for _alias, _attrs in _MOD_REQ.items():
     _mod = globals()[_alias]
-    if any(not hasattr(_mod, a_) for a_ in _attrs) or (_alias == "msig" and getattr(_mod, "MARKET_VERSION", None) != MARKET_VERSION):
+    if any(not hasattr(_mod, a_) for a_ in _attrs) or _old_ver(_alias, _mod):
         globals()[_alias] = importlib.reload(_mod)
     _mod = globals()[_alias]
-    if any(not hasattr(_mod, a_) for a_ in _attrs) or (_alias == "msig" and getattr(_mod, "MARKET_VERSION", None) != MARKET_VERSION):
+    if any(not hasattr(_mod, a_) for a_ in _attrs) or _old_ver(_alias, _mod):
         _missing.append(f"{_mod.__name__}.py 새 파일")
 REPORTS_VERSION = "2026-10-06-autolearn"
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
@@ -7487,11 +7495,64 @@ def _mkt_card(name: str, m: dict | None) -> str:
             f'<div class="pf-s">{"<br>".join(sub)}</div>')
 
 
+FTD_RULES = pd.DataFrame([
+    {"출처": "IBD(Investor's Business Daily) 현재 규칙", "랠리 1일차": "지수가 오른 날(또는 내렸어도 고가 근처 마감)",
+     "리셋": "1일차 저점을 깨면 처음부터", "FTD 가장 빠른 날": "보통 4일차(4~7일차가 전형)", "상승폭": "1% 이상(때로 그 이상)",
+     "거래량": "전날보다 많음"},
+    {"출처": "William O'Neil + Co 연구(2025, S&P500 1970~)", "랠리 1일차": "새 저점 뒤 3일 동안 새 저점 없음",
+     "리셋": "직전 저점 이탈", "FTD 가장 빠른 날": "4일차(4~7일차가 가장 강함)", "상승폭": "1.7% 이상", "거래량": "전날보다 많음"},
+    {"출처": "이 보드(🚦 시장 신호 기본값)", "랠리 1일차": "바닥 뒤 처음 오른 날 또는 범위 위쪽 절반 마감",
+     "리셋": "바닥(장중 저가) 이탈", "FTD 가장 빠른 날": "4일차(⚙️ 기준에서 3일차로 바꿀 수 있음)", "상승폭": "1.25% 이상(IBD)",
+     "거래량": "전날보다 많음"},
+    {"출처": "스탁이지 '지금 여긴'", "랠리 1일차": "공개 안 됨", "리셋": "공개 안 됨",
+     "FTD 가장 빠른 날": "공개 안 됨 — 10/28 코스피 FTD로 표시(이 보드 기준 반등 2일차)", "상승폭": "공개 안 됨", "거래량": "공개 안 됨"},
+])
+FTD_STATS = pd.DataFrame([
+    {"연구": "William O'Neil + Co (Forbes, 2025.3)", "표본": "S&P500 9%↑ 조정 35번(1970~)",
+     "결과": "첫 FTD 성공 19/35(54%) · 첫 FTD 실패 후 두 번째 성공 8/35(23%) · 약세장 8/35(23%) — 약세장은 대부분 FTD 실패 4번↑"},
+    {"연구": "Quantifiable Edges (2010)", "표본": "S&P500 FTD(1970~)",
+     "결과": "4일차 FTD 38승 35패(52%) vs 2일차까지 허용 39승 43패(48%) — 일찍 잡으면 실패만 늘어남"},
+    {"연구": "깡토 백테스트(코스피·코스닥 1990~2026)", "표본": "하락장(-20%) 바닥 25번 · 하락장 FTD 52번",
+     "결과": "바닥 뒤엔 항상 FTD(25/25) · 하락장 FTD 52번 중 25번은 진짜 바닥 전에 나와 실패 → FTD는 '허락'이지 '공격'이 아님"},
+])
+EXPO = pd.DataFrame([
+    {"단계": "조정 · 반등 시도(FTD 전)", "IBD": "0-20%", "스승님": "쉬기 → 3일차 강세면 정찰병", "내 원칙": "60일선 아래면 0-20%"},
+    {"단계": "FTD 당일·직후", "IBD": "20-40% (셋업이 적으면 0-20% 유지, 아주 강하면 처음 40%)", "스승님": "정찰병 → 살아남으면 키우기",
+     "내 원칙": "60일선 아래면 0-20%"},
+    {"단계": "FTD 뒤 상승 지속", "IBD": "40-60%", "스승님": "성공한 종목에 피라미딩", "내 원칙": "60일선 위면 유닛 매매"},
+    {"단계": "상승 추세가 자리 잡음", "IBD": "60-80% → 80-100%", "스승님": "주도주 끌고 가기", "내 원칙": "유닛 6→12→18%, 최대 8종목"},
+    {"단계": "상승 둔화(분산일 증가)", "IBD": "노출 줄이기(40-60%)", "스승님": "약한 종목부터 정리", "내 원칙": "신규는 정찰병 크기"},
+])
+
+
+def _render_ftd_research(mn: dict):
+    """FTD 기준 · 권장 노출 근거 비교(스탁이지와 숫자가 다른 이유)."""
+    with st.expander("📚 FTD 기준 · 권장 노출 — 근거 비교 (스탁이지와 숫자가 다른 이유)", expanded=True):
+        rows = []
+        for n, x in mn["idx"].items():
+            rows.append(f"**{n}** — 이 보드: {x['state']} · IBD 기준 {x['exp_ibd']}"
+                        + (f" · 내 원칙 적용 {x['exp_mine']}" if x["exp_mine"] else "") + f" → **{x['exp']}**")
+        st.markdown("\n".join(f"- {r}" for r in rows))
+        st.markdown("**1. FTD를 언제로 보느냐가 다름**")
+        st.dataframe(FTD_RULES, hide_index=True, width="stretch")
+        st.markdown("**2. FTD가 나와도 바로 80-100%가 아님** — IBD는 FTD 직후 20-40%에서 시작해 상승이 이어질 때 올려요. "
+                    "스탁이지는 FTD 당일 80-100%로 표시해서 IBD보다 훨씬 공격적이에요(기준 비공개).")
+        st.dataframe(EXPO, hide_index=True, width="stretch")
+        st.markdown("**3. FTD 성공률 — 통계로 본 근거**")
+        st.dataframe(FTD_STATS, hide_index=True, width="stretch")
+        st.caption("결론: FTD는 절반 가까이 실패해요(54%·52%·25/52). 그래서 IBD도 FTD 직후 20-40%로 시작하고, 실패하면 바로 줄여요. "
+                   "이 보드의 권장 노출 = IBD 5단계 → 지수가 60일선 아래면 내 원칙대로 0-20%(정찰병)로 낮춰서 보여줘요. "
+                   "출처: Investor's Business Daily 'How To Invest After A Follow-Through Day', 'Risk Management In The Stock Market', "
+                   "'How To Spot A Stock Market Bottom' · Forbes 'Follow-Through Day Study Update'(2025.3.7) · Quantifiable Edges "
+                   "'Follow Through Days Before The 4th Day'(2010.7) · 깡토 블로그 백테스트.")
+
+
 def _render_health_charts(df: pd.DataFrame):
     """🚦 시장 신호 탭: 시장 체력·증시 자금 차트(코스피 겹쳐 보기)."""
     mn = market_now(df)
     h, dp = mn["health"], mn["dep"]
     st.markdown(DB_CSS + f'<div class="db">{_now_card(mn)}</div>', unsafe_allow_html=True)
+    _render_ftd_research(mn)
     if h is None or h.empty:
         st.info("시장 체력을 계산할 일봉이 아직 없어요.")
         return
@@ -9322,7 +9383,8 @@ NOW_CSS = """
 .db-nw .ex{border-radius:12px;text-align:center;padding:.6rem .4rem;margin:.5rem 0 .25rem}
 .db-nw .ex b{display:block;font-size:1.7rem;font-weight:900;line-height:1.15}
 .db-nw .ex small{font-size:.78rem;font-weight:700;color:#4B5563}
-.db-nw .ex-w{font-size:.76rem;color:#6B7280;text-align:center;margin-bottom:.35rem}
+.db-nw .ex-w{font-size:.78rem;color:#6B7280;text-align:center;margin-bottom:.35rem;line-height:1.5}
+.db-nw .ex-w b{color:#111827}
 .db-nw .kv{display:flex;justify-content:space-between;border-top:1px solid #F1F3F8;padding:.45rem .1rem;font-size:.88rem}
 .db-nw .kv span{color:#4B5563;font-weight:600}.db-nw .kv b{color:#111827;font-weight:850}
 .db-mtg{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem;margin-top:.9rem}
@@ -9547,10 +9609,12 @@ def market_now(df: pd.DataFrame) -> dict:
         m = msigs.get(name)
         sm = data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}
         ph = scout.index_phase(m)
-        rng, why = data.exposure_for(ph["phase"] if ph else None, sm.get("above60"))
+        ex = data.exposure_for(ph["phase"] if ph else None, sm.get("above60"), (ph or {}).get("n_after"),
+                               (m or {}).get("dd"), (m or {}).get("q50"))
         lf = (m or {}).get("last_ftd")
         idx[name] = {"state": (m or {}).get("state_txt", "-"), "em": (m or {}).get("em", "⚪"), "phase": ph,
-                     "exp": rng, "exp_why": why, "dd": (m or {}).get("dd"), "q50": (m or {}).get("q50"),
+                     "exp": ex["final"], "exp_ibd": ex["ibd"], "exp_why": ex["ibd_why"], "exp_mine": ex["mine"],
+                     "dd": (m or {}).get("dd"), "q50": (m or {}).get("q50"),
                      "ftd": pd.Timestamp(lf["date"]) if lf else None, "ftd_res": lf["result"] if lf else None,
                      "above60": sm.get("above60"), "dist60": sm.get("dist60"), "last": sm.get("last"), "chg": sm.get("change")}
     try:
@@ -9581,7 +9645,8 @@ def _now_card(mn: dict) -> str:
         dd = "-" if x["dd"] is None else f"{x['dd']}개" + (f" (평소 {x['q50']:.0f})" if x["q50"] is not None else "")
         cols.append(f'<div class="db-nw"><div class="h"><b>{esc(name)}</b><span style="color:{col}">● {esc(x["state"])}</span></div>'
                     f'<div class="ex" style="background:{bg};color:{col}"><b>{esc(x["exp"])}</b><small>권장 노출</small></div>'
-                    f'<div class="ex-w">{esc(x["exp_why"])}</div>'
+                    f'<div class="ex-w">IBD 기준 <b>{esc(x["exp_ibd"])}</b> — {esc(x["exp_why"])}'
+                    + (f'<br>내 원칙: 60일선 아래 → <b>{esc(x["exp_mine"])}</b>(정찰병만)' if x["exp_mine"] else "") + '</div>'
                     f'<div class="kv"><span>60일선 대비</span><b>{"-" if x["dist60"] is None else format(x["dist60"], "+.1f") + "%"}</b></div>'
                     f'<div class="kv"><span>Distribution Day (25일)</span><b>{esc(dd)}</b></div>'
                     f'<div class="kv"><span>Last Follow-Through Day</span><b>{esc(ftd)}</b></div></div>')
@@ -9609,7 +9674,7 @@ def _now_card(mn: dict) -> str:
     ddate = f"{pd.Timestamp(dl['date']):%y.%m.%d}" if dl is not None else "불러오지 못함 — 네이버 페이지 형식이 바뀌어 다른 출처 확인 중"
     link = "?tab=" + quote_plus("🚦 시장 신호")
     return ('<div class="db-card db-now"><div class="db-hd"><div><h3>📍 지금 여긴</h3>'
-            '<p>지수 국면 · 권장 노출 · 분산일 · FTD — 오닐 방식 계산 + 스승님 플레이북 + 내 60일선 원칙</p></div>'
+            '<p>지수 국면 · 권장 노출(IBD 5단계 + 내 60일선 원칙) · 분산일 · FTD(IBD: Day 4 이후 +1.25%↑ · 거래량 증가)</p></div>'
             f'<a class="db-pill b" href="{link}" target="_self">차트로 보기 →</a></div>'
             f'<div class="db-nwg">{"".join(cols)}</div>'
             f'<div class="db-mtg"><div><div class="db-mth"><b>시장 체력</b><small>기준 {hdate} · 보드 국내 {n_used}종목</small></div>'

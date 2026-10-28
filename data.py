@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-28-deposits"
+DATA_VERSION = "2026-10-28-ibdexp"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -4451,13 +4451,37 @@ def fetch_deposits(pages: int = 3) -> pd.DataFrame:
     return t[cols]
 
 
-def exposure_for(phase: str | None, above60: bool | None) -> tuple[str, str]:
-    """국면 → 권장 노출(주식 비중) 범위와 근거. 내 원칙: 60일선 아래면 본매매 쉬고 정찰병만(≤20%)."""
-    base = {"corr": (0, 10), "rally12": (0, 10), "day3": (10, 20), "susp_ftd": (10, 30), "ftd": (30, 60),
-            "press": (40, 60), "up": (80, 100)}.get(phase or "corr", (0, 10))
-    if above60 is False and base[1] > 20:
-        return f"{base[0] if base[0] < 20 else 10}-20%", f"국면 기준 {base[0]}-{base[1]}% → 60일선 아래라 내 원칙상 20% 이하(정찰병)"
-    return f"{base[0]}-{base[1]}%", "국면 기준(오닐 FTD·분산일 + 스승님 플레이북)"
+# IBD 공식 노출 5단계(0-20 · 20-40 · 40-60 · 60-80 · 80-100%) — FTD 직후는 20-40%, 상승이 이어지면 40-60%,
+# 80-100%는 '상승 추세가 자리 잡았을 때'만(Investor's Business Daily, 'How To Invest After A Follow-Through Day' ·
+# 'Risk Management In The Stock Market: How Much Money To Invest Now'). 그 위에 내 원칙(60일선 아래 = 정찰병만, ≤20%)을 씌워요.
+IBD_LADDER = {
+    "corr": ((0, 20), "조정 국면 — IBD 가장 낮은 단계"),
+    "rally12": ((0, 20), "반등 시도(FTD 전) — IBD 가장 낮은 단계"),
+    "day3": ((0, 20), "반등 3일차 강세(FTD 전) — 스승님 정찰병, IBD 기준은 아직 0-20%"),
+    "susp_ftd": ((0, 20), "의심스러운 FTD(IBD 기준 미달) — 정찰병, IBD 기준은 0-20%"),
+    "ftd_new": ((20, 40), "FTD 직후 — IBD 첫 단계 20-40%"),
+    "ftd_hold": ((40, 60), "FTD 뒤 상승 지속(랠리 저점 안 깸) — IBD 40-60%"),
+    "press": ((40, 60), "상승 둔화(분산일 평소보다 많음) — 노출 줄이기"),
+    "up": ((60, 80), "상승 추세 — 분산일·이평 조건이 다 좋으면 80-100%"),
+    "up_strong": ((80, 100), "상승 추세가 자리 잡음(60일선 위 · 분산일 평소 이하) — IBD 최고 단계"),
+}
+
+
+def exposure_for(phase: str | None, above60: bool | None, n_after: int | None = None, dd: int | None = None,
+                 q50: float | None = None) -> dict:
+    """국면 → IBD 기준 권장 노출 + 내 원칙(60일선) 적용 결과.
+    {'ibd': '20-40%', 'ibd_why': ..., 'mine': '0-20%' | None, 'final': '0-20%', 'key': 단계}"""
+    key = phase or "corr"
+    if key == "ftd":
+        key = "ftd_new" if (n_after is None or n_after <= 5) else "ftd_hold"
+    elif key == "up":
+        key = "up_strong" if (above60 and dd is not None and q50 is not None and dd <= q50) else "up"
+    (lo, hi), why = IBD_LADDER.get(key, IBD_LADDER["corr"])
+    ibd = f"{lo}-{hi}%"
+    mine = None
+    if above60 is False and hi > 20:
+        mine = "0-20%"
+    return {"ibd": ibd, "ibd_why": why, "mine": mine, "final": mine or ibd, "key": key, "hi": 20 if mine else hi}
 
 
 def breadth_zone(down20: float | None) -> tuple[str, str]:
