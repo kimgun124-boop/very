@@ -262,7 +262,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
             "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for")
-DATA_VERSION = "2026-10-28-h52backed"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-28-deposits"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -9510,7 +9510,11 @@ def load_health(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_deposits() -> pd.DataFrame:
-    return swr(("deposits",), 3600, lambda: data.fetch_deposits(), "증시 자금(예탁금·신용잔고)을 불러오는 중이에요.")
+    t = swr(("deposits", DATA_VERSION), 3600, lambda: data.fetch_deposits(), "증시 자금(예탁금·신용잔고)을 불러오는 중이에요.")
+    if t is None or len(t) == 0:            # 실패는 오래 기억하지 않고 10분 뒤 다시 시도
+        t = swr(("deposits_retry", DATA_VERSION, data.now_kst().strftime("%H%M")[:3]), 600, lambda: data.fetch_deposits(),
+                "증시 자금을 다시 불러오는 중이에요.")
+    return t
 
 
 def _hl_tone(kind: str, v) -> tuple[str, str]:
