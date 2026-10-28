@@ -166,6 +166,7 @@ import cashflow
 import views
 import market as msig
 import scout
+import bigpicture
 import bear_check
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
@@ -7602,6 +7603,107 @@ def _views_box_kt():
         st.caption(f"출처: {views.KT_SRC} · {views.LT_SRC}")
 
 
+# ─────────────────────────── 🗺️ 큰 그림: AI · 비AI · 그외 → 테마 ───────────────────────────
+BP_CSS = """
+<style>
+.bp-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem;margin:.2rem 0 1rem}
+.bp-card{background:#fff;border:1px solid #ECEEF5;border-radius:16px;padding:.9rem 1rem;box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 18px rgba(91,71,245,.05);min-width:0}
+.bp-h{display:flex;justify-content:space-between;align-items:baseline;gap:.4rem;margin-bottom:.15rem}
+.bp-h b{font-size:1.12rem;font-weight:850;color:#111827}
+.bp-h span{font-size:1.02rem;font-weight:850}
+.bp-s{font-size:.76rem;color:#6B7280;margin-bottom:.55rem}
+.bp-t{display:grid;grid-template-columns:minmax(0,1.3fr) 64px minmax(0,1fr);gap:.5rem;align-items:center;padding:.45rem 0;border-top:1px solid #F1F3F8}
+.bp-t:first-of-type{border-top:none}
+.bp-t .n{font-weight:800;font-size:.9rem;color:#111827}
+.bp-t .n small{display:block;font-weight:600;font-size:.7rem;color:#9CA3AF;margin-top:.05rem}
+.bp-t .c{font-weight:850;font-size:.9rem;text-align:right;white-space:nowrap}
+.bp-t .m{font-size:.72rem;color:#4B5563;line-height:1.35;min-width:0}
+.bp-t .m i{font-style:normal;color:#9CA3AF}
+.bp-bar{height:5px;border-radius:5px;background:#EEF1F6;margin-top:.25rem;overflow:hidden}
+.bp-bar div{height:100%;border-radius:5px}
+.bp-hot{display:inline-block;font-size:.66rem;font-weight:800;color:#C0262E;background:#FDECEC;border-radius:6px;padding:.03rem .35rem;margin-left:.25rem}
+@media (max-width:900px){.bp-row{grid-template-columns:minmax(0,1fr)}}
+</style>
+"""
+
+
+def _bp_cards(s: pd.DataFrame, top_n: int | None = None) -> str:
+    """영역 3칸 카드(테마 줄마다 등락 중앙값 · 오른 비율 막대 · 신고가 · 대장)."""
+    bs = bigpicture.bucket_summary(s)
+    cards = []
+    for b, em, themes in bigpicture.BIG:
+        g = s[s["bucket"] == b].set_index("theme")
+        info = bs.get(b)
+        if not info:
+            continue
+        col = UP if (info["chg"] or 0) > 0 else (DOWN if (info["chg"] or 0) < 0 else "#6B7280")
+        rows = []
+        order = [t for t in themes if t in g.index]
+        if top_n:
+            order = list(g.loc[order].sort_values("score", ascending=False).index[:top_n])
+        for t in order:
+            r = g.loc[t]
+            ch = r["chg"]
+            chs = "-" if ch is None or ch != ch else f"{ch:+.1f}%"
+            ccol = UP if (ch or 0) > 0 else (DOWN if (ch or 0) < 0 else "#6B7280")
+            up = r["up"] or 0
+            hot = '<span class="bp-hot">신고가 확산</span>' if r["nh5"] >= 2 else ""
+            lead = f"대장 {r['leader']}" if r["leader"] else ""
+            best = f"오늘 최강 {r['best']} {r['best_chg']:+.1f}%" if r["best"] and r["best_chg"] is not None else ""
+            rows.append(f'<div class="bp-t"><div class="n">{html.escape(t)}{hot}<small>{int(r["n"])}종목 · 신고가 오늘 {int(r["nh0"])} · 5일 {int(r["nh5"])}'
+                        + (f' · 20일선 위 {r["a20"]:.0f}%' if r["a20"] is not None else "") + '</small>'
+                        f'<div class="bp-bar"><div style="width:{up:.0f}%;background:{ccol}"></div></div></div>'
+                        f'<div class="c" style="color:{ccol}">{chs}</div>'
+                        f'<div class="m">{html.escape(lead)}<br><i>{html.escape(best)}</i></div></div>')
+        bchg = "-" if info["chg"] is None else f"{info['chg']:+.1f}%"
+        cards.append(f'<div class="bp-card"><div class="bp-h"><b>{em} {b}</b><span style="color:{col}">'
+                     f'{bchg}</span></div>'
+                     f'<div class="bp-s">오른 테마 {info["n_up"]}/{info["n"]} · 최근 5일 신고가 {info["nh5"]} · 막대 = 테마 안 오른 종목 비율</div>'
+                     + "".join(rows) + '</div>')
+    return BP_CSS + f'<div class="bp-row">{"".join(cards)}</div>'
+
+
+def render_bigpicture(df: pd.DataFrame):
+    _sec_h("🗺️ 큰 그림", "시장을 AI · 비AI · 그외 영역으로 먼저 나누고, 그 안에서 어떤 테마에 돈이 도는지 봐요")
+    c1, c2 = st.columns([1, 1])
+    scope = c1.segmented_control("범위", ["국내", "국내+해외"], default="국내", key="bp_scope", label_visibility="collapsed") or "국내"
+    sort = c2.segmented_control("정렬", ["분류 순서", "강한 순"], default="분류 순서", key="bp_sort", label_visibility="collapsed") or "분류 순서"
+    d = df if scope == "국내+해외" else df[df["code"].map(data.is_kr)]
+    s = tab_memo("bigpicture", (scope, len(d)), lambda: bigpicture.summary(d, recent_days))
+    if s.empty:
+        st.info("표를 계산하는 중이에요.")
+        return
+    st.markdown(_bp_cards(s if sort == "분류 순서" else s.sort_values("score", ascending=False)), unsafe_allow_html=True)
+    top = s.sort_values("score", ascending=False).head(5)
+    st.caption("강한 테마 TOP 5 (오늘 등락 + 최근 신고가 확산 + 20일선 위 비율): "
+               + " · ".join(f"{r.theme}({r.bucket}) {r.chg:+.1f}%" for r in top.itertuples() if r.chg is not None)
+               + " — 등락은 테마 안 종목 등락률의 중앙값, 여러 테마에 걸친 종목은 각 테마에 모두 들어가요.")
+
+    st.markdown("##### 테마 안 종목 보기")
+    th = st.selectbox("테마", bigpicture.THEME_ORDER, key="bp_theme",
+                      format_func=lambda t: f"{bigpicture.BUCKET_OF[t]} · {t}")
+    t = bigpicture.tag(d)
+    v = t[t["themes"].map(lambda xs: th in xs)].copy()
+    if v.empty:
+        st.info("이 테마에 해당하는 종목이 지금 범위에 없어요.")
+        return
+    v = v.sort_values(["days_since_high", "rs"], ascending=[True, False], na_position="last")
+    tb = pd.DataFrame({"종목": v["name"] + " · " + v["code"], "차트": "?chart=" + v["code"], "세부 분류": v["group"],
+                       "현재가": pd.to_numeric(v["price"], errors="coerce"), "등락률": pd.to_numeric(v["change"], errors="coerce"),
+                       "신고가까지": pd.to_numeric(v["to_high"], errors="coerce"),
+                       "신고가 뒤(일)": pd.to_numeric(v["days_since_high"], errors="coerce"),
+                       "RS": pd.to_numeric(v["rs"], errors="coerce"),
+                       "다른 테마": v["themes"].map(lambda xs: " · ".join(x for x in xs if x != th))})
+    st.dataframe(tb.style.format({"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:.1f}%", "신고가 뒤(일)": "{:.0f}", "RS": "{:.0f}"},
+                                 na_rep="-").map(_won_c, subset=["등락률"]),
+                 hide_index=True, width="stretch", height=min(560, 36 * (len(tb) + 1) + 4),
+                 column_config={"차트": st.column_config.LinkColumn("차트", display_text="🕯️")})
+    with st.expander("ℹ️ 분류 기준"):
+        for b, em, themes in bigpicture.BIG:
+            st.markdown(f"**{em} {b}** — " + " · ".join(themes))
+        st.caption("세부 분류 → 테마 지도는 bigpicture.py. 한 종목이 여러 테마에 걸치면(예: 삼성전기 = 반도체소부장·MLCC·유리기판) 모두 셉니다.")
+
+
 def render_early(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
     _sec_h("🎯 초기 매수", "리 태너 — 표준 피벗보다 싸게 사는 자리: 하락 추세선 돌파 · 손잡이 저점(조용한 거래량) · Shakeout +3")
     d = msig.EE_DEFAULTS
@@ -9244,6 +9346,14 @@ DB_CSS = """
 .db-sig{align-items:start}.db-sig .n{margin-top:.1rem}.db-sig b{margin-top:.15rem}
 .db-step .x .ln{margin:.1rem 0}
 @media (max-width:520px){.db-dl{grid-template-columns:1fr;gap:.15rem}.db-cmr{grid-template-columns:1fr;gap:.3rem}.db-cmr b{justify-self:start}}
+.db-bp{margin-bottom:1rem}
+.db-bpg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.7rem}
+.db-bpi{background:#F7F9FC;border-radius:14px;padding:.7rem .85rem;min-width:0}
+.db-bpi .h{display:flex;justify-content:space-between;align-items:baseline}
+.db-bpi .h b{font-size:1.05rem;font-weight:850;color:#111827}.db-bpi .h span{font-size:1.05rem;font-weight:850}
+.db-bpi small{display:block;font-size:.78rem;color:#6B7280;margin:.15rem 0 .4rem}
+.db-bpc{display:inline-block;font-size:.82rem;font-weight:800;background:#fff;border:1px solid #ECEEF5;border-radius:999px;padding:.15rem .55rem;margin:0 .3rem .3rem 0}
+@media (max-width:900px){.db-bpg{grid-template-columns:minmax(0,1fr)}}
 .db .db-a{font-family:'Pretendard Variable',Pretendard,'Malgun Gothic','Apple SD Gothic Neo',sans-serif!important}
 .db-step .x{margin:.25rem 0 0;font-size:0.88rem;color:#4B5563;line-height:1.5}
 .db-step{align-items:start}.db-step .r{margin-top:.15rem}
@@ -9292,6 +9402,31 @@ def _db_note_row(x: str) -> str:
     label, body = (m.group(1), m.group(2)) if m else ("", x)
     body = re.sub(r"</?b>", "", body)
     return f'<div class="db-cmr"><b>{html.escape(label)}</b><div>{_db_lines(body, by_mid=True)}</div></div>'
+
+
+def _db_bigpicture(df: pd.DataFrame) -> str:
+    """판단 보드 띠: 큰 그림(AI · 비AI · 그외) — 영역 등락과 강한 테마 3개."""
+    try:
+        kr = df[df["code"].map(data.is_kr)]
+        s_ = tab_memo("bigpicture", ("국내", len(kr)), lambda: bigpicture.summary(kr, recent_days))
+        bs = bigpicture.bucket_summary(s_)
+    except Exception:  # noqa: BLE001
+        return ""
+    cells = []
+    for b, em, _ in bigpicture.BIG:
+        x = bs.get(b)
+        if not x:
+            continue
+        col = "#E5484D" if (x["chg"] or 0) > 0 else ("#1F66C9" if (x["chg"] or 0) < 0 else "#6B7280")
+        chips = "".join(f'<span class="db-bpc" style="color:{"#E5484D" if (c or 0) > 0 else ("#1F66C9" if (c or 0) < 0 else "#6B7280")}">'
+                        f'{html.escape(t)} {"-" if c is None or c != c else format(c, "+.1f") + "%"}</span>' for t, c in x["top"])
+        bchg = "-" if x["chg"] is None else format(x["chg"], "+.1f") + "%"
+        cells.append(f'<div class="db-bpi"><div class="h"><b>{em} {b}</b><span style="color:{col}">{bchg}</span></div>'
+                     f'<small>오른 테마 {x["n_up"]}/{x["n"]} · 5일 신고가 {x["nh5"]} · 강한 테마</small><div>{chips}</div></div>')
+    link = "?tab=" + quote_plus("🗺️ 큰 그림")
+    return ('<div class="db-card db-bp"><div class="db-hd"><div><h3>🗺️ 큰 그림</h3>'
+            '<p>AI · 비AI · 그외 영역으로 먼저 나눠 보기 — 숫자는 테마 등락 중앙값</p></div>'
+            f'<a class="db-pill b" href="{link}" target="_self">테마 전체 →</a></div><div class="db-bpg">{"".join(cells)}</div></div>')
 
 
 def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[list, str | None, int]:
@@ -9494,6 +9629,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
          f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" · ".join(why_bits))}</p><p>{esc(_DB_SHORT[ph_key])}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
          f'<div class="db-stats">{"".join(stats)}</div></div>',
+         _db_bigpicture(df),
          '<div class="db-grid">']
     # 왼쪽: TOP 6 — 종목마다 '왜'는 배지 3개, '어떻게'는 손절·3R 한 줄
     if n_buy:
@@ -10568,7 +10704,7 @@ NAV_GROUPS = [
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
     ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매"]),
-    ("🔭 섹터 흐름", ["💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
+    ("🔭 섹터 흐름", ["🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
 NAV_DESC = {
@@ -10579,7 +10715,7 @@ NAV_DESC = {
     "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
     "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
-    "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
+    "🗺️ 큰 그림": "AI · 비AI · 그외 → 테마별 등락·신고가 확산·대장주", "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
     "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
     "🚦 시장 신호": "FTD·분산일로 본 시장 국면 + 견조주", "📉 하락장 점검": "과대낙폭 vs 버티는 종목 — 섹터 점검(제주바람)", "🧭 시나리오": "시장 시나리오별 대응", "📣 실적·지분": "3분기 어닝 서프라이즈 · VC·펀드 지분 확대",
@@ -10737,6 +10873,7 @@ def render_board():
         "🏭 인더스트리 액션": lambda: render_industry_action(df, histories, quotes),
         "⚖️ 1:2:6 매매": lambda: render_126(df, histories, quotes, fins_all),
         "🎯 매수 후보": lambda: render_buy(df, quotes),
+        "🗺️ 큰 그림": lambda: render_bigpicture(df),
         "💰 거래대금": lambda: render_money(df),
         "🚀 급상승": lambda: render_engine(df, trends_all, leaders_now, fins_all),
         "🔭 차기 주도": lambda: render_next(df, fins_all, trends_all, leaders_now),
