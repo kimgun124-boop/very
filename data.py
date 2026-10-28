@@ -4352,6 +4352,108 @@ def breadth_series(histories: dict, quotes: dict, days: int = 120) -> pd.DataFra
     return out
 
 
+_health_memo: dict = {}
+
+
+def market_health(histories: dict, quotes: dict, days: int = 120) -> pd.DataFrame:
+    """시장 체력(날짜별, 보드 국내 종목 기준 — 전체 상장사가 아니라 보드에 올라온 종목으로 계산한 근사치):
+    down20/down200 = 20·200일선 아래 종목 비율(%) · nh/nl = 52주(250거래일) 종가 신고가·신저가 종목 수 ·
+    nh_pct/nl_pct = 그 비율(%) · net = 신고가 − 신저가 · adv/dec = 오른·내린 종목 수 · adr = 20일 ADR(상승 합 ÷ 하락 합 × 100)."""
+    today = now_kst().date()
+    key = (today, now_kst().hour * 12 + now_kst().minute // 5, len(histories))
+    if key in _health_memo:
+        return _health_memo[key]
+    c20, c200, chi, clo, cup, cdn = {}, {}, {}, {}, {}, {}
+    for code, item in histories.items():
+        if not is_kr(code) or not item:
+            continue
+        hist = item[1]
+        if hist is None or len(hist) < 60:
+            continue
+        d, o, h, l, c, v = _session_bars(hist, quotes.get(code), today)
+        s = pd.Series(c, index=pd.DatetimeIndex(d))
+        s = s[~s.index.duplicated(keep="last")]
+        ma20, ma200 = s.rolling(20).mean(), s.rolling(200).mean()
+        prev_hi = s.shift(1).rolling(250, min_periods=240).max()
+        prev_lo = s.shift(1).rolling(250, min_periods=240).min()
+        ch = s.diff()
+        sl = slice(-(days + 20), None)
+        c20[code] = (s < ma20).where(ma20.notna()).iloc[sl]
+        c200[code] = (s < ma200).where(ma200.notna()).iloc[sl]
+        chi[code] = (s > prev_hi).where(prev_hi.notna()).iloc[sl]
+        clo[code] = (s < prev_lo).where(prev_lo.notna()).iloc[sl]
+        cup[code] = (ch > 0).where(ch.notna()).iloc[sl]
+        cdn[code] = (ch < 0).where(ch.notna()).iloc[sl]
+    cols = ["date", "down20", "down200", "nh", "nl", "nh_pct", "nl_pct", "net", "adv", "dec", "adr", "n"]
+    if not c20:
+        return pd.DataFrame(columns=cols)
+    f = lambda x: pd.DataFrame(x).astype("float")  # noqa: E731
+    b20, b200, bhi, blo, bup, bdn = f(c20), f(c200), f(chi), f(clo), f(cup), f(cdn)
+    n = b20.notna().sum(axis=1)
+    nhl = bhi.notna().sum(axis=1).replace(0, np.nan)
+    adv, dec = bup.sum(axis=1), bdn.sum(axis=1)
+    out = pd.DataFrame({
+        "down20": b20.mean(axis=1) * 100, "down200": b200.mean(axis=1) * 100,
+        "nh": bhi.sum(axis=1), "nl": blo.sum(axis=1),
+        "nh_pct": bhi.sum(axis=1) / nhl * 100, "nl_pct": blo.sum(axis=1) / nhl * 100,
+        "adv": adv, "dec": dec,
+        "adr": adv.rolling(20).sum() / dec.rolling(20).sum().replace(0, np.nan) * 100, "n": n})
+    out["net"] = out["nh"] - out["nl"]
+    out.loc[nhl.isna(), ["nh", "nl", "net", "nh_pct", "nl_pct"]] = np.nan
+    out = out[out["n"] >= max(30, out["n"].max() * 0.5)].iloc[-days:].reset_index(names="date")
+    _health_memo.clear()
+    _health_memo[key] = out[cols]
+    return out[cols]
+
+
+DEPOSIT_URL = "https://finance.naver.com/sise/sise_deposit.naver"
+
+
+def fetch_deposits(pages: int = 3) -> pd.DataFrame:
+    """증시 자금(네이버 금융 '증시자금동향', 억원): 날짜 · 투자자예탁금 · 신용잔고. 실패하면 빈 표.
+    credit_ratio = 신용잔고 ÷ 예탁금(%) · credit_osc = 신용잔고 5일 평균 ÷ 20일 평균 − 1(%)."""
+    cols = ["date", "deposit", "credit", "credit_ratio", "credit_osc"]
+    if MOCK:
+        rng = np.random.default_rng(7)
+        d = pd.bdate_range(end=now_kst().date(), periods=60)
+        dep = 900_000 + np.cumsum(rng.normal(0, 8000, len(d)))
+        cr = 300_000 + np.cumsum(rng.normal(0, 2500, len(d)))
+        t = pd.DataFrame({"date": d, "deposit": dep, "credit": cr})
+    else:
+        rows = []
+        for pg in range(1, pages + 1):
+            try:
+                r = requests.get(DEPOSIT_URL, params={"page": pg}, headers=HEADERS, timeout=8)
+                txt = r.content.decode("euc-kr", "ignore")
+            except Exception:  # noqa: BLE001
+                break
+            for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", txt, flags=re.S):
+                m = re.search(r"(\d{2})\.(\d{2})\.(\d{2})", tr)
+                if not m:
+                    continue
+                cells = [re.sub(r"<[^>]+>|\s|&nbsp;", "", x) for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S)]
+                nums = [float(x.replace(",", "")) for x in cells[1:] if x and re.fullmatch(r"-?[\d,]+(\.\d+)?", x)]
+                if len(nums) >= 3:        # 예탁금, 증감, 신용잔고, 증감, ...
+                    rows.append({"date": pd.Timestamp(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))),
+                                 "deposit": nums[0], "credit": nums[2]})
+        if not rows:
+            return pd.DataFrame(columns=cols)
+        t = pd.DataFrame(rows).drop_duplicates("date").sort_values("date")
+    t = t.reset_index(drop=True)
+    t["credit_ratio"] = t["credit"] / t["deposit"] * 100
+    t["credit_osc"] = (t["credit"].rolling(5).mean() / t["credit"].rolling(20).mean() - 1) * 100
+    return t[cols]
+
+
+def exposure_for(phase: str | None, above60: bool | None) -> tuple[str, str]:
+    """국면 → 권장 노출(주식 비중) 범위와 근거. 내 원칙: 60일선 아래면 본매매 쉬고 정찰병만(≤20%)."""
+    base = {"corr": (0, 10), "rally12": (0, 10), "day3": (10, 20), "susp_ftd": (10, 30), "ftd": (30, 60),
+            "press": (40, 60), "up": (80, 100)}.get(phase or "corr", (0, 10))
+    if above60 is False and base[1] > 20:
+        return f"{base[0] if base[0] < 20 else 10}-20%", f"국면 기준 {base[0]}-{base[1]}% → 60일선 아래라 내 원칙상 20% 이하(정찰병)"
+    return f"{base[0]}-{base[1]}%", "국면 기준(오닐 FTD·분산일 + 스승님 플레이북)"
+
+
 def breadth_zone(down20: float | None) -> tuple[str, str]:
     """20 DOWN 구간 → (이름, 설명)."""
     if down20 is None:

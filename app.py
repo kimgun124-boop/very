@@ -7473,6 +7473,72 @@ def _mkt_card(name: str, m: dict | None) -> str:
             f'<div class="pf-s">{"<br>".join(sub)}</div>')
 
 
+def _render_health_charts(df: pd.DataFrame):
+    """🚦 시장 신호 탭: 시장 체력·증시 자금 차트(코스피 겹쳐 보기)."""
+    mn = market_now(df)
+    h, dp = mn["health"], mn["dep"]
+    st.markdown(DB_CSS + f'<div class="db">{_now_card(mn)}</div>', unsafe_allow_html=True)
+    if h is None or h.empty:
+        st.info("시장 체력을 계산할 일봉이 아직 없어요.")
+        return
+    k = load_index_long(data.MARKETS["코스피"])
+    kp = pd.DataFrame({"date": pd.to_datetime(k["date"]), "KOSPI": pd.to_numeric(k["close"], errors="coerce")}) if len(k) else pd.DataFrame()
+    h = h.copy()
+    h["date"] = pd.to_datetime(h["date"])
+    base = alt.Chart(kp[kp["date"] >= h["date"].min()]) if len(kp) else None
+
+    def dual(series: pd.DataFrame, cols: dict, title: str, y_title: str, rules: list | None = None, shade=None):
+        long = series.melt("date", value_vars=list(cols), var_name="k", value_name="v").dropna()
+        long["구분"] = long["k"].map(cols)
+        right = alt.Chart(long).mark_line(strokeWidth=1.8, interpolate="monotone").encode(
+            x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0, grid=False)),
+            y=alt.Y("v:Q", title=y_title, axis=alt.Axis(orient="right")),
+            color=alt.Color("구분:N", scale=alt.Scale(domain=list(cols.values()), range=["#F59E0B", "#0F9D8A", "#E5484D", "#8B5CF6"][:len(cols)]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("v:Q", format=",.1f")])
+        layers = []
+        if shade is not None and len(shade):
+            layers.append(alt.Chart(shade).mark_rect(color="#F8B4B8", opacity=.35).encode(x="s:T", x2="e:T"))
+        if base is not None:
+            layers.append(base.mark_line(color="#3B6FD8", strokeWidth=1.6, interpolate="monotone").encode(
+                x="date:T", y=alt.Y("KOSPI:Q", title="KOSPI", scale=alt.Scale(zero=False), axis=alt.Axis(orient="left")),
+                tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("KOSPI:Q", format=",.2f")]))
+        rlay = [right] + [alt.Chart(pd.DataFrame({"y": [y]})).mark_rule(color=c, strokeDash=[4, 4]).encode(y="y:Q") for y, c in (rules or [])]
+        ch = alt.layer(*layers, alt.layer(*rlay)).resolve_scale(y="independent").properties(height=280, title=title)
+        st.altair_chart(ch, width="stretch")
+
+    # 20/200일선 하락비율 — 20일선 하락비율 80%↑ 구간 음영(과매도 접근)
+    hot = h["down20"] >= 80
+    grp = (hot != hot.shift()).cumsum()
+    shade = pd.DataFrame([{"s": g["date"].iloc[0], "e": g["date"].iloc[-1] + pd.Timedelta(days=1)} for _, g in h[hot].groupby(grp[hot])])
+    dual(h[["date", "down20", "down200"]], {"down200": "200일선 하락비율", "down20": "20일선 하락비율"},
+         "20일선 / 200일선 하락비율 (음영 = 20일선 하락비율 80%↑)", "%", shade=shade)
+    st.caption("이평선 아래 종목 비율 — 높을수록 약세장. 20일선 90%↑는 통상 과매도권(분할 저가매수는 가치 계좌), 20%↓는 과열권.")
+    if h["nh_pct"].notna().any():
+        dual(h[["date", "nh_pct", "nl_pct"]], {"nh_pct": "52주 신고가 비율", "nl_pct": "52주 신저가 비율"},
+             "52주 신고가 / 신저가 비율", "%")
+        last = h.dropna(subset=["net"]).iloc[-1]
+        st.caption(f"오늘 신고가 {last['nh']:.0f} · 신저가 {last['nl']:.0f} · 순증 {last['net']:+.0f} — 순증이 양이면 신고가 우세(돌파매매 환경), 음이면 신저가 우세.")
+    if h["adr"].notna().any():
+        dual(h[["date", "adr"]], {"adr": "ADR(20일)"}, "ADR — 20일 상승 종목 합 ÷ 하락 종목 합 × 100", "ADR",
+             rules=[(120, "#E5484D"), (100, "#9CA3AF"), (75, "#1F66C9")])
+        st.caption("100 기준선 위면 매수 우위, 120 이상 과열, 75 이하 침체.")
+    if dp is not None and len(dp) >= 2:
+        d2 = dp.copy()
+        d2["date"] = pd.to_datetime(d2["date"])
+        d2["예탁금(조)"], d2["신용잔고(조)"] = d2["deposit"] / 10000, d2["credit"] / 10000
+        long = d2.melt("date", value_vars=["예탁금(조)", "신용잔고(조)"], var_name="구분", value_name="조")
+        st.altair_chart(alt.Chart(long).mark_line(strokeWidth=1.8, point=True).encode(
+            x=alt.X("date:T", title=None, axis=alt.Axis(format="%m/%d", labelAngle=0)),
+            y=alt.Y("조:Q", title="조원"), color=alt.Color("구분:N", scale=alt.Scale(range=["#2B7FF0", "#E5484D"]),
+                                                       legend=alt.Legend(orient="top", title=None)),
+            tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("조:Q", format=".2f")],
+        ).properties(height=240, title="증시 자금 — 투자자예탁금 · 신용잔고"), width="stretch")
+        st.caption("예탁금 = 주식 사려고 대기 중인 돈 · 신용잔고 = 빚내서 산 돈. 신용잔고/예탁금이 높을수록 반대매매 위험이 커요. 출처: 네이버 금융 증시자금동향.")
+    st.caption(f"시장 체력은 전체 상장사가 아니라 보드에 올라온 국내 {int(h['n'].iloc[-1])}종목의 일봉으로 계산한 근사치예요 "
+               "(사이드바 종목 범위를 '주요500+신고가'로 두면 시장 전체에 가까워져요).")
+
+
 def render_market_signal(df: pd.DataFrame):
     _sec_h("🚦 시장 신호", "오닐의 분산일·FTD로 지금 시장이 어디쯤인지 — 상승 추세 · 상승 둔화 · 조정 국면 · 반등 시도")
     d = msig.MKT_DEFAULTS
@@ -7496,6 +7562,10 @@ def render_market_signal(df: pd.DataFrame):
     worst = max(ms, key=lambda m: {"corr": 3, "rally": 2, "press": 1, "up": 0}[m["state"]])
     head, body = msig.action_text(worst)
     st.markdown(f"<div class='verdict'><b>{head}</b><br>{body}</div>", unsafe_allow_html=True)
+    try:
+        _render_health_charts(df)
+    except Exception as _e:  # noqa: BLE001
+        st.caption(f"시장 체력 차트를 그리지 못했어요({type(_e).__name__}).")
     if not all(m["has_vol"] for m in ms):
         st.caption("⚠️ 지수 거래량을 못 받은 날이 있어 분산일·FTD 거래량 조건을 일부 건너뛰었어요.")
 
@@ -9229,6 +9299,29 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 # ─────────────────────────── 🎯 대시보드(10/28 시안): 지금 살 종목 · 왜 · 보유 대응 ───────────────────────────
+NOW_CSS = """
+.db-now{margin-bottom:1rem}
+.db-nwg{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
+.db-nw{border:1px solid var(--ln);border-radius:14px;padding:.75rem .85rem}
+.db-nw .h{display:flex;justify-content:space-between;align-items:baseline}
+.db-nw .h b{font-size:1.05rem;font-weight:850;color:#111827}.db-nw .h span{font-size:.86rem;font-weight:800}
+.db-nw .ex{border-radius:12px;text-align:center;padding:.6rem .4rem;margin:.5rem 0 .25rem}
+.db-nw .ex b{display:block;font-size:1.7rem;font-weight:900;line-height:1.15}
+.db-nw .ex small{font-size:.78rem;font-weight:700;color:#4B5563}
+.db-nw .ex-w{font-size:.76rem;color:#6B7280;text-align:center;margin-bottom:.35rem}
+.db-nw .kv{display:flex;justify-content:space-between;border-top:1px solid #F1F3F8;padding:.45rem .1rem;font-size:.88rem}
+.db-nw .kv span{color:#4B5563;font-weight:600}.db-nw .kv b{color:#111827;font-weight:850}
+.db-mtg{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem;margin-top:.9rem}
+.db-mth{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.35rem}
+.db-mth b{font-size:.98rem;font-weight:850;color:#111827}.db-mth small{font-size:.74rem;color:#9CA3AF}
+.db-mts{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+.db-mts .mt{background:#F7F9FC;border-radius:12px;padding:.55rem .7rem}
+.db-mts .mt small{display:block;font-size:.76rem;color:#6B7280}
+.db-mts .mt b{display:block;font-size:1.25rem;font-weight:900;color:#111827;margin:.1rem 0}
+.db-mts .mt i{font-style:normal;font-size:.74rem;font-weight:800}
+.db-mts .mt em{display:block;font-style:normal;font-size:.7rem;color:#9CA3AF;margin-top:.05rem}
+@media (max-width:900px){.db-nwg,.db-mtg{grid-template-columns:1fr}}
+"""
 DB_CSS = """
 <style>
 @import url('https://cdn.jsdelivr.net/npm/@sun-typeface/suit@2.0.5/fonts/variable/woff2/SUIT-Variable.css');
@@ -9364,6 +9457,7 @@ DB_CSS = """
 .db-fx.rl em{color:#7C5CF0;background:#F1EEFE}.db-fx.gd em{color:#15803D;background:#E9F7EE}
 .db-concl .db-fx em{background:#fff}
 .db-rule b{font-weight:850;color:#111827}
+""" + NOW_CSS + """
 .db .db-a{font-family:'Pretendard Variable',Pretendard,'Malgun Gothic','Apple SD Gothic Neo',sans-serif!important}
 .db-step .x{margin:.25rem 0 0;font-size:0.88rem;color:#4B5563;line-height:1.5}
 .db-step{align-items:start}.db-step .r{margin-top:.15rem}
@@ -9394,6 +9488,118 @@ _DB_SHORT = {
 _IDX_EN = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
 _CLOCK = ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2B7FF0" stroke-width="2.2" stroke-linecap="round">'
           '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>')
+
+
+def load_health(df: pd.DataFrame) -> pd.DataFrame:
+    """시장 체력(20/200일선 하락비율 · 52주 신고가/신저가 · ADR) — 보드 국내 일봉으로 계산, 5분 기억."""
+    return data.market_health(_hist_store()["data"], _QUOTES)
+
+
+def load_deposits() -> pd.DataFrame:
+    return swr(("deposits",), 3600, lambda: data.fetch_deposits(), "증시 자금(예탁금·신용잔고)을 불러오는 중이에요.")
+
+
+def _hl_tone(kind: str, v) -> tuple[str, str]:
+    """지표 값 → (색, 한 줄 해석). 기준은 스탁이지 읽는 법 · 내 원칙과 같은 숫자."""
+    if v is None or v != v:
+        return "#9CA3AF", "-"
+    if kind == "down20":
+        return ("#1F66C9", "과매도권(90%↑)") if v >= 90 else (("#1F66C9", "과매도 접근(80%↑)") if v >= 80 else
+                (("#B45309", "약세(60%↑)") if v >= 60 else (("#E5484D", "과열권(20%↓)") if v <= 20 else ("#6B7280", "중립"))))
+    if kind == "down200":
+        return ("#1F66C9", "장기 약세(70%↑)") if v >= 70 else (("#15803D", "장기 강세(30%↓)") if v <= 30 else ("#6B7280", "중립"))
+    if kind == "net":
+        return ("#15803D", "신고가 우세") if v > 0 else (("#B45309", "신저가 우세") if v < 0 else ("#6B7280", "균형"))
+    if kind == "adr":
+        return ("#E5484D", "과열(120↑)") if v >= 120 else (("#15803D", "매수 우위(100↑)") if v >= 100 else
+                (("#1F66C9", "침체(75↓)") if v <= 75 else ("#6B7280", "매도 우위(100↓)")))
+    if kind == "credit_osc":
+        return ("#E5484D", "빚투 증가") if v > 1 else (("#1F66C9", "빚투 감소") if v < -1 else ("#6B7280", "보합"))
+    if kind == "credit_ratio":
+        return ("#E5484D", "레버리지 높음(35%↑)") if v >= 35 else ("#6B7280", "보통")
+    return "#6B7280", ""
+
+
+def market_now(df: pd.DataFrame) -> dict:
+    """'지금 여긴' 숫자 모음 — 판단 보드 · 시장 신호 탭이 같이 써요."""
+    msigs = market_signals()
+    hist_idx = load_indexes()
+    idx = {}
+    for name, sym in data.MARKETS.items():
+        m = msigs.get(name)
+        sm = data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}
+        ph = scout.index_phase(m)
+        rng, why = data.exposure_for(ph["phase"] if ph else None, sm.get("above60"))
+        lf = (m or {}).get("last_ftd")
+        idx[name] = {"state": (m or {}).get("state_txt", "-"), "em": (m or {}).get("em", "⚪"), "phase": ph,
+                     "exp": rng, "exp_why": why, "dd": (m or {}).get("dd"), "q50": (m or {}).get("q50"),
+                     "ftd": pd.Timestamp(lf["date"]) if lf else None, "ftd_res": lf["result"] if lf else None,
+                     "above60": sm.get("above60"), "dist60": sm.get("dist60"), "last": sm.get("last"), "chg": sm.get("change")}
+    try:
+        h = load_health(df)
+    except Exception:  # noqa: BLE001
+        h = pd.DataFrame()
+    hl = h.dropna(subset=["down20"]).iloc[-1] if len(h) else None
+    hn = h.dropna(subset=["net"]).iloc[-1] if len(h) and h["net"].notna().any() else None
+    try:
+        dp = load_deposits()
+    except Exception:  # noqa: BLE001
+        dp = pd.DataFrame()
+    dl = dp.iloc[-1] if len(dp) else None
+    return {"idx": idx, "health": h, "h_last": hl, "h_net": hn, "dep": dp, "d_last": dl}
+
+
+def _now_card(mn: dict) -> str:
+    """판단 보드 '지금 여긴' — 지수별 국면·권장 노출·분산일·마지막 FTD + 시장 체력 + 증시 자금(모두 숫자)."""
+    esc = html.escape
+    cols = []
+    for name, x in mn["idx"].items():
+        ok = x["state"] in ("상승 추세",)
+        col, bg = ("#15803D", "#E9F7EE") if ok else (("#B45309", "#FFF7E8") if x["state"] in ("상승 둔화", "반등 시도") else ("#C0262E", "#FDECEC"))
+        res_ = x["ftd_res"]
+        if res_ == "⏳ 진행 중" and x["state"] in ("조정 국면", "반등 시도"):
+            res_ = "이후 조정"
+        ftd = (f"{x['ftd']:%y.%m.%d}" + (f" · {res_}" if res_ else "")) if x["ftd"] is not None else "-"
+        dd = "-" if x["dd"] is None else f"{x['dd']}개" + (f" (평소 {x['q50']:.0f})" if x["q50"] is not None else "")
+        cols.append(f'<div class="db-nw"><div class="h"><b>{esc(name)}</b><span style="color:{col}">● {esc(x["state"])}</span></div>'
+                    f'<div class="ex" style="background:{bg};color:{col}"><b>{esc(x["exp"])}</b><small>권장 노출</small></div>'
+                    f'<div class="ex-w">{esc(x["exp_why"])}</div>'
+                    f'<div class="kv"><span>60일선 대비</span><b>{"-" if x["dist60"] is None else format(x["dist60"], "+.1f") + "%"}</b></div>'
+                    f'<div class="kv"><span>Distribution Day (25일)</span><b>{esc(dd)}</b></div>'
+                    f'<div class="kv"><span>Last Follow-Through Day</span><b>{esc(ftd)}</b></div></div>')
+    hl, hn, dl = mn["h_last"], mn["h_net"], mn["d_last"]
+
+    def met(label, v, fmt, kind, sub=""):
+        c, t = _hl_tone(kind, v)
+        vs = "-" if v is None or v != v else fmt.format(v)
+        return (f'<div class="mt"><small>{esc(label)}</small><b>{vs}</b><i style="color:{c}">{esc(t)}</i>'
+                + (f'<em>{esc(sub)}</em>' if sub else "") + '</div>')
+    n_used = int(hl["n"]) if hl is not None else 0
+    health = "".join([
+        met("20일선 하락비율", None if hl is None else hl["down20"], "{:.1f}%", "down20"),
+        met("200일선 하락비율", None if hl is None else hl["down200"], "{:.1f}%", "down200"),
+        met("신고가-신저가 순증", None if hn is None else hn["net"], "{:+.0f}", "net",
+            "" if hn is None else f"신고가 {hn['nh']:.0f} · 신저가 {hn['nl']:.0f}"),
+        met("ADR (20일)", None if hl is None else hl["adr"], "{:.1f}", "adr")])
+    money = "".join([
+        met("투자자예탁금", None if dl is None else dl["deposit"] / 10000, "{:.1f}조", ""),
+        met("신용잔고", None if dl is None else dl["credit"] / 10000, "{:.1f}조", ""),
+        met("신용잔고/예탁금", None if dl is None else dl["credit_ratio"], "{:.1f}%", "credit_ratio"),
+        met("신용잔고 오실레이터", None if dl is None else dl["credit_osc"], "{:+.1f}%", "credit_osc", "5일÷20일 평균 −1")])
+    hdate = f"{pd.Timestamp(hl['date']):%y.%m.%d}" if hl is not None else "-"
+    ddate = f"{pd.Timestamp(dl['date']):%y.%m.%d}" if dl is not None else "불러오지 못함"
+    link = "?tab=" + quote_plus("🚦 시장 신호")
+    return ('<div class="db-card db-now"><div class="db-hd"><div><h3>📍 지금 여긴</h3>'
+            '<p>지수 국면 · 권장 노출 · 분산일 · FTD — 오닐 방식 계산 + 스승님 플레이북 + 내 60일선 원칙</p></div>'
+            f'<a class="db-pill b" href="{link}" target="_self">차트로 보기 →</a></div>'
+            f'<div class="db-nwg">{"".join(cols)}</div>'
+            f'<div class="db-mtg"><div><div class="db-mth"><b>시장 체력</b><small>기준 {hdate} · 보드 국내 {n_used}종목</small></div>'
+            f'<div class="db-mts">{health}</div></div>'
+            f'<div><div class="db-mth"><b>증시 자금</b><small>기준 {ddate} · 네이버 증시자금동향</small></div>'
+            f'<div class="db-mts">{money}</div></div></div></div>')
+
+
+
 
 
 def _db_lines(text, by_mid: bool = False, lead: bool = False) -> str:
@@ -9521,8 +9727,17 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     W = scout.SCOUT_WEIGHT
 
     # ── 판단 회로: 단계마다 사실 → 원칙 → 판정
+    mn = market_now(df)
+    _hl, _hn, _dl = mn["h_last"], mn["h_net"], mn["d_last"]
+    hfacts = []
+    if _hl is not None:
+        hfacts.append(f"20일선 하락비율 {_hl['down20']:.1f}% ({_hl_tone('down20', _hl['down20'])[1]}) · "
+                      f"200일선 {_hl['down200']:.1f}%" + (f" · ADR {_hl['adr']:.1f} ({_hl_tone('adr', _hl['adr'])[1]})" if _hl['adr'] == _hl['adr'] else ""))
+    if _hn is not None:
+        hfacts.append(f"52주 신고가 {_hn['nh']:.0f} · 신저가 {_hn['nl']:.0f} → 순증 {_hn['net']:+.0f} ({_hl_tone('net', _hn['net'])[1]})")
+    hfacts.append("권장 노출 " + " · ".join(f"{n} {x['exp']}" for n, x in mn["idx"].items()))
     s1 = {"t": "시장 국면", "ok": allowed,
-          "facts": [f"{n}: {scout.PLAYBOOK[v['phase']]['title'].split(' — ')[0]} — {v['why']}" for n, v in phases.items() if v],
+          "facts": [f"{n}: {scout.PLAYBOOK[v['phase']]['title'].split(' — ')[0]} — {v['why']}" for n, v in phases.items() if v] + hfacts,
           "rule": "스승님: 조정 중엔 사지 않는다. 반등 3일차 강세 · FTD가 나와야 정찰병부터 (FTD는 '허락'이지 '공격'이 아님)",
           "v": "정찰병 허락" if allowed else "매수 보류 — 반등 확인 전"}
     s2 = {"t": "지수 60일선", "ok": market_ok,
@@ -9662,6 +9877,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
          f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" / ".join(why_bits) or "막힌 단계 없음")}</p><p><b>할 일</b> {esc(concl_act)}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
          f'<div class="db-stats">{"".join(stats)}</div></div>',
+         _now_card(mn),
          _db_bigpicture(df),
          '<div class="db-grid">']
     # 왼쪽: TOP 6 — 종목마다 '왜'는 배지 3개, '어떻게'는 손절·3R 한 줄
@@ -9756,7 +9972,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
                              + f" · 고점 대비 {m['draw']:+.1f}%"
                              + (f" · 60일선 {sm['dist60']:+.1f}%" if sm.get("dist60") is not None else "")
                              + f" · 분산일 {m['dd']}개(평소 {m['q50']:.0f})")
-    breadth = [f"오늘 52주 신고가 {n_nh}개 (국내 보드 종목)"]
+    breadth = hfacts[:2] + [f"오늘 52주 신고가 {n_nh}개 (국내 보드 종목)"]
     if d20 is not None:
         breadth.append(f"20 DOWN {d20:.0f}% — 20일선 아래 종목 비율" + (" · 90%↑ 과매도권" if d20 >= 90 else (" · 80%↑ 과매도 접근" if d20 >= 80 else "")))
     eb_lines = [f"{r.name} — 매물대 {r.node_lo:,.0f}~{r.node_hi:,.0f} 돌파 · 거래량 {r.vx:.1f}배 · 위 매물 {r.above:.0f}%"

@@ -131,7 +131,7 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
            "draw": (c[last] / peak_all - 1) * 100, "close": float(c[last]), "date": d[last],
            "low": float(l[low_i]) if low_i is not None and state[last] in ("corr", "rally") else None,
            "rally_date": d[rally_i] if rally_i is not None and state[last] == "rally" else None,
-           "ftd_low": ftd_low, "last_ftd": ftds[0] if ftds else None, "has_vol": bool(has_vol),
+           "ftd_low": ftd_low, "last_ftd": ftds[-1] if ftds else None, "has_vol": bool(has_vol),   # last_ftd = 가장 최근(ftds는 오래된 순)
            # 정찰병 신호(scout.py)용: 조정 바닥·그 전 고점 날짜, 오늘 등락·거래량 증가·종가 위치
            "low_date": d[low_i] if low_i is not None else None,
            "peak_date": d[max(0, low_i - 250) + int(np.nanargmax(c[max(0, low_i - 250):low_i + 1]))] if low_i is not None else None,
