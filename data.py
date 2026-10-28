@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-18-barfix"
+DATA_VERSION = "2026-10-28-h52backed"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -562,7 +562,12 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         live_hi = max([float(x) for x in (q_high, price) if x] or [0.0])
         final_hi = max(float(off_hi), live_hi)      # 공식값이 늦게 바뀌는 장중 신고가는 실시간 값이 우선
         h52_diff = (high52_calc / final_hi - 1) * 100
-        if abs(h52_diff) > H52_TOL:
+        # (2026.10.28) 네이버 공식 52주 값은 KRX·NXT 일봉 어디에도 없는 가격일 때가 많아요(117종목, 최대 +20%:
+        # 삼성SDI 공식 820,000 vs 일봉·다음 723,000). 일봉에 그 근처(1.5% 안) 고가가 실제로 있을 때만 공식값을 써요.
+        backed_hi = live_hi >= final_hi or bool(np.any(np.abs(w_hi[np.isfinite(w_hi)] / final_hi - 1) <= 0.015))
+        if abs(h52_diff) > H52_TOL and not backed_hi:
+            h52_src = f"일봉 계산(네이버 공식 {final_hi:,.0f}은 일봉에 없음)"
+        elif abs(h52_diff) > H52_TOL:
             h52_fixed, h52_src = True, "네이버 공식(교정)"
             high52 = final_hi
             if live_hi >= final_hi:
@@ -575,7 +580,8 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     if off_lo:
         live_lo = min([float(x) for x in (q_low, price) if x] or [float(off_lo)])
         final_lo = min(float(off_lo), live_lo)
-        if abs(low52_calc / final_lo - 1) * 100 > H52_TOL:
+        backed_lo = live_lo <= final_lo or bool(np.any(np.abs(w_lo[np.isfinite(w_lo)] / final_lo - 1) <= 0.015))
+        if abs(low52_calc / final_lo - 1) * 100 > H52_TOL and backed_lo:
             low52 = final_lo
             h52_fixed = True
             if h52_src != "네이버 공식(교정)":
@@ -2286,6 +2292,14 @@ def is_halted(hist: pd.DataFrame | None, quote: dict | None, days: int = 5) -> b
     이런 종목은 가격이 멈춰 있어서 52주 최고 = 현재가, 신고가까지 0%처럼 보이지만 실제로는 살 수 없어요."""
     if hist is None or len(hist) < days or "volume" not in hist:
         return False
+    # (2026.10.28) 상장폐지·장기 정지: 실시간 시세가 없고 마지막 일봉이 30일 넘게 지났으면(예: 연우, 2024.3에 멈춤)
+    if not (quote and quote.get("price")):
+        try:
+            last = pd.Timestamp(hist["date"].iloc[-1]).date()
+            if (now_kst().date() - last).days > 30:
+                return True
+        except (KeyError, ValueError, TypeError):
+            pass
     v = hist["volume"].to_numpy()[-days:]
     try:
         if (np.nan_to_num(v.astype(float)) > 0).any():

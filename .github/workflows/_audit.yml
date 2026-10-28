@@ -5,7 +5,7 @@ on:
 permissions:
   contents: write
 env:
-  FULL: '0'
+  FULL: '1'
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -17,6 +17,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - name: diag 52w
+        if: env.FULL == '2'
         continue-on-error: true
         run: mkdir -p out && timeout 900 python _audit/diag52.py 2>&1 | tee out/diag_log.txt
       - name: fact check

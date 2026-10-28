@@ -258,7 +258,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
-DATA_VERSION = "2026-10-18-barfix"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-28-h52backed"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
