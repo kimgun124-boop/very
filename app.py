@@ -9606,8 +9606,7 @@ def _now_card(mn: dict) -> str:
         met("신용잔고 오실레이터", None if dl is None else dl["credit_osc"], "{:+.1f}%", "credit_osc", "5일÷20일 평균 −1")])
     hdate = f"{pd.Timestamp(hl['date']):%y.%m.%d}" if hl is not None else "-"
     _dg = getattr(data, "DEPOSIT_DIAG", {}) or {}
-    ddate = f"{pd.Timestamp(dl['date']):%y.%m.%d}" if dl is not None else (
-        "불러오지 못함 (" + (_dg.get("error") or f"HTTP {_dg.get('status', '?')} · 줄 {_dg.get('trs', '?')} · 읽은 행 {_dg.get('rows', 0)} · {_dg.get('url', '')} · {_dg.get('head', '')[:160]}") + ")")
+    ddate = f"{pd.Timestamp(dl['date']):%y.%m.%d}" if dl is not None else "불러오지 못함 — 네이버 페이지 형식이 바뀌어 다른 출처 확인 중"
     link = "?tab=" + quote_plus("🚦 시장 신호")
     return ('<div class="db-card db-now"><div class="db-hd"><div><h3>📍 지금 여긴</h3>'
             '<p>지수 국면 · 권장 노출 · 분산일 · FTD — 오닐 방식 계산 + 스승님 플레이북 + 내 60일선 원칙</p></div>'
