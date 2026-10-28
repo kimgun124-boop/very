@@ -3973,6 +3973,10 @@ PRINCIPLES = [
         "IPO 셋업: 상장 첫날 시가를 넘을 때",
         "실적이 어긋나면 — 추세 계좌: 맞았냐보다 추세가 꺾였냐 / 가치 계좌: 단순히 다음 분기로 밀린 거면 홀딩",
         "고멀티플: 추세 계좌에선 시장이 높게 쳐준다는 뜻이라 오히려 괜찮음, 가치 계좌에선 후순위"]),
+    ("선매입 · 매물대 돌파", [
+        "52주 신고가 전이라도: 인더스트리 액션 섹터 + 거래량 1.5배↑ 양봉 + 1년 매물대의 큰 덩어리를 종가로 돌파 + RS 70↑",
+        "손절은 뚫은 매물대 아래(최대 1R 8%) · 위에 남은 매물 비율이 낮을수록, 다음 매물대가 멀수록 가볍다",
+        "비중은 판단 회로의 결론(매수 1유닛 / 정찰병 3%)을 따른다 — 막힌 단계가 있으면 '선매입 후보'로만 본다"]),
     ("스승님 10/28 · 반등장 정찰병", [
         "반등 3일차가 강세로 끝나면 다음 날 시초가부터 정찰병 — 정석 FTD를 기다리지 않아도 됨",
         "의심스러운 FTD가 정석보다 좋을 때가 있다 — 주가는 의심의 벽을 타고 오른다",
@@ -9354,6 +9358,12 @@ DB_CSS = """
 .db-bpi small{display:block;font-size:.78rem;color:#6B7280;margin:.15rem 0 .4rem}
 .db-bpc{display:inline-block;font-size:.82rem;font-weight:800;background:#fff;border:1px solid #ECEEF5;border-radius:999px;padding:.15rem .55rem;margin:0 .3rem .3rem 0}
 @media (max-width:900px){.db-bpg{grid-template-columns:minmax(0,1fr)}}
+.db-fx{display:grid;grid-template-columns:38px 1fr;gap:.45rem;margin-top:.3rem;font-size:0.86rem;color:#374151}
+.db-fx em{font-style:normal;font-size:0.72rem;font-weight:800;color:#64748B;background:#F1F5F9;border-radius:6px;text-align:center;
+          padding:.1rem 0;align-self:start;margin-top:.15rem}
+.db-fx.rl em{color:#7C5CF0;background:#F1EEFE}.db-fx.gd em{color:#15803D;background:#E9F7EE}
+.db-concl .db-fx em{background:#fff}
+.db-rule b{font-weight:850;color:#111827}
 .db .db-a{font-family:'Pretendard Variable',Pretendard,'Malgun Gothic','Apple SD Gothic Neo',sans-serif!important}
 .db-step .x{margin:.25rem 0 0;font-size:0.88rem;color:#4B5563;line-height:1.5}
 .db-step{align-items:start}.db-step .r{margin-top:.15rem}
@@ -9494,23 +9504,94 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     ph_key = phase or "corr"
     esc = html.escape
 
-    # ── TOP 6: 원칙 매수 → 정찰병 → (남는 칸) 준비 종목
+    # ── 사실(숫자) 모으기
+    hist_idx = load_indexes()
+    idx_sm = {n: (data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}) for n, sym in data.MARKETS.items()}
+    kr = df[df["code"].map(data.is_kr)]
+    n_nh = int((pd.to_numeric(kr["days_since_high"], errors="coerce") == 0).sum()) if "days_since_high" in kr else 0
+    leaders = lead_groups(df)
+    n_lead, lead_names = len(leaders), [g for g, _ in leaders][:3]
+    n_main = len(sig.get("signals") or [])
+    eb = tab_memo("early_buys", (tuple(ia_secs), len(df)),
+                  lambda: scout.early_buys(df, sig.get("scan"), histories, quotes, set(ia_secs)))
+    n_eb = len(eb)
+    n_go = int((cands["tier"] == "투입").sum()) if len(cands) else 0
+    hrows, hmsg, urgent = _tb_holdings(df, phase)
+    d20 = sig.get("d20")
+    W = scout.SCOUT_WEIGHT
+
+    # ── 판단 회로: 단계마다 사실 → 원칙 → 판정
+    s1 = {"t": "시장 국면", "ok": allowed,
+          "facts": [f"{n}: {scout.PLAYBOOK[v['phase']]['title'].split(' — ')[0]} — {v['why']}" for n, v in phases.items() if v],
+          "rule": "스승님: 조정 중엔 사지 않는다. 반등 3일차 강세 · FTD가 나와야 정찰병부터 (FTD는 '허락'이지 '공격'이 아님)",
+          "v": "정찰병 허락" if allowed else "매수 보류 — 반등 확인 전"}
+    s2 = {"t": "지수 60일선", "ok": market_ok,
+          "facts": [f"{n} 60일선 대비 {sm['dist60']:+.1f}% ({'위' if sm.get('above60') else '아래'})" for n, sm in idx_sm.items() if sm.get("dist60") is not None],
+          "rule": "내 원칙: 코스피·코스닥 둘 다 60일선 위여야 본매매(유닛). 하나라도 아래면 정찰병 크기만",
+          "v": "본매매 가능" if market_ok else ("정찰병 크기만" if market_ok is False else "확인 중")}
+    s3 = {"t": "주도 · 액션 섹터", "ok": bool(n_lead or ia_secs),
+          "facts": [f"주도섹터(5일 안 신고가 2종목↑) {n_lead}개" + (f": {', '.join(lead_names)}" if lead_names else ""),
+                    f"오늘 인더스트리 액션 {len(ia_secs)}개" + (f": {', '.join(ia_secs[:3])}" if ia_secs else "")],
+          "rule": "내 원칙: 주도섹터가 없으면 돌파매매 안 함 · 스승님: 그날 액션 섹터의 선도주가 1순위",
+          "v": "매수할 섹터 있음" if (n_lead or ia_secs) else "섹터 없음 — 돌파매매 쉼"}
+    s4 = {"t": "종목 조건", "ok": bool(n_main or n_eb or n_go),
+          "facts": [f"원칙 전부 통과(52주 신고가 돌파) {n_main}개",
+                    f"선매입(매물대 돌파 + 거래량 1.5배↑ + 액션 섹터) {n_eb}개",
+                    f"견조주 중 거래량 실은 신고가 {n_go}개" + (f" (견조주 {n_res}개 중)" if n_res is not None else "")],
+          "rule": "RS 70↑·지수보다 강함 · 거래량 실은 장대양봉 · 52주 신고가 또는 큰 매물대 돌파 · 영업이익 증가",
+          "v": "살 종목 있음" if (n_main or n_eb or n_go) else "조건 맞는 종목 없음"}
+    s5 = {"t": "리스크", "ok": urgent == 0,
+          "facts": [f"정찰병 {W:.0f}% × 손절 8% = 종목당 계좌 위험 약 {W * 0.08:.2f}%",
+                    "1유닛 6% × 8% ≈ 0.48% · 한도 종목당 1.5%, 최대 8종목"]
+          + ([f"보유 중 손절·익절 처리할 종목 {urgent}개"] if urgent else []),
+          "rule": "리스크관리 > 멘탈 > 종목 > 타점 — 보유 종목의 손절·익절이 새 매수보다 먼저",
+          "v": "새 매수 여유 있음" if urgent == 0 else "보유 정리 먼저"}
+    steps = [s1, s2, s3, s4, s5]
+
+    # ── 결론: 위에서부터 막힌 단계가 있으면 거기서 멈춤
+    if not s1["ok"]:
+        decision = "쉬기"
+    elif not s3["ok"]:
+        decision = "쉬기"
+    elif urgent:
+        decision = "보유 정리 먼저"
+    elif not s4["ok"]:
+        decision = "대기"
+    elif market_ok is not True:
+        decision = "정찰병만"
+    else:
+        decision = "매수"
+    can_buy = decision in ("매수", "정찰병만")
+    size = "1유닛(계좌 약 6%)" if decision == "매수" else f"계좌 약 {W:.0f}%"
+    stop_reasons = [f"{s_['t']} — {s_['v']}" for s_ in steps if s_["ok"] is False]
+    go_reasons = [f"{s_['t']} — {s_['v']}" for s_ in steps if s_["ok"]]
+    ok_n = sum(1 for s_ in steps if s_["ok"])
+
+    # ── TOP 6: 원칙 매수 → 선매입 → 정찰병 → (남는 칸) 준비 종목
     rows, seen = [], set()
     for x in sig.get("signals") or []:
         seen.add(x["code"])
         why = " · ".join(t for t in (f"거래량 {x['vx']:.1f}배", x["lead"], "⭐ 첫 돌파" if x["first"] else None,
-                                     "신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%") if t)
-        rows.append({"kind": "main", "tag": "원칙 매수", "code": x["code"], "name": x["name"], "group": x["group"], "price": x["price"],
-                     "chg": x["chg"], "why": why, "plan": f"손절 {x['stop']:,.0f} · 3R {x['target']:,.0f} · 1유닛"})
-    if allowed and phase != "up":
+                                     "52주 신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%", "원칙 전부 통과") if t)
+        rows.append({"kind": "main" if can_buy else "watch", "tag": "원칙 매수" if can_buy else "원칙 통과(대기)", "code": x["code"],
+                     "name": x["name"], "group": x["group"], "price": x["price"], "chg": x["chg"], "why": why,
+                     "plan": f"손절 {x['stop']:,.0f} · 3R {x['target']:,.0f} · {size}" if can_buy else None})
+    for r in eb.head(6).itertuples():
+        if r.code in seen:
+            continue
+        seen.add(r.code)
+        rows.append({"kind": "early" if can_buy else "watch", "tag": "선매입" if can_buy else "선매입 후보(대기)", "code": r.code,
+                     "name": r.name, "group": r.group, "price": r.price, "chg": r.chg, "why": r.why,
+                     "plan": (f"손절 {r.stop:,.0f}(-{r.stop_pct:.1f}%, 매물대 아래) · 3R {r.target:,.0f} · {size}" if can_buy
+                              else f"매물대 {r.node_lo:,.0f}~{r.node_hi:,.0f} 위 유지 확인")})
+    if can_buy and phase != "up":
         for r in scout.pick(cands, n=6, per_group=2).itertuples() if len(cands) else []:
             if r.code in seen:
                 continue
             seen.add(r.code)
             rows.append({"kind": "scout", "tag": "정찰병", "code": r.code, "name": r.name, "group": r.group, "price": r.price,
-                         "chg": r.chg, "why": r.why, "plan": f"손절 {r.stop:,.0f} · 3R {r.target:,.0f} · 계좌 {scout.SCOUT_WEIGHT:.0f}%"})
-    n_buy = len(rows)
-    n_main = len(sig.get("signals") or [])
+                         "chg": r.chg, "why": r.why, "plan": f"손절 {r.stop:,.0f} · 3R {r.target:,.0f} · 계좌 {W:.0f}%"})
+    n_buy = sum(1 for r in rows if r["kind"] in ("main", "early", "scout"))
     if len(rows) < 6 and len(cands):
         pool = pd.concat([scout.pick(cands, 12, 2, "투입"), scout.pick(cands, 12, 2, "대기")])
         for r in pool.itertuples():
@@ -9526,30 +9607,43 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
             st.session_state["ia_toasted"].add(x["code"])
             st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
 
-    # ── 모드
-    if n_main:
+    # ── 모드 · 한 줄 판정 (결론을 그대로 따름)
+    n_e = sum(1 for r in rows if r["kind"] == "early")
+    n_s = sum(1 for r in rows if r["kind"] == "scout")
+    n_m = sum(1 for r in rows if r["kind"] == "main")
+    if decision == "매수":
         mode, mcol, mbg, micon, mtitle = "매수 모드", "#15803D", "#E9F7EE", "✓", "매수 · 원칙 진입"
-        mdesc = f"원칙을 모두 통과한 종목 {n_main}개 — 아침·종가로 나눠 사고, 손절선을 먼저 정해 둡니다."
-        action = f"원칙 매수 {n_main}종목"
-    elif n_buy:
-        mode, mcol, mbg, micon, mtitle = "정찰병 모드", "#1A62CC", "#EAF2FE", "↗", "정찰병 · 소량 진입"
-        mdesc = f"견조주 중 오늘 신고가 가는 {n_buy}종목에 계좌 약 {scout.SCOUT_WEIGHT:.0f}%씩. 정찰병은 죽는 게 당연 — 1R 손절 그대로."
-        action = f"정찰병 투입 {n_buy}종목"
-    elif allowed:
-        mode, mcol, mbg, micon, mtitle = "정찰병 모드", "#1A62CC", "#EAF2FE", "…", "정찰병 허락 · 종목 대기"
-        mdesc = "국면은 정찰병을 허락했지만 조건 맞는 종목이 아직 없어요. 억지로 사지 않습니다."
-        action = "정찰병 허락 · 종목 대기"
+        action = f"매수 {n_buy}종목"
+    elif decision == "정찰병만":
+        mode, mcol, mbg, micon, mtitle = "정찰병 모드", "#1A62CC", "#EAF2FE", "↗", "소량 진입 · 정찰병 크기"
+        action = f"소량 진입 {n_buy}종목"
+    elif decision == "대기":
+        mode, mcol, mbg, micon, mtitle = "대기 모드", "#1A62CC", "#EAF2FE", "…", "대기 · 종목 조건 미충족"
+        action = "조건 맞는 종목 대기"
+    elif decision == "보유 정리 먼저":
+        mode, mcol, mbg, micon, mtitle = "정리 모드", "#C0262E", "#FDECEC", "!", "보유 정리 먼저"
+        action = "보유 정리 먼저"
     else:
-        mode, mcol, mbg, micon, mtitle = "관찰 모드", "#B45309", "#FFF7E8", "!", "관찰 · 진입 대기"
-        mdesc = "아직 정방향 신호가 없습니다. 반등을 예상해 먼저 사지 않습니다."
-        action = "신규 매수는 대기"
+        mode, mcol, mbg, micon, mtitle = "관찰 모드", "#B45309", "#FFF7E8", "!", "관찰 · 신규 매수 멈춤"
+        action = "신규 매수 멈춤"
     headline = f"{pb['title'].split(' — ')[0]} · {action}"
+    mdesc = {"매수": f"원칙 매수 {n_m} · 선매입 {n_e} · 정찰병 {n_s} — 아침·종가로 나눠 사고, 손절선을 먼저 정해 둡니다.",
+             "정찰병만": f"선매입 {n_e} · 정찰병 {n_s} · 원칙 매수 {n_m} — 종목당 계좌 약 {W:.0f}%, 손절 1R 그대로. 지수가 60일선을 회복하면 살아남은 종목부터 1유닛.",
+             "대기": "국면과 섹터는 허락했지만 거래량·신고가·매물대 조건을 채운 종목이 없어요. 억지로 사지 않습니다.",
+             "보유 정리 먼저": "보유 종목 중 손절선 이탈·3R 도달이 있어요. 새 매수보다 그 처리가 먼저입니다.",
+             "쉬기": "막힌 단계가 풀릴 때까지 사지 않습니다. 대신 버티는 견조주·매물대 근처 종목을 목록으로 준비합니다."}[decision]
+    concl_act = {"매수": f"종목당 {size} · 손절 -8%(선매입은 매물대 아래) · 3R에서 절반",
+                 "정찰병만": f"종목당 계좌 약 {W:.0f}% · 손절 -8%(선매입은 매물대 아래) · 같은 섹터 2개까지",
+                 "대기": "사지 않기 — 준비 목록에서 매물대 돌파·신고가가 나오는지 지켜보기",
+                 "보유 정리 먼저": "💼 내 보유에서 손절·익절부터 처리",
+                 "쉬기": "사지 않는 게 매매 — 견조주·매물대 근처 종목 목록만 준비"}[decision]
+    why_bits = (["멈추는 이유: " + " · ".join(r.split(" — ")[0] + "(" + r.split(" — ")[1] + ")" for r in stop_reasons[:2])] if stop_reasons
+                else []) + (["허락 근거: " + " · ".join(r.split(" — ")[0] for r in go_reasons[:4])] if go_reasons and can_buy else [])
 
-    # ── 지수 카드
-    hist_idx = load_indexes()
+    # ── 지수 · 진입 신호 카드
     stats = []
     for name, sym in data.MARKETS.items():
-        sm = data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}
+        sm = idx_sm.get(name) or {}
         ab = sm.get("above60")
         ic, icol, ibg = ("↑", "#16A34A", "#E7F6EC") if ab else (("↓", "#D97706", "#FEF3E2") if ab is False else ("·", "#94A3B8", "#F1F5F9"))
         ph = phases.get(name)
@@ -9557,85 +9651,24 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
             (f" · {sm['dist60']:+.1f}%" if sm.get("dist60") is not None else "")
         stats.append(f'<div class="db-st"><div class="t"><span style="background:{ibg};color:{icol}">{ic}</span>{esc(_IDX_EN.get(name, name))}</div>'
                      f'<b>60일선 {"위" if ab else ("아래" if ab is False else "-")}</b><small>{esc(note)}</small></div>')
-    sv = (f"매수 {n_main}" if n_main else (f"정찰병 {n_buy}" if n_buy else ("정찰병 허락" if allowed else "확인 대기")))
-    sic, scol, sbg = (("✓", "#16A34A", "#E7F6EC") if n_main else (("↗", "#1A62CC", "#EAF2FE") if (n_buy or allowed) else ("—", "#1A62CC", "#EAF2FE")))
+    sv = action if len(action) <= 9 else decision
+    sic, scol, sbg = (("✓", "#16A34A", "#E7F6EC") if decision == "매수" else (("↗", "#1A62CC", "#EAF2FE") if can_buy else ("—", "#B45309", "#FFF7E8")))
     stats.append(f'<div class="db-st"><div class="t"><span style="background:{sbg};color:{scol}">{sic}</span>진입 신호</div>'
-                 f'<b>{esc(sv)}</b><small>{esc((phases.get(best) or {}).get("why", "")[:28] or "정방향 신호 없음")}</small></div>')
-
-    # ── 진입 전 체크
-    kr = df[df["code"].map(data.is_kr)]
-    n_nh = int((pd.to_numeric(kr.get("days_since_high"), errors="coerce") == 0).sum()) if "days_since_high" in kr else 0
-    scan = sig.get("scan")
-    n_vol = int(((scan["vx"] >= 1.5) & scan["up"] & (pd.to_numeric(scan["chg"], errors="coerce") > 0)).sum()) if scan is not None and len(scan) else 0
-    n_lead = len(lead_groups(df))
-    checks = [("신고가", "52주 신고가 종목 2개 이상", f"오늘 {n_nh}개", n_nh >= 2),
-              ("거래량", "평균 대비 1.5배↑ 동반 상승", f"{n_vol}종목 · 액션 섹터 {len(ia_secs)}", bool(ia_secs)),
-              ("주도 섹터", "강한 종목이 섹터 안에서 확산", f"주도섹터 {n_lead}개", n_lead >= 1)]
-    ok_n = sum(1 for c in checks if c[3]) + (1 if allowed else 0)
-
-    # ── 판단 회로: 시장 → 지수 → 섹터 → 종목 → 결론
-    n_go = int((cands["tier"] == "투입").sum()) if len(cands) else 0
-    ph_short = pb["title"].split(" — ")[0]
-    sec_name = ", ".join(ia_secs[:2]) if ia_secs else (f"주도섹터 {n_lead}개" if n_lead else "없음")
-    steps = [
-        ("시장 국면", ph_short, allowed, "정찰병 허락" if allowed else "아직 대기"),
-        ("지수 60일선", " · ".join(f"{n} {'위' if (data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}).get('above60') else '아래'}"
-                                  for n, sym in data.MARKETS.items()),
-         True if market_ok else (False if market_ok is False else None), "본매매 가능" if market_ok else "정찰병만"),
-        ("주도·액션 섹터", sec_name, bool(ia_secs or n_lead), "있음" if (ia_secs or n_lead) else "돌파매매 쉼"),
-        ("종목 신호", f"원칙 매수 {n_main} · 견조주 신고가 {n_go}", bool(n_main or n_go), "후보 있음" if (n_main or n_go) else "후보 없음"),
-    ]
-    if n_main:
-        concl = ("매수", "원칙 매수 1유닛 · 아침·종가 나눠 사기 · 손절 -8%")
-    elif n_buy:
-        concl = ("정찰병", f"계좌 {scout.SCOUT_WEIGHT:.0f}%씩 · 손절 -8% · 같은 섹터 2개까지")
-    elif allowed:
-        concl = ("대기", "정찰병은 허락 — 조건 맞는 종목이 나올 때까지 사지 않기")
-    else:
-        concl = ("쉬기", "사지 않는 게 매매 — 견조주 목록만 준비")
-    ok_n = sum(1 for s_ in steps if s_[2])
-    _ph_x = {
-        "corr": "아직 바닥 확인 전이에요. 스승님: 반등을 예상해 미리 사지 않는다 — 쉴 때는 쉬는 게 최선, 대신 버티는 종목을 체크해 둔다.",
-        "rally12": "랠리 1~2일차는 지켜보는 구간이에요. 3일차가 강세로 끝나면 다음 날 시초가부터 정찰병, 그 전에 바닥을 깨면 반등 시도 실패.",
-        "day3": "3일차 강세 확인 — 스승님은 다음 날 시초가부터 정찰병을 넣기 시작했어요. 정석 FTD를 꼭 기다리지 않아도 되는 자리예요.",
-        "susp_ftd": "정석 FTD(4일차 이후 +1.25%·거래량 증가)엔 못 미쳐도 강한 반등. 스승님: 의심스러운 FTD가 때로는 더 좋다 — 주가는 의심의 벽을 타고 오른다.",
-        "ftd": "FTD는 '공격'이 아니라 '다시 볼 허락'이에요. 랠리 저점을 깨면 모든 판단을 되돌리고, 살아서 오르는 종목에만 비중을 늘려요.",
-        "press": "상승 추세지만 큰돈이 파는 흔적(분산일)이 평소보다 많아요. 신규는 정찰병 크기로, 약한 종목부터 정리.",
-        "up": "상승 추세 — 원칙대로 매매하는 장이에요. 주도섹터 대장주의 신고가 돌파를 1유닛부터 사고 이기면 키워요.",
-    }[ph_key]
-    step_x = [
-        f"{(phases.get(best) or {}).get('why', '')}. {_ph_x}",
-        ("내 원칙: 코스피·코스닥이 60일선 아래면 본매매(유닛)는 쉬고 스승님 방식의 정찰병만 넣어요. "
-         "둘 다 60일선을 회복하면 살아남은 정찰병부터 1유닛으로 키워요.") if market_ok is False else
-        ("둘 다 60일선 위 — 원칙 유닛(6% → 12% → 18%) 매매가 가능한 장이에요. 진입 때 지수가 20일선 위면 시장 유닛 +1."
-         if market_ok else "지수 일봉을 확인하는 중이에요."),
-        (f"오늘 {', '.join(ia_secs[:3])}에서 여러 종목이 같은 날 거래량 1.5배↑ 장대양봉 — 돈이 섹터로 들어오는 신호(인더스트리 액션). "
-         "그 안에서 먼저 신고가를 간 선도주가 1순위예요.") if ia_secs else
-        (f"신고가 2종목↑ 주도섹터 {n_lead}개 — 돌파매매 조건은 갖췄어요. 오늘 섹터 동반 거래량(액션)은 아직 없음."
-         if n_lead else "주도섹터가 없으면 내 원칙상 신고가 돌파매매를 쉬어요. 섹터가 같이 움직여야 개별 종목 추세도 이어져요."),
-        ((f"견조주 = 지수가 빠질 때 52주 고점 근처를 지킨 상위 20%({n_res}개). " if n_res is not None else "")
-         + "스승님이 오늘 신고가 종목을 바로 편입할 수 있었던 건 이 목록을 미리 체크해 뒀기 때문. "
-         + (f"지금 그중 거래량 실어 신고가 가는 종목 {n_go}개" if n_go else "지금 그중 신고가 가는 종목은 없어요")
-         + (f", 원칙을 모두 통과한 종목 {n_main}개." if n_main else ".")),
-    ]
-
-    why_bits = [x for x in ((phases.get(best) or {}).get("why", "").split(" — ")[0],
-                            f"액션 섹터 {ia_secs[0]}" if ia_secs else None,
-                            "60일선 아래 → 정찰병만" if market_ok is False else None) if x]
+                 f'<b>{esc(sv)}</b><small>{esc(("막힘: " + stop_reasons[0].split(" — ")[0]) if stop_reasons else "막힌 단계 없음")}</small></div>')
 
     # ── HTML
     o = [DB_CSS, '<div class="db">',
          f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
-         f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" · ".join(why_bits))}</p><p>{esc(_DB_SHORT[ph_key])}</p>'
+         f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" / ".join(why_bits) or "막힌 단계 없음")}</p><p><b>할 일</b> {esc(concl_act)}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
          f'<div class="db-stats">{"".join(stats)}</div></div>',
          _db_bigpicture(df),
          '<div class="db-grid">']
     # 왼쪽: TOP 6 — 종목마다 '왜'는 배지 3개, '어떻게'는 손절·3R 한 줄
     if n_buy:
-        t_title, t_sub = "지금 살 종목 TOP 6", "원칙 매수 → 정찰병 순 · 이름을 누르면 차트"
+        t_title, t_sub = "지금 살 종목 TOP 6", "원칙 매수 → 선매입(매물대 돌파) → 정찰병 순 · 이름을 누르면 차트"
     else:
-        t_title, t_sub = "준비 종목 TOP 6", "국면이 허락하고 신고가를 가면 정찰병 후보"
+        t_title, t_sub = "준비 종목 TOP 6", f"지금은 '{decision}' — 막힌 단계가 풀리면 먼저 볼 종목"
     link = "?tab=" + quote_plus("🏁 신고가 후보")
     o.append(f'<div class="db-card"><div class="db-hd"><div><h3>{t_title}</h3><p>{t_sub}</p></div>'
              f'<a class="db-pill b" href="{link}" target="_self">전체 보기 →</a></div>')
@@ -9645,6 +9678,8 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     def badges(why: str) -> str:
         out = []
         for w in (why or "").split(" · "):
+            if w.startswith("매물대 "):
+                w = "매물대 돌파"
             if w.startswith("조정 바닥"):
                 m_ = re.search(r"상위 (\d+)%", w)
                 w = f"견조 상위 {m_.group(1)}%" if m_ else "견조주"
@@ -9661,9 +9696,9 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
             chg = r["chg"]
             if chg is None or chg != chg:
                 continue
-            on = r["kind"] in ("main", "scout") or r["tag"] == "우선 검토"
+            on = r["kind"] in ("main", "early", "scout") or r["tag"] in ("우선 검토", "선매입 후보(대기)")
             ccol = "#E5484D" if chg > 0 else ("#1F66C9" if chg < 0 else "#6B7280")
-            tcol = {"main": "#15803D", "scout": "#1A62CC"}.get(r["kind"], "#1A62CC" if r["tag"] == "우선 검토" else "#9CA3AF")
+            tcol = {"main": "#15803D", "early": "#C2410C", "scout": "#1A62CC"}.get(r["kind"], "#1A62CC" if r["tag"] in ("우선 검토", "선매입 후보(대기)") else "#9CA3AF")
             trs.append(f'<tr><td><span class="db-rk{" on" if on else ""}">{i}</span></td>'
                        f'<td><span class="db-ar{"" if on else " off"}">{"↗" if on else "·"}</span></td>'
                        f'<td class="db-nm"><a href="?chart={esc(r["code"])}" target="_self">{esc(str(r["name"]))}</a>'
@@ -9676,6 +9711,9 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
         legend = [("#15803D", "원칙 매수", ["오늘 인더스트리 액션 섹터 + 내 원칙 전부 통과",
                                            "지수 60일선 위 · RS 70↑ · 거래량 · 장대양봉 · 저항 돌파 · 실적",
                                            "→ 1유닛, 아침·종가 나눠 사기"]),
+                  ("#C2410C", "선매입", ["52주 신고가 전이라도: 오늘 인더스트리 액션 섹터 + 거래량 1.5배↑ 양봉",
+                                       "+ 1년 매물대(가격대별 거래량) 중 큰 덩어리를 종가로 돌파 + RS 70↑",
+                                       "→ 손절은 뚫은 매물대 아래(최대 -8%), 비중은 결론(매수/정찰병)에 따라"]),
                   ("#1A62CC", "정찰병", ["조정 때 버틴 견조주 중 오늘 거래량 실어 52주 신고가",
                                        f"→ 계좌 약 {scout.SCOUT_WEIGHT:.0f}% · 손절 -8% · 같은 섹터 2개까지",
                                        "살아서 3R 쪽으로 가면 그때 키우기"]),
@@ -9687,66 +9725,85 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     else:
         o.append('<div class="db-empty">조건에 맞는 견조주 후보가 아직 없어요 — 📉 하락장 점검에서 버티는 종목부터 확인.</div>')
     o.append('</div>')
-    # 오른쪽: 판단 회로
+    # 오른쪽: 판단 회로 — 단계마다 사실 → 원칙 → 판정, 맨 아래 결론
     live = data.market_status(quotes).startswith("장중")
-    o.append(f'<div class="db-card"><div class="db-hd"><div><h3>판단 회로</h3><p>위에서 아래로 — 하나라도 막히면 그 단계에서 멈춤</p></div>'
+    o.append(f'<div class="db-card"><div class="db-hd"><div><h3>판단 회로</h3><p>사실(숫자) → 원칙 → 판정 · 위에서부터 막히면 그 단계에서 멈춤</p></div>'
              f'<span class="db-pill {"r" if live else "g"}">{"LIVE" if live else "장 마감"}</span></div>')
-    for i, (t, v, ok, res_) in enumerate(steps, 1):
+    for i, s_ in enumerate(steps, 1):
+        ok = s_["ok"]
         cls = "ok" if ok else ("no" if ok is False else "na")
-        o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{t}</b><span class="d">{esc(v)}</span>'
-                 f'<div class="x">{_db_lines(step_x[i - 1])}</div></div>'
-                 f'<span class="r">{"✓" if ok else ("✕" if ok is False else "?")} {esc(res_)}</span></div>')
-    o.append(f'<div class="db-bar"><div style="width:{ok_n / 4 * 100:.0f}%"></div></div>'
+        facts = "".join(f'<span class="ln">{esc(x)}</span>' for x in s_["facts"])
+        o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{s_["t"]}</b>'
+                 f'<div class="db-fx"><em>사실</em><div>{facts}</div></div>'
+                 f'<div class="db-fx rl"><em>원칙</em><div><span class="ln">{esc(s_["rule"])}</span></div></div></div>'
+                 f'<span class="r">{"✓" if ok else ("✕" if ok is False else "?")} {esc(s_["v"])}</span></div>')
+    o.append(f'<div class="db-bar"><div style="width:{ok_n / len(steps) * 100:.0f}%"></div></div>'
+             f'<div class="db-barl">통과 {ok_n}/{len(steps)}</div>'
              f'<div class="db-concl" style="background:{mbg};border-color:{mcol}55"><small style="color:{mcol}">결론</small>'
-             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p><div class="x">{_db_lines(mdesc)}</div></div></div></div>')
+             f'<b style="color:{mcol}">{micon} {esc(decision)}</b><p>{esc(concl_act)}</p>'
+             + (f'<div class="db-fx"><em>멈춤</em><div>' + "".join(f'<span class="ln">{esc(x)}</span>' for x in stop_reasons) + '</div></div>'
+                if stop_reasons else "")
+             + (f'<div class="db-fx gd"><em>근거</em><div>' + "".join(f'<span class="ln">{esc(x)}</span>' for x in go_reasons) + '</div></div>'
+                if go_reasons else "")
+             + f'<div class="x">{_db_lines(mdesc)}</div></div></div></div>')
 
-    # 아래 1줄: 시장 흐름 · 핵심 신호 | 보유 → 매도 판단
-    rule60 = ("코스피·코스닥 60일선 아래 → 본매매(유닛)는 쉬고 정찰병 크기만." if market_ok is False else
-              "지수 60일선 위 → 원칙 유닛 매매 가능." if market_ok else "")
-    d20 = sig.get("d20")
-    mkt_lines = [f"{pb['em']} {pb['title']}", (phases.get(best) or {}).get("why", ""), rule60]
+    # 아래 1줄: 근거 데이터 | 보유 → 매도 판단
+    idx_lines = []
+    for n, m in msigs.items():
+        sm = idx_sm.get(n) or {}
+        if m:
+            idx_lines.append(f"{n}: {m['state_txt']}" + (f" Day {m['day']}" if m.get("state") == "rally" else "")
+                             + f" · 고점 대비 {m['draw']:+.1f}%"
+                             + (f" · 60일선 {sm['dist60']:+.1f}%" if sm.get("dist60") is not None else "")
+                             + f" · 분산일 {m['dd']}개(평소 {m['q50']:.0f})")
+    breadth = [f"오늘 52주 신고가 {n_nh}개 (국내 보드 종목)"]
     if d20 is not None:
-        mkt_lines.append(f"20 DOWN {d20:.0f}%" + (" — 과매도권 (저가매수는 가치 계좌에서 3~5유닛 분할)" if d20 >= 80 else ""))
-    sigs = [("01", "#2B7FF0", "시장", "".join(f'<span class="ln{" lead" if i == 0 else ""}">{esc(x)}</span>'
-                                               for i, x in enumerate(mkt_lines) if x)),
-            ("02", "#7C5CF0", "섹터", _db_lines(step_x[2])),
-            ("03", "#16A34A", "종목", _db_lines(step_x[3]) + '<span class="ln">RS·실적·거래량을 함께 확인 — 숫자 없는 테마성 급등은 비중 축소</span>'),
-            ("04", "#F59E0B", "스승님", f'<span class="ln lead">“{esc(pb["mentor"])}”</span>'
-                                       '<span class="ln">장이 좋아질지 다시 내려갈지는 아무도 몰라요 → 정해진 규칙대로 대응</span>')]
-    hrows, hmsg, urgent = _tb_holdings(df, phase)
+        breadth.append(f"20 DOWN {d20:.0f}% — 20일선 아래 종목 비율" + (" · 90%↑ 과매도권" if d20 >= 90 else (" · 80%↑ 과매도 접근" if d20 >= 80 else "")))
+    eb_lines = [f"{r.name} — 매물대 {r.node_lo:,.0f}~{r.node_hi:,.0f} 돌파 · 거래량 {r.vx:.1f}배 · 위 매물 {r.above:.0f}%"
+                for r in eb.head(3).itertuples()]
+    sigs = [("01", "#2B7FF0", "지수", "".join(f'<span class="ln">{esc(x)}</span>' for x in idx_lines)),
+            ("02", "#7C5CF0", "시장 폭", "".join(f'<span class="ln">{esc(x)}</span>' for x in breadth)),
+            ("03", "#16A34A", "섹터", "".join(f'<span class="ln">{esc(x)}</span>' for x in s3["facts"])),
+            ("04", "#F59E0B", "선매입", "".join(f'<span class="ln">{esc(x)}</span>' for x in eb_lines)
+             or '<span class="ln">오늘 매물대를 거래량 실어 뚫은 액션 섹터 종목 없음</span>')]
     hold_html = ("".join(f'<div class="db-hold">{em} <b>{esc(n)}</b> {esc(v)}<small>{esc(a)}</small></div>' for em, n, v, a in hrows[:6])
                  if hrows else f'<div class="db-empty">{esc(hmsg or "")}</div>')
-    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>시장 흐름 · 핵심 신호</h3>'
-             '<p>시장 → 섹터 → 종목 순서로 지금 상황을 풀어서 봐요.</p></div><span class="db-pill g">오늘 기준</span></div>'
+    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>근거 데이터</h3>'
+             '<p>판단에 쓴 숫자를 그대로 — 지수 · 시장 폭 · 섹터 · 선매입</p></div><span class="db-pill g">오늘 기준</span></div>'
              + "".join(f'<div class="db-sig"><span class="n" style="background:{c}">{n}</span><b>{t}</b><span class="d">{x}</span></div>'
                        for n, c, t, x in sigs) + '</div>')
     o.append('<div class="db-card"><div class="db-hd"><div><h3>보유 → 매도 판단</h3>'
              f'<p>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else "🔴 손절 · 🔵 3R 절반 · 🟣 본절 올리기 · 🟢 유지"}</p></div>'
              f'<a class="db-pill b" href="?tab={quote_plus("💼 내 보유")}" target="_self">내 보유 →</a></div>{hold_html}'
              '<div class="db-note"><div class="db-nt">매도 기준</div>'
-             '<span class="ln">🔴 손절선 이탈 → 예외 없이 정리 (평단 -8%, ATR이 8%보다 크면 ATR)</span>'
+             '<span class="ln">🔴 손절선 이탈 → 예외 없이 정리 (평단 -8%, ATR이 8%보다 크면 ATR · 선매입은 뚫은 매물대 아래)</span>'
              '<span class="ln">🔵 3R(+24%) → 절반 익절, 나머지는 일봉 5일선이 50일선에 닿을 때</span>'
              '<span class="ln">🟣 +2R → 손절선을 본전으로, +4R → +1R로 올리기</span>'
              '<span class="ln">➕ 불타기 때 3R 익절가는 처음 가격 그대로</span>'
              f'<div class="db-nt" style="margin-top:.55rem">지금 장</div>{_db_lines(pb["hold"], by_mid=True)}</div></div></div>')
-    # 아래 2줄: 오늘 지킬 것 | 해설
-    do_now = {"corr": "사지 않기 · 버티는 견조주 목록 만들기", "rally12": "3일차 강세까지 기다리기 · 견조주 신고가 근접 체크",
-              "day3": "견조주 중 거래량 실은 신고가만 · 정찰병 3%", "susp_ftd": "액션 섹터 선도주에 정찰병 · 랠리 저점 깨면 되돌림",
-              "ftd": "살아서 오르는 정찰병에만 비중 추가", "press": "신규는 작게 · 약한 종목부터 정리",
-              "up": "주도섹터 대장주 신고가 돌파 · 1유닛부터"}[ph_key]
-    rules = [("✓", "#16A34A", do_now, pb["buy"]),
-             ("✕", "#E5484D", "물타기 · 손절 넓히기 · 같은 섹터 우르르",
-              "변동성이 커도 손절을 넓히면 손실만 커져요. 같은 섹터 정찰병을 한꺼번에 넣으면 작은 손절이 모여 계좌가 갈려요."),
-             ("✓", "#16A34A", "1R -8% · 종목당 위험 1.5% · 3R(+24%) 절반 익절",
-              "승률 30%여도 손실은 짧게, 수익은 3R 이상 길게 — 그래서 손절선을 먼저 정하고 들어가요.")]
-    notes = scout.commentary(phase, ph_txt, market_ok, d20, cands, ia_secs, n_res, n_lead)
-    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>오늘 지킬 것</h3><p>스승님 플레이북 + 내 원칙</p></div>'
-             '<span class="db-pill g">오늘 기준</span></div>'
-             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div>{esc(x)}<small>{_db_lines(y)}</small></div></div>'
-                       for m, c, x, y in rules)
+
+    # 아래 2줄: 사는 방법 | 원칙 출처
+    how = [("1", "#16A34A", "원칙 매수", "52주 신고가 돌파 + 인더스트리 액션 + 원칙 전부 통과",
+            "지수 60일선 위일 때만 · 1유닛 · 아침 1차 · 종가 2차"),
+           ("2", "#C2410C", "선매입", "신고가 전이라도 큰 매물대를 거래량 1.5배↑로 뚫고, 그 섹터에 인더스트리 액션",
+            "손절 = 뚫은 매물대 아래(최대 -8%) · 위 매물 비율이 낮을수록 가벼움 · 다음 매물대까지 여유 확인"),
+           ("3", "#1A62CC", "정찰병", "조정 때 버틴 견조주가 거래량 실어 52주 신고가",
+            f"계좌 약 {W:.0f}% · 손절 -8% · 같은 섹터 2개까지 · 살아서 3R 쪽이면 키우기"),
+           ("✕", "#E5484D", "사지 않기", "물타기 · 손절 넓히기 · 같은 섹터 우르르 · 막힌 단계가 있는데 사기",
+            "변동성이 커도 손절을 넓히면 손실만 커져요")]
+    srcs = [("FTD", "깡토 백테스트(코스피 1990~2026): 하락장 바닥 뒤엔 항상 FTD가 나왔지만 하락장 FTD 52번 중 25번은 실패 → FTD는 허락이지 공격이 아님, 점진적으로"),
+            ("견조주", "깡토 백테스트(2018.10~2026.10 하락장 56일): 견조주(고점 -8%)는 1년 +16.7%, 과대낙폭(-67%)은 1년 중앙값 -19.9% → 버틴 종목을 산다"),
+            ("신고가", "한국 연구: 52주 신고가 하나만으로는 예측력이 약하다는 결과도 있음 → 섹터 액션 · 거래량 · 매물대 · 실적과 함께 볼 때 의미"),
+            ("매물대", "위에 쌓인 거래량 = 본전 오면 팔려는 물량. 큰 매물대를 거래량 실어 뚫었다 = 그 물량을 소화 → 위 매물이 적을수록 오를 길이 가벼움"),
+            ("손익비", "승률 30%면 2.33R가 손익분기 → 3R가 최소 목표, 그래서 손절선(1R)을 먼저 정하고 들어감"),
+            ("60일선", "내 원칙: 지수가 60일선 아래면 돌파매매는 쉬는 장 — 스승님 방식의 정찰병만 허용")]
+    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>사는 방법</h3><p>신고가만 기다리지 않고 매물대 돌파로 먼저 사는 길까지</p></div>'
+             '<span class="db-pill g">원칙</span></div>'
+             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div><b>{esc(t)}</b> — {esc(x)}<small>{_db_lines(y)}</small></div></div>'
+                       for m, c, t, x, y in how)
              + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님 · {esc(pb["title"])}</small></div></div>')
-    o.append('<div class="db-card"><div class="db-hd"><div><h3>🧭 해설</h3><p>지금 장을 스승님 플레이북으로 읽고 내 원칙과 겹쳐 본 결론</p></div></div>'
-             + "".join(_db_note_row(x) for x in notes) + '</div></div>')
+    o.append('<div class="db-card"><div class="db-hd"><div><h3>원칙 출처 — 왜 이 규칙인가</h3><p>판단에 쓰는 규칙의 근거(백테스트 · 연구 · 논리)</p></div></div>'
+             + "".join(f'<div class="db-cmr"><b>{esc(k)}</b><div>{_db_lines(v)}</div></div>' for k, v in srcs) + '</div></div>')
     o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div></div>')
     out = "".join(o)
     for ch in "→↑↓←↗":            # SUIT는 화살표를 꺾쇠(> ^)처럼 그려서, 화살표만 원래 글꼴로

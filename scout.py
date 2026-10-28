@@ -277,3 +277,112 @@ def commentary(phase: str | None, ph_txt: str, market_ok: bool | None, d20: floa
     out.append("<b>보유·매도</b>: " + pb["hold"])
     out.append(f"<b>스승님</b>: “{pb['mentor']}” — 장이 좋아질지 다시 내려갈지는 모름, 정해진 규칙대로 대응")
     return out
+
+
+# ─────────────────────────── 🚀 선매입: 매물대 돌파 + 거래량 + 인더스트리 액션 ───────────────────────────
+# 52주 신고가만 기다리지 않고, 위에 쌓인 매물(가격대별 거래량)의 큰 덩어리를 거래량을 실어 뚫는 날
+# 섹터가 같이 움직이면(인더스트리 액션) 신고가 전에 먼저 산다. 손절은 뚫은 매물대 아래(최대 1R 8%).
+VP_DAYS = 250        # 매물대를 보는 기간(약 1년)
+VP_BINS = 40         # 가격 칸 수
+VP_NODE_PCT = 75     # 이 백분위 이상 거래량이 쌓인 칸 = '매물대'
+
+
+def volume_profile(d, h, l, c, v, upto: int) -> dict | None:
+    """upto(오늘) 이전 VP_DAYS 거래일로 가격대별 거래량을 만들고, 오늘 종가 기준
+    뚫은 매물대 · 위에 남은 매물 비율 · 다음 저항 · 아래 지지(매물대 위쪽)를 돌려줘요."""
+    a = max(0, upto - VP_DAYS)
+    hh, ll, cc, vv = h[a:upto], l[a:upto], c[a:upto], v[a:upto]
+    ok = np.isfinite(hh) & np.isfinite(ll) & np.isfinite(cc) & np.isfinite(vv) & (vv > 0)
+    if ok.sum() < 60:
+        return None
+    hh, ll, cc, vv = hh[ok], ll[ok], cc[ok], vv[ok]
+    lo, hi = float(np.min(ll)), float(np.max(hh))
+    if hi <= lo:
+        return None
+    edges = np.linspace(lo, hi, VP_BINS + 1)
+    tp = (hh + ll + cc) / 3
+    vol, _ = np.histogram(tp, bins=edges, weights=vv)
+    total = vol.sum()
+    if total <= 0:
+        return None
+    cut = max(np.percentile(vol, VP_NODE_PCT), vol.max() * 0.25)      # 가장 무거운 칸의 25% 이상만 '매물대'
+    heavy = [i for i in range(VP_BINS) if vol[i] >= cut and vol[i] > 0]
+    # 붙어 있는 무거운 칸을 하나의 매물대(구간)로 묶어요: (아래, 위, 거래량 비중)
+    zones, run = [], []
+    for i in heavy + [None]:
+        if run and (i is None or i != run[-1] + 1):
+            zones.append((float(edges[run[0]]), float(edges[run[-1] + 1]), float(vol[run[0]:run[-1] + 1].sum() / total * 100)))
+            run = []
+        if i is not None:
+            run.append(i)
+    C, P = float(c[upto]), float(c[upto - 1])
+    centers = (edges[:-1] + edges[1:]) / 2
+    # 오늘 뚫은 매물대: 어제 종가 ≤ 구간 위쪽 < 오늘 종가 — 그중 거래량 비중이 가장 큰 구간
+    broke = [z for z in zones if P <= z[1] < C]
+    bz = max(broke, key=lambda z: z[2]) if broke else None
+    above = vol[centers > C].sum() / total * 100
+    nxt = [z for z in zones if z[0] > C]
+    nz = min(nxt, key=lambda z: z[0]) if nxt else None
+    below = [z for z in zones if z[1] <= C]
+    sz = max(below, key=lambda z: z[1]) if below else None
+    return {"broke": bz is not None,
+            "node_lo": bz[0] if bz else None, "node_hi": bz[1] if bz else None, "node_share": bz[2] if bz else None,
+            "above": float(above),
+            "next_res": nz[0] if nz else None, "next_pct": (nz[0] / C - 1) * 100 if nz else None,
+            "support": sz[1] if sz else None, "zones": zones}
+
+
+def early_buys(df: pd.DataFrame, scan_today: pd.DataFrame | None, histories: dict, quotes: dict, ia_groups: set,
+               vol_min: float = 1.5, chg_min: float = 2.0, rs_min: float = 70, max_ext: float = 20.0,
+               max_above: float = 35.0, min_cap_eok: float = 1000) -> pd.DataFrame:
+    """선매입 후보: 오늘 인더스트리 액션 섹터 + 거래량 vol_min배↑ 양봉 + 매물대 돌파 + RS(70↑ 또는 1개월 RS 80↑)
+    + 20일선 이격 max_ext% 이하. 52주 신고가 전이어도 돼요(이미 신고가면 '신고가 돌파'로 표시)."""
+    cols = ["code", "name", "group", "price", "chg", "vx", "dcr", "rs", "node_lo", "node_hi", "node_share", "above",
+            "next_res", "next_pct", "to_res", "nh", "stop", "stop_pct", "target", "score", "why"]
+    if scan_today is None or scan_today.empty or not ia_groups:
+        return pd.DataFrame(columns=cols)
+    import data
+    keep = [k for k in ("name", "rs", "rs_1m", "cap_krw", "dist_ma20", "lead_rank", "lead_ok") if k in df]
+    t = scan_today[scan_today["group"].isin(list(ia_groups)) & (scan_today["vx"] >= vol_min) & scan_today["up"]
+                   & (pd.to_numeric(scan_today["chg"], errors="coerce") >= chg_min)]
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+    t = t.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+    num = lambda x: None if x is None or (isinstance(x, float) and x != x) else x  # noqa: E731
+    today = data.now_kst().date()
+    out = []
+    for r in t.itertuples():
+        rs, rs1 = num(getattr(r, "rs", None)), num(getattr(r, "rs_1m", None))
+        if not ((rs is not None and rs >= rs_min) or (rs1 is not None and rs1 >= 80)):
+            continue
+        cap = num(getattr(r, "cap_krw", None))
+        if cap is not None and cap / 1e8 < min_cap_eok:
+            continue
+        ext = num(getattr(r, "dist_ma20", None))
+        if ext is not None and ext > max_ext:
+            continue
+        hist = (histories.get(r.code) or (None, None, None))[1]
+        if hist is None or len(hist) < 80:
+            continue
+        d, o, h, l, c, v = data._session_bars(hist, quotes.get(r.code), today)
+        vp = volume_profile(d, h, l, c, v, len(c) - 1)
+        if not vp or not vp["broke"] or vp["above"] > max_above:
+            continue
+        C = float(c[-1])
+        stop = max(C * (1 - SCOUT_STOP / 100), vp["node_lo"] * 0.995)      # 뚫은 매물대 아래, 최대 1R 8%
+        sp = (1 - stop / C) * 100
+        nh = bool(r.brk_close)
+        lr = getattr(r, "lead_rank", None)
+        lead = getattr(r, "lead_ok", None) is True and lr == lr and lr is not None and int(lr) == 1
+        why = [f"매물대 {vp['node_lo']:,.0f}~{vp['node_hi']:,.0f} 돌파", f"거래량 {r.vx:.1f}배", "액션 섹터",
+               f"위 매물 {vp['above']:.0f}%", "52주 신고가 돌파" if nh else (f"신고가까지 {r.to_res:.1f}%" if r.to_res == r.to_res and r.to_res is not None else None),
+               f"다음 저항 +{vp['next_pct']:.0f}%" if vp["next_pct"] is not None else "위로 큰 매물대 없음",
+               "👑 대장주" if lead else None]
+        score = r.vx + (35 - vp["above"]) / 10 + (vp["node_share"] or 0) / 2 + (1.5 if lead else 0) + ((rs or 60) - 60) / 20
+        out.append({"code": r.code, "name": r.name, "group": r.group, "price": C, "chg": r.chg, "vx": r.vx, "dcr": r.dcr, "rs": rs,
+                    "node_lo": vp["node_lo"], "node_hi": vp["node_hi"], "node_share": vp["node_share"], "above": vp["above"],
+                    "next_res": vp["next_res"], "next_pct": vp["next_pct"], "to_res": r.to_res, "nh": nh,
+                    "stop": stop, "stop_pct": sp, "target": C * (1 + 3 * sp / 100), "score": score,
+                    "why": " · ".join(w for w in why if w)})
+    o = pd.DataFrame(out, columns=cols)
+    return o.sort_values("score", ascending=False).reset_index(drop=True) if len(o) else o
