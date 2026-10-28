@@ -1,0 +1,25 @@
+name: _audit (temporary)
+on:
+  push:
+    branches: [audit-tmp]
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: fact check
+        continue-on-error: true
+        run: mkdir -p out && timeout 1800 python _audit/fact_check.py out 2>&1 | tee out/fact_log.txt
+      - name: render all tabs (real data)
+        continue-on-error: true
+        run: timeout 3000 python _audit/run_tabs.py app.py out/tabs.json 2>&1 | grep -v "ScriptRunContext\|No runtime found\|st.iframe\|will be removed\|^$" | tee out/tabs_log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-out
+          path: out/
