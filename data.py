@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-18-barfix"
+DATA_VERSION = "2026-10-28-h52backed"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -368,6 +368,8 @@ def index_summary(df: pd.DataFrame) -> dict | None:
         "change": (last / prev - 1) * 100,
         "ma60": ma60,
         "above60": (last > ma60) if ma60 else None,
+        "ma20": float(close.tail(20).mean()) if len(close) >= 20 else None,
+        "above20": (last > float(close.tail(20).mean())) if len(close) >= 20 else None,
         "dist60": (last / ma60 - 1) * 100 if ma60 else None,
         "date": df["date"].iloc[-1],
     }
@@ -560,7 +562,12 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         live_hi = max([float(x) for x in (q_high, price) if x] or [0.0])
         final_hi = max(float(off_hi), live_hi)      # 공식값이 늦게 바뀌는 장중 신고가는 실시간 값이 우선
         h52_diff = (high52_calc / final_hi - 1) * 100
-        if abs(h52_diff) > H52_TOL:
+        # (2026.10.28) 네이버 공식 52주 값은 KRX·NXT 일봉 어디에도 없는 가격일 때가 많아요(117종목, 최대 +20%:
+        # 삼성SDI 공식 820,000 vs 일봉·다음 723,000). 일봉에 같은 값(0.3% 안) 고가가 실제로 있을 때만 공식값을 써요(1.5%로 두면 삼성전자 380,000처럼 1%대 어긋난 값이 들어왔어요).
+        backed_hi = live_hi >= final_hi or bool(np.any(np.abs(w_hi[np.isfinite(w_hi)] / final_hi - 1) * 100 <= H52_TOL))
+        if abs(h52_diff) > H52_TOL and not backed_hi:
+            h52_src = f"일봉 계산(네이버 공식 {final_hi:,.0f}은 일봉에 없음)"
+        elif abs(h52_diff) > H52_TOL:
             h52_fixed, h52_src = True, "네이버 공식(교정)"
             high52 = final_hi
             if live_hi >= final_hi:
@@ -573,7 +580,8 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     if off_lo:
         live_lo = min([float(x) for x in (q_low, price) if x] or [float(off_lo)])
         final_lo = min(float(off_lo), live_lo)
-        if abs(low52_calc / final_lo - 1) * 100 > H52_TOL:
+        backed_lo = live_lo <= final_lo or bool(np.any(np.abs(w_lo[np.isfinite(w_lo)] / final_lo - 1) * 100 <= H52_TOL))
+        if abs(low52_calc / final_lo - 1) * 100 > H52_TOL and backed_lo:
             low52 = final_lo
             h52_fixed = True
             if h52_src != "네이버 공식(교정)":
@@ -2284,6 +2292,14 @@ def is_halted(hist: pd.DataFrame | None, quote: dict | None, days: int = 5) -> b
     이런 종목은 가격이 멈춰 있어서 52주 최고 = 현재가, 신고가까지 0%처럼 보이지만 실제로는 살 수 없어요."""
     if hist is None or len(hist) < days or "volume" not in hist:
         return False
+    # (2026.10.28) 상장폐지·장기 정지: 실시간 시세가 없고 마지막 일봉이 30일 넘게 지났으면(예: 연우, 2024.3에 멈춤)
+    if not (quote and quote.get("price")):
+        try:
+            last = pd.Timestamp(hist["date"].iloc[-1]).date()
+            if (now_kst().date() - last).days > 30:
+                return True
+        except (KeyError, ValueError, TypeError):
+            pass
     v = hist["volume"].to_numpy()[-days:]
     try:
         if (np.nan_to_num(v.astype(float)) > 0).any():
@@ -2912,13 +2928,17 @@ def position_plan(price: float, atr: float | None, equity: float | None, p: dict
     if atr is not None and atr == atr and atr >= p["stop_pct"]:
         stop_pct = float(atr)
     out = {"stop_pct": stop_pct, "stop_price": price * (1 - stop_pct / 100),
-           "target_price": price * (1 + 3 * stop_pct / 100), "shares": None, "amount": None, "weight": None}
+           "target_price": price * (1 + 3 * stop_pct / 100), "shares": None, "amount": None, "weight": None,
+           "mkt_unit": p.get("mkt_up20") is True}
     if equity and price:
         risk_won = equity * p["risk_pct"] / 100
         shares = int(risk_won // (price * stop_pct / 100))
         shares = min(shares, int(equity // price))           # 계좌보다 크게는 못 사요
         units = max(1, int(p.get("units", 3)))
         level = min(max(1, int(p.get("unit_level", units))), units)
+        # 원칙: 진입 때 지수가 20일선 위면 시장 유닛 +1(종목당 위험 1.5%는 넘지 않게 최대 유닛까지만)
+        if p.get("mkt_up20") is True:
+            level = min(units, level + 1)
         full = shares
         shares = int(full * level / units)
         out.update(shares=shares, amount=shares * price, weight=shares * price / equity * 100,
@@ -3761,10 +3781,10 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
     price = float(live) if live else float(c[-1])
     krx_close = float(c[-1])
     hi_now = max(float(h[-1]), float(nxt_hi or 0), price)
-    # 네이버 공식 52주 최고가는 일봉에 그 근처 고가(1.5% 안)가 실제로 있을 때만 써요.
+    # 네이버 공식 52주 최고가는 일봉에 같은 고가(0.3% 안)가 실제로 있을 때만 써요.
     # (2026.10.17) HMM처럼 일봉 어디에도 없는 공식값(27,000 vs 일봉 최고 약 25,000)이 기준가가 되면 '신고가까지'가 엉뚱하게 멀어졌어요.
     def _backed(x):
-        return bool(len(prior[okp])) and bool(np.any(np.abs(prior[okp] / x - 1) <= 0.015))
+        return bool(len(prior[okp])) and bool(np.any(np.abs(prior[okp] / x - 1) <= 0.003))
     if official_high and official_high > ref * 1.003 and official_high > hi_now * 1.001 and _backed(official_high):
         ref, ref_src = float(official_high), "네이버 공식"
     if ref_override and ref_override > ref * 1.003 and ref_override > hi_now * 1.001 and _backed(ref_override):
@@ -4240,7 +4260,7 @@ def potential_groups(df: pd.DataFrame, leaders: set, near: float = 10.0, min_cou
 
 
 def ia_candidates(df: pd.DataFrame, scan: pd.DataFrame, day, ia_groups: set, p: dict | None = None,
-                  idx_rs: dict | None = None) -> pd.DataFrame:
+                  idx_rs: dict | None = None, fins: dict | None = None) -> pd.DataFrame:
     """인더스트리 액션 섹터 안에서 그날 거래량이 평소보다 높게 터진 종목 + 매수 조건 점검.
     조건: 거래량 배수 · 장대양봉 · 돌파/저항 근처 · 종가 강도 · RS(70↑ & 지수 RS 위) · 시총 · 20일선 이격"""
     p = {**IA_DEFAULTS, **(p or {})}
@@ -4270,13 +4290,19 @@ def ia_candidates(df: pd.DataFrame, scan: pd.DataFrame, day, ia_groups: set, p: 
         rs = num(r.get("rs"))
         if rs is None:
             c["rs"] = (None, "RS 없음")
+        elif not known:          # 지수 RS를 모르면 매수 후보 탭처럼 '모름'(통과 아님)
+            c["rs"] = (None, f"RS {rs:.0f} · 지수 RS 모름")
         else:
-            beat = all(rs > v for v in known.values()) if known else True
+            beat = all(rs > v for v in known.values())
             c["rs"] = (rs >= p["rs_min"] and beat, f"RS {rs:.0f}" + ("" if beat else " (지수보다 약함)"))
         cap = num(r.get("cap_krw"))
         c["cap"] = (None if cap is None else cap / 1e8 >= p["min_cap"], format_krw(cap) + "원" if cap else "시총 모름")
         ext = num(r.get("dist_ma20"))
         c["ext"] = (None if ext is None else ext <= p["max_ext"], f"20일선 {ext:+.1f}%" if ext is not None else "-")
+        # 원칙: 강하게 치고 나가도 영업이익이 늘지 않으면 배제 → 영업이익·EPS 정배열(매수 후보 탭과 같은 판정)
+        if fins is not None:
+            e = earnings_trend(fins.get(r["code"]), int(p.get("earn_years", 3))).get("earn_ok")
+            c["earn"] = (e, {True: "실적 정배열", False: "영업이익·EPS 정배열 아님", None: "실적 판정 불가(전망 없음)"}[e])
         fails = [k for k, (ok, _) in c.items() if ok is not True]
         tier = "매수 가능" if not fails else ("1개 미충족" if len(fails) == 1 else "관찰")
         rows.append({"code": r["code"], "group": r["group"], "tier": tier, "fails": fails, "checks": c,
@@ -4382,9 +4408,14 @@ def ia_buy_signals(df: pd.DataFrame, histories: dict, quotes: dict, idx_hist: di
         sub = names[names["group"] == g].sort_values("vx", ascending=False)
         out["sectors"][g] = {"label": pot.get(g, ""), "names": [f"{r.name}" for r in sub.itertuples()],
                              "sec_vx": float(ia.loc[ia["group"] == g, "sec_vx"].iloc[0] or 0)}
-    cand = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs)
-    if cand.empty:
+    pre = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs)
+    if pre.empty:
         return out
+    try:          # 실적은 후보만 받아서 확인(영업이익이 안 느는 종목은 '매수하세요'에서 빼요)
+        fins = fetch_financials_many(tuple(pre["code"]))
+    except Exception:  # noqa: BLE001
+        fins = None
+    cand = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs, fins) if fins is not None else pre
     bp = dict(BUY_DEFAULTS)
     for r in cand.itertuples():
         plan = position_plan(float(r.close), r.atr_pct, None, bp)

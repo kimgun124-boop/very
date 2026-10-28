@@ -258,7 +258,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
-DATA_VERSION = "2026-10-18-barfix"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-10-28-h52backed"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -3200,7 +3200,7 @@ def _hold_context(df: pd.DataFrame) -> dict:
             ch = pd.to_numeric(ih["close"], errors="coerce").pct_change().tail(20).abs() * 100
             vol_days = max(vol_days, int((ch >= 3).sum()))
     return {"vol_mode": vol_days >= 3, "vol_days": vol_days,
-            "ladder": (holdings.load().get("settings") or {}).get("ladder", "2R"),
+            "ladder": (holdings.load().get("settings") or {}).get("ladder", "원칙"),
             "dist_days": {k: v for k, v in dist.items() if v is not None},
             "n_above60": sum(1 for x in oks if x),
             "market_ok": None if None in oks else all(oks), "market_text": " · ".join(parts),
@@ -3479,12 +3479,14 @@ def _render_mode(store: dict, stt: dict, ctx: dict):
         st.warning(f"🌊 변동성 큰 횡보장 — 최근 20거래일 중 지수가 ±3% 넘게 움직인 날 {ctx.get('vol_days')}일. "
                    "깡토 원칙: 쿠션 있는 종목은 추세가 무너지기 전까지 홀딩, 늦게 산 종목은 손절 -5∼6%·목표 +15∼18%로 타이트하게"
                    "(손익비 1:3은 그대로, 기준 가격만 좁힘). 확신이 부족하면 비중을 줄이거나 쉬어도 돼요.")
-    cur = (store.get("settings") or {}).get("ladder", "2R")
+    cur = (store.get("settings") or {}).get("ladder", "원칙")
+    if cur not in ("원칙", "1R", "2R", "끄기"):
+        cur = "원칙"
     c1, c2 = st.columns([2, 3])
-    lad = c1.segmented_control("🪜 손절 사다리(수익이 날수록 손절선 올리기)", ["1R", "2R", "끄기"], default=cur, required=True,
+    lad = c1.segmented_control("🪜 손절 사다리(수익이 날수록 손절선 올리기)", ["원칙", "1R", "2R", "끄기"], default=cur, required=True,
                                key="hold_ladder",
-                               format_func=lambda x: {"1R": "1R 간격", "2R": "2R 간격(기본)", "끄기": "끄기"}[x],
-                               help="1R 간격: 1R 오르면 본전, 2R이면 +1R … (초보·변동성 장) / 2R 간격: 2R에 본전, 4R에 +2R … "
+                               format_func=lambda x: {"원칙": "원칙(기본)", "1R": "1R 간격", "2R": "2R 간격", "끄기": "끄기"}[x],
+                               help="원칙(기본): 2R에 본전, 4R에 +1R, 5R에 +2R … / 1R 간격: 1R 오르면 본전, 2R이면 +1R … (초보·변동성 장) / 2R 간격: 2R에 본전, 4R에 +2R … "
                                     "/ 끄기: 절반 익절 전까지 처음 손절선 유지. 익숙해지면 간격을 넓혀 가라는 게 깡토 권장")
     c2.caption("예) 손절 8%·1R 간격이면 +8%에 손절선 = 평단, +16%에 손절선 = 평단+8%. 노이즈에 털릴 수 있어 익숙해지면 2R·3R로 넓혀요.")
     if lad and lad != cur:
@@ -6884,8 +6886,64 @@ def _pct(v, d=1):
     return "-" if v is None or v != v else f"{v:+.{d}f}%"
 
 
+def _render_peer_leaders(df: pd.DataFrame):
+    """글로벌 피어 대비 강한 한국 종목: 국내 RS 70↑ + 글로벌 RS(국내+해외 피어 무리 안 백분위) 70↑ + 3개월 피어 초과."""
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    rs_min = c1.number_input("국내 RS ≥", 1, 99, 70, 5, key="pl_rs", help="원칙: RS 70 이상")
+    grs_min = c2.number_input("글로벌 RS ≥", 1, 99, 70, 5, key="pl_grs",
+                              help="같은 분류의 한국 종목 + 해외 피어를 한 무리로 놓고 매긴 RS 백분위")
+    only_ok = c3.toggle("조건 통과만", value=True, key="pl_ok")
+    t = views.kr_peer_leaders(df, rs_min, grs_min)
+    if t.empty:
+        st.info("해외 피어 일봉이 아직 없어서 비교할 수 없어요. 잠시 뒤 다시 열어 보세요.")
+        return
+    hist = load_indexes()
+    idx_rs = {n: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs") for n, sym in data.MARKETS.items()}
+    known = [v for v in idx_rs.values() if v is not None]
+    t["beat_idx"] = [None if not known or r != r or r is None else all(r > v for v in known) for r in t["rs"]]
+    ok_n = int(t["ok"].sum())
+    n_grp = t.loc[t["ok"], "group"].nunique()
+    best = t[t["ok"]].head(1)
+    tiles = [_tile(True if ok_n else None, "피어보다 강한 한국 종목", f"{ok_n}"),
+             _tile(None, "해당 분류", f"{n_grp}/{t['group'].nunique()}"),
+             _tile(None, "지수 RS", " · ".join(f"{k} {v:.0f}" for k, v in idx_rs.items() if v is not None) or "-"),
+             _tile(None, "글로벌 RS 1위", f"{best['name'].iloc[0]} {best['grs'].iloc[0]:.0f}" if len(best) else "-")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    v = t[t["ok"]] if only_ok else t
+    if v.empty:
+        st.info("조건을 모두 통과한 한국 종목이 없어요. '조건 통과만'을 끄거나 기준을 낮춰 보세요.")
+        return
+    vt = pd.DataFrame({
+        "종목": v["name"] + " · " + v["code"], "차트": "?chart=" + v["code"], "분류": v["group"],
+        "글로벌 RS": v["grs"], "무리 안 순위": v["g_rank"].astype(int).astype(str) + "/" + v["g_n"].astype(int).astype(str),
+        "국내 RS": v["rs"], "지수보다 강함": v["beat_idx"].map({True: "✓", False: "✕", None: "-"}),
+        "3개월": v["ret_3m"], "피어 3개월": v["peer_3m"], "피어 초과(3개월)": v["ex3m"],
+        "1개월": v["ret_1m"], "피어 초과(1개월)": v["ex1m"],
+        "섹터 순위": [("👑 1위" if (lr == 1 and lo) else (f"{int(lr)}위" if lr == lr and lr is not None else "-"))
+                  for lr, lo in zip(v["lead_rank"], v["lead_ok"])],
+        "현재가": v["price"], "신고가까지": v["to_high"], "피어 1위": v["peer_top"] + " " +
+        pd.to_numeric(v["peer_top_ret3m"], errors="coerce").map(lambda x: "" if x != x else f"({x:+.0f}%)"),
+        "해외 피어 분류": v["peer_groups"]})
+    pc = ["3개월", "피어 3개월", "피어 초과(3개월)", "1개월", "피어 초과(1개월)"]
+    sty = vt.style.format({**{k: "{:+.1f}%" for k in pc}, "글로벌 RS": "{:.0f}", "국내 RS": "{:.0f}",
+                           "현재가": "{:,.0f}", "신고가까지": "{:.1f}%"}, na_rep="-").map(_won_c, subset=pc)
+    st.dataframe(sty, hide_index=True, width="stretch", height=min(560, 40 + 35 * len(vt)),
+                 column_config={"종목": st.column_config.Column(pinned=True),
+                                "차트": st.column_config.LinkColumn("차트", display_text="열기")})
+    st.download_button("📥 CSV", vt.drop(columns=["차트"]).to_csv(index=False).encode("utf-8-sig"),
+                       f"피어대비_강한_한국종목_{data.now_kst():%Y%m%d}.csv", "text/csv", key="pl_dl")
+    st.caption("글로벌 RS = 같은 분류의 한국 종목과 해외 피어(보드의 해외 분류)를 한 무리로 놓고, 보드 RS와 같은 오닐식 점수"
+               "(3개월 0.4 + 6·9·12개월 각 0.2, 각 나라 통화 기준 수익률)의 백분위. 통과 = 국내 RS·글로벌 RS 기준 이상 + 3개월 수익률이 피어 중앙값보다 높음. "
+               "해외는 마지막 거래일 종가(미국은 우리 시간 새벽 마감). 매수 판단은 🎯 매수 후보 탭의 원칙 점검을 같이 보세요.")
+
+
 def render_peers(df: pd.DataFrame, histories: dict):
     _sec_h("🌏 글로벌 피어", "한국 밸류체인 분류 ↔ 해외 같은 업종(피어)·수요처 — 우리만 빠지는지, 글로벌로 같이 움직이는지")
+    pv = st.segmented_control("보기", ["🇰🇷 피어보다 강한 한국 종목", "🌏 분류별 비교"], default="🇰🇷 피어보다 강한 한국 종목",
+                              key="peer_view", label_visibility="collapsed") or "🇰🇷 피어보다 강한 한국 종목"
+    if pv == "🇰🇷 피어보다 강한 한국 종목":
+        _render_peer_leaders(df)
+        return
     rows = load_peers(df, histories)
     if not rows:
         st.info("해외 피어 일봉을 아직 못 받았어요. 잠시 뒤 다시 열어 보세요.")
@@ -7191,11 +7249,12 @@ def render_buy(df: pd.DataFrame, quotes: dict):
     _sec_h("🎯 매수 후보", "내 원칙을 모두 통과한 국내 종목만")
     p = _buy_params()
     hist = load_indexes()
-    parts, oks = [], []
+    parts, oks, up20 = [], [], {}
     for name, sym in data.MARKETS.items():
         sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
         ok = None if not sm or sm.get("above60") is None else bool(sm["above60"])
         oks.append(ok)
+        up20[name] = None if not sm else sm.get("above20")
         parts.append(f"{name} " + ("-" if ok is None else f"60일선 {'위' if ok else '아래'} {sm['dist60']:+.1f}%"))
     market_ok = None if None in oks else all(oks)
     idx_rs = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df).get("rs")
@@ -7233,7 +7292,8 @@ def render_buy(df: pd.DataFrame, quotes: dict):
     rows = []
     for x in res.itertuples():
         r, c = x.row, x.checks
-        plan = data.position_plan(float(r["price"]), r.get("atr_pct"), p["equity"], p)
+        mk_up = True if up20 and all(v is True for v in up20.values()) else None     # 코스피·코스닥 둘 다 20일선 위
+        plan = data.position_plan(float(r["price"]), r.get("atr_pct"), p["equity"], {**p, "mkt_up20": mk_up})
         sm = data.trend_summary(trends.get(x.code))
         rows.append({
             "상태": f"{BUY_TIER_STYLE[x.tier][1]} {x.tier}", "종목": x.name,
@@ -7241,6 +7301,8 @@ def render_buy(df: pd.DataFrame, quotes: dict):
             "현재가": r["price"], "신고가까지": r.get("to_high"), "돌파": _bo_full(r.to_dict()),
             "손절가": plan["stop_price"], "3R 목표가": plan["target_price"],
             "수량": plan["shares"], "매수금액": plan["amount"],
+            "유닛": (f"{plan.get('unit_level')}/{plan.get('units')}" + (" (시장 +1)" if plan.get("mkt_unit") else ""))
+            if plan.get("unit_level") else ("시장 +1" if plan.get("mkt_unit") else "-"),
             "미충족": ", ".join(labels[k].split("(")[0] for k in x.fails) or "-",
             "등락률": r["change"], "RS": r.get("rs"), "ADX": r.get("adx"), "20일선 이격": r.get("dist_ma20"),
             "돌파일 거래량": r.get("bo_vol_ratio"), "DCR": r.get("bo_dcr"), "손절폭": plan["stop_pct"],
@@ -7249,11 +7311,11 @@ def render_buy(df: pd.DataFrame, quotes: dict):
         })
     view = pd.DataFrame(rows)
     base_cols = ["상태", "종목", "섹터 순위", "현재가", "신고가까지", "돌파", "손절가", "3R 목표가"] + \
-        (["수량", "매수금액"] if p["equity"] else []) + ["미충족"]
+        (["수량", "매수금액", "유닛"] if p["equity"] else []) + ["미충족"]
     if not st.toggle("지표 자세히", key="buy_detail"):
         view = view[base_cols]
     elif not p["equity"]:
-        view = view.drop(columns=["수량", "매수금액"])
+        view = view.drop(columns=["수량", "매수금액", "유닛"])
     fmt = {"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "신고가까지": "{:+.1f}%", "RS": "{:.0f}", "ADX": "{:.0f}",
            "20일선 이격": "{:+.1f}%", "돌파일 거래량": "{:.1f}배", "DCR": "{:.0f}%", "손절가": "{:,.0f}",
            "손절폭": "{:.1f}%", "3R 목표가": "{:,.0f}", "수량": "{:,.0f}주", "매수금액": "{:,.0f}",
@@ -7278,7 +7340,7 @@ def render_buy(df: pd.DataFrame, quotes: dict):
                 st.caption("오늘 장중 돌파 — 종가가 직전 52주 최고가 위에서 마감하는지 확인.")
     with st.expander("ℹ️ 표 읽는 법"):
         st.markdown("- ⏳ 종가 확인 = 오늘 장중 돌파 · ⛔ 시장 대기 = 종목은 통과, 시장 미충족 · ⚠️ 1개 미충족 = 관심 종목(매수 대상 아님)\n"
-                    "- 손절가 = 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR) · 수량 = 계좌 1.5% 위험 · 3R 목표가에서 절반 익절\n"
+                    "- 손절가 = 현재가 기준 1R(8%, ATR이 8% 이상이면 ATR) · 수량 = 계좌 1.5% 위험 안에서 3유닛 중 지금 단계(코스피·코스닥이 모두 20일선 위면 시장 유닛 +1) · 3R 목표가에서 절반 익절\n"
                     "- 해외 종목은 제외 · 종목별 수급의 연기금·투신은 기관 합계에 포함 · 마지막 확인은 HTS 차트로")
 
 
@@ -8519,6 +8581,10 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
         oks.append(None if not sm or sm.get("above60") is None else bool(sm["above60"]))
     market_ok = None if None in oks else all(oks)
     cand = data.ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs) if not ia.empty else pd.DataFrame()
+    if not cand.empty:            # 원칙: 영업이익이 안 느는 종목은 배제 → 후보만 실적을 받아 다시 판정
+        with st.spinner("후보 실적 확인 중…"):
+            _ia_fins = load_financials(tuple(cand["code"]))
+        cand = data.ia_candidates(df, scan, day, set(ia["group"]), {**p, "earn_years": earn_years}, idx_rs, _ia_fins)
     n_buy = int((cand["tier"] == "매수 가능").sum()) if not cand.empty else 0
     tiles = [
         _tile(market_ok, "시장 60일선", " · ".join(f"{n} {'✓' if o else ('✕' if o is False else '?')}" for n, o in zip(data.MARKETS, oks))),
