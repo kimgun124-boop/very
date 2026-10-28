@@ -9231,6 +9231,14 @@ DB_CSS = """
 .db-quote{font-size:.84rem;color:#374151;border-left:3px solid var(--b);padding:.35rem .75rem;margin-top:.6rem;line-height:1.5}
 .db-quote small{display:block;font-size:.72rem;color:var(--mut);margin-top:.15rem}
 .db-hl p b{color:#111827}
+.db-step .x{margin:.25rem 0 0;font-size:.76rem;color:#4B5563;line-height:1.5}
+.db-step{align-items:start}.db-step .r{margin-top:.15rem}
+.db-concl .x{margin-top:.3rem!important;font-size:.8rem!important;color:#4B5563!important;font-weight:500!important;line-height:1.5}
+.db-note{font-size:.77rem;color:#4B5563;line-height:1.6;background:#F7F9FC;border-radius:12px;padding:.6rem .75rem;margin-top:.7rem}
+.db-note b{color:#111827}
+.db-rule{align-items:flex-start}.db-rule small{display:block;font-size:.76rem;font-weight:500;color:#6B7280;margin-top:.15rem;line-height:1.5}
+.db-cm{margin:0;padding-left:1.1rem;font-size:.82rem;color:#374151;line-height:1.65}
+.db-cm li{margin:.2rem 0}.db-cm b{color:#111827}
 @media (max-width:1100px){.db-stats{grid-template-columns:repeat(3,minmax(0,1fr));flex:1 1 100%}}
 @media (max-width:900px){.db-grid,.db-two{grid-template-columns:minmax(0,1fr)}.db-hl h2{font-size:1.3rem!important}
   .db-ck{grid-template-columns:auto 1fr auto;row-gap:.15rem}.db-ck .n{grid-row:1/3;grid-column:1}.db-ck b{grid-column:2;grid-row:1}.db-ck .d{grid-column:2;grid-row:2}.db-ck i{grid-row:1/3;grid-column:3}}
@@ -9419,6 +9427,30 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     else:
         concl = ("쉬기", "사지 않는 게 매매 — 견조주 목록만 준비")
     ok_n = sum(1 for s_ in steps if s_[2])
+    _ph_x = {
+        "corr": "아직 바닥 확인 전이에요. 스승님: 반등을 예상해 미리 사지 않는다 — 쉴 때는 쉬는 게 최선, 대신 버티는 종목을 체크해 둔다.",
+        "rally12": "랠리 1~2일차는 지켜보는 구간이에요. 3일차가 강세로 끝나면 다음 날 시초가부터 정찰병, 그 전에 바닥을 깨면 반등 시도 실패.",
+        "day3": "3일차 강세 확인 — 스승님은 다음 날 시초가부터 정찰병을 넣기 시작했어요. 정석 FTD를 꼭 기다리지 않아도 되는 자리예요.",
+        "susp_ftd": "정석 FTD(4일차 이후 +1.25%·거래량 증가)엔 못 미쳐도 강한 반등. 스승님: 의심스러운 FTD가 때로는 더 좋다 — 주가는 의심의 벽을 타고 오른다.",
+        "ftd": "FTD는 '공격'이 아니라 '다시 볼 허락'이에요. 랠리 저점을 깨면 모든 판단을 되돌리고, 살아서 오르는 종목에만 비중을 늘려요.",
+        "press": "상승 추세지만 큰돈이 파는 흔적(분산일)이 평소보다 많아요. 신규는 정찰병 크기로, 약한 종목부터 정리.",
+        "up": "상승 추세 — 원칙대로 매매하는 장이에요. 주도섹터 대장주의 신고가 돌파를 1유닛부터 사고 이기면 키워요.",
+    }[ph_key]
+    step_x = [
+        f"{(phases.get(best) or {}).get('why', '')}. {_ph_x}",
+        ("내 원칙: 코스피·코스닥이 60일선 아래면 본매매(유닛)는 쉬고 스승님 방식의 정찰병만 넣어요. "
+         "둘 다 60일선을 회복하면 살아남은 정찰병부터 1유닛으로 키워요.") if market_ok is False else
+        ("둘 다 60일선 위 — 원칙 유닛(6% → 12% → 18%) 매매가 가능한 장이에요. 진입 때 지수가 20일선 위면 시장 유닛 +1."
+         if market_ok else "지수 일봉을 확인하는 중이에요."),
+        (f"오늘 {', '.join(ia_secs[:3])}에서 여러 종목이 같은 날 거래량 1.5배↑ 장대양봉 — 돈이 섹터로 들어오는 신호(인더스트리 액션). "
+         "그 안에서 먼저 신고가를 간 선도주가 1순위예요.") if ia_secs else
+        (f"신고가 2종목↑ 주도섹터 {n_lead}개 — 돌파매매 조건은 갖췄어요. 오늘 섹터 동반 거래량(액션)은 아직 없음."
+         if n_lead else "주도섹터가 없으면 내 원칙상 신고가 돌파매매를 쉬어요. 섹터가 같이 움직여야 개별 종목 추세도 이어져요."),
+        ((f"견조주 = 지수가 빠질 때 52주 고점 근처를 지킨 상위 20%({n_res}개). " if n_res is not None else "")
+         + "스승님이 오늘 신고가 종목을 바로 편입할 수 있었던 건 이 목록을 미리 체크해 뒀기 때문. "
+         + (f"지금 그중 거래량 실어 신고가 가는 종목 {n_go}개" if n_go else "지금 그중 신고가 가는 종목은 없어요")
+         + (f", 원칙을 모두 통과한 종목 {n_main}개." if n_main else ".")),
+    ]
 
     why_bits = [x for x in ((phases.get(best) or {}).get("why", "").split(" — ")[0],
                             f"액션 섹터 {ia_secs[0]}" if ia_secs else None,
@@ -9427,7 +9459,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     # ── HTML
     o = [DB_CSS, '<div class="db">',
          f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
-         f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" · ".join(why_bits))}</p>'
+         f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" · ".join(why_bits))}</p><p>{esc(_DB_SHORT[ph_key])}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
          f'<div class="db-stats">{"".join(stats)}</div></div>',
          '<div class="db-grid">']
@@ -9446,13 +9478,14 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
         out = []
         for w in (why or "").split(" · "):
             if w.startswith("조정 바닥"):
-                w = "견조주"
+                m_ = re.search(r"상위 (\d+)%", w)
+                w = f"견조 상위 {m_.group(1)}%" if m_ else "견조주"
             for a, b in _short:
                 if w == a:
                     w = b
             if w and w not in out:
                 out.append(w)
-        return "".join(f'<span class="db-bd">{esc(x)}</span>' for x in out[:3])
+        return "".join(f'<span class="db-bd">{esc(x)}</span>' for x in out[:4])
 
     if rows:
         trs = []
@@ -9472,6 +9505,11 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
                        f'<td class="db-ch"><b style="color:{ccol}">{chg:+.1f}%</b><small style="color:{tcol}">{esc(r["tag"])}</small></td></tr>')
         o.append('<table class="db-tbl"><thead><tr><th>순위</th><th></th><th>종목 / 왜</th><th>현재가</th><th>등락률</th></tr></thead>'
                  f'<tbody>{"".join(trs)}</tbody></table>')
+        o.append('<div class="db-note"><b>읽는 법</b> · <b style="color:#15803D">원칙 매수</b> = 오늘 인더스트리 액션 섹터에서 내 원칙'
+                 '(지수 60일선 위·RS 70↑·거래량·장대양봉·저항 돌파·실적)을 모두 통과 → 1유닛, 아침·종가 나눠 사기. '
+                 f'<b style="color:#1A62CC">정찰병</b> = 조정 때 버틴 견조주 중 오늘 거래량 실어 52주 신고가 → 계좌 약 {scout.SCOUT_WEIGHT:.0f}%, '
+                 '손절 -8%, 같은 섹터 2개까지. 살아서 3R 쪽으로 가면 그때 키워요. '
+                 '<b>우선 검토</b> = 신고가는 갔지만 국면이 아직 허락 전 · <b>관찰 후보</b> = 신고가까지 3% 안.</div>')
     else:
         o.append('<div class="db-empty">조건에 맞는 견조주 후보가 아직 없어요 — 📉 하락장 점검에서 버티는 종목부터 확인.</div>')
     o.append('</div>')
@@ -9481,30 +9519,54 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
              f'<span class="db-pill {"r" if live else "g"}">{"LIVE" if live else "장 마감"}</span></div>')
     for i, (t, v, ok, res_) in enumerate(steps, 1):
         cls = "ok" if ok else ("no" if ok is False else "na")
-        o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{t}</b><span class="d">{esc(v)}</span></div>'
+        o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{t}</b><span class="d">{esc(v)}</span>'
+                 f'<p class="x">{esc(step_x[i - 1])}</p></div>'
                  f'<span class="r">{"✓" if ok else ("✕" if ok is False else "?")} {esc(res_)}</span></div>')
     o.append(f'<div class="db-bar"><div style="width:{ok_n / 4 * 100:.0f}%"></div></div>'
              f'<div class="db-concl" style="background:{mbg};border-color:{mcol}55"><small style="color:{mcol}">결론</small>'
-             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p></div></div></div>')
+             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p><p class="x">{esc(mdesc)}</p></div></div></div>')
 
-    # 아래 왼쪽: 보유 → 매도 회로
+    # 아래 1줄: 시장 흐름 · 핵심 신호 | 보유 → 매도 판단
+    rule60 = ("코스피·코스닥 60일선 아래 → 본매매(유닛)는 쉬고 정찰병 크기만." if market_ok is False else
+              "지수 60일선 위 → 원칙 유닛 매매 가능." if market_ok else "")
+    sec_txt = step_x[2]
+    stock_txt = step_x[3] + " RS·실적·거래량을 함께 확인하고, 숫자 없는 테마성 급등은 비중을 줄여요."
+    d20 = sig.get("d20")
+    mkt_txt = (f"{pb['em']} {pb['title']} — {(phases.get(best) or {}).get('why', '')}. {rule60}"
+               + (f" 20 DOWN {d20:.0f}%" + (" — 과매도권(저가매수는 가치 계좌에서 3~5유닛 분할)." if d20 >= 80 else ".") if d20 is not None else ""))
+    sigs = [("01", "#2B7FF0", "시장", mkt_txt), ("02", "#7C5CF0", "섹터", sec_txt), ("03", "#16A34A", "종목", stock_txt),
+            ("04", "#F59E0B", "스승님", f"“{pb['mentor']}” — 장이 좋아질지 다시 내려갈지는 아무도 몰라요. 정해진 규칙대로 대응.")]
     hrows, hmsg, urgent = _tb_holdings(df, phase)
     hold_html = ("".join(f'<div class="db-hold">{em} <b>{esc(n)}</b> {esc(v)}<small>{esc(a)}</small></div>' for em, n, v, a in hrows[:6])
                  if hrows else f'<div class="db-empty">{esc(hmsg or "")}</div>')
-    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>보유 → 매도 판단</h3>'
+    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>시장 흐름 · 핵심 신호</h3>'
+             '<p>시장 → 섹터 → 종목 순서로 지금 상황을 풀어서 봐요.</p></div><span class="db-pill g">오늘 기준</span></div>'
+             + "".join(f'<div class="db-sig"><span class="n" style="background:{c}">{n}</span><b>{t}</b><span class="d">{esc(x)}</span></div>'
+                       for n, c, t, x in sigs) + '</div>')
+    o.append('<div class="db-card"><div class="db-hd"><div><h3>보유 → 매도 판단</h3>'
              f'<p>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else "🔴 손절 · 🔵 3R 절반 · 🟣 본절 올리기 · 🟢 유지"}</p></div>'
-             f'<a class="db-pill b" href="?tab={quote_plus("💼 내 보유")}" target="_self">내 보유 →</a></div>{hold_html}</div>')
-    # 아래 오른쪽: 오늘 지킬 것
+             f'<a class="db-pill b" href="?tab={quote_plus("💼 내 보유")}" target="_self">내 보유 →</a></div>{hold_html}'
+             '<div class="db-note"><b>매도 기준</b> · 🔴 손절선(평단 -8%, ATR이 8%보다 크면 ATR) 이탈은 예외 없이 정리 · '
+             '🔵 3R(+24%)에서 절반 익절, 나머지는 일봉 5일선이 50일선에 닿을 때 · 🟣 +2R이면 손절선을 본전으로, +4R이면 +1R로 · '
+             f'추가 매수(불타기) 때 3R 익절가는 처음 가격 그대로.<br><b>지금 장</b> · {esc(pb["hold"])}</div></div></div>')
+    # 아래 2줄: 오늘 지킬 것 | 해설
     do_now = {"corr": "사지 않기 · 버티는 견조주 목록 만들기", "rally12": "3일차 강세까지 기다리기 · 견조주 신고가 근접 체크",
               "day3": "견조주 중 거래량 실은 신고가만 · 정찰병 3%", "susp_ftd": "액션 섹터 선도주에 정찰병 · 랠리 저점 깨면 되돌림",
               "ftd": "살아서 오르는 정찰병에만 비중 추가", "press": "신규는 작게 · 약한 종목부터 정리",
               "up": "주도섹터 대장주 신고가 돌파 · 1유닛부터"}[ph_key]
-    rules = [("✓", "#16A34A", do_now), ("✕", "#E5484D", "물타기 · 손절 넓히기 · 같은 섹터 우르르"),
-             ("✓", "#16A34A", "1R -8% · 종목당 위험 1.5% · 3R(+24%) 절반 익절")]
-    o.append('<div class="db-card"><div class="db-hd"><div><h3>오늘 지킬 것</h3><p>스승님 플레이북 + 내 원칙</p></div>'
+    rules = [("✓", "#16A34A", do_now, pb["buy"]),
+             ("✕", "#E5484D", "물타기 · 손절 넓히기 · 같은 섹터 우르르",
+              "변동성이 커도 손절을 넓히면 손실만 커져요. 같은 섹터 정찰병을 한꺼번에 넣으면 작은 손절이 모여 계좌가 갈려요."),
+             ("✓", "#16A34A", "1R -8% · 종목당 위험 1.5% · 3R(+24%) 절반 익절",
+              "승률 30%여도 손실은 짧게, 수익은 3R 이상 길게 — 그래서 손절선을 먼저 정하고 들어가요.")]
+    notes = scout.commentary(phase, ph_txt, market_ok, d20, cands, ia_secs, n_res, n_lead)
+    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>오늘 지킬 것</h3><p>스승님 플레이북 + 내 원칙</p></div>'
              '<span class="db-pill g">오늘 기준</span></div>'
-             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span>{esc(x)}</div>' for m, c, x in rules)
-             + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님</small></div></div></div>')
+             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div>{esc(x)}<small>{esc(y)}</small></div></div>'
+                       for m, c, x, y in rules)
+             + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님 · {esc(pb["title"])}</small></div></div>')
+    o.append('<div class="db-card"><div class="db-hd"><div><h3>🧭 해설</h3><p>지금 장을 스승님 플레이북으로 읽고 내 원칙과 겹쳐 본 결론</p></div></div>'
+             '<ul class="db-cm">' + "".join(f"<li>{x}</li>" for x in notes) + '</ul></div></div>')
     o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div></div>')
     st.markdown("".join(o), unsafe_allow_html=True)
 
