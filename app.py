@@ -2348,20 +2348,191 @@ def render_turnover(overview: dict):
         unsafe_allow_html=True)
 
 
+HERO_CSS = """<style>
+.hx-top{display:flex;justify-content:space-between;align-items:center;margin:.1rem 0 .5rem;font-size:.82rem;color:#5B6670}
+.hx-top b{color:#1C2430;font-size:.95rem}
+.hx-live{background:#F1F3F6;border-radius:8px;padding:4px 10px;font-weight:700;color:#26343E;white-space:nowrap}
+.hx-live i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#2EAD5B;margin-right:6px}
+.hx-live.off i{background:#9AA4AE}.hx-live small{color:#8A93A0;font-weight:500;margin-left:6px}
+.hx-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}
+.hx-card{background:#fff;border:1px solid #E7E9EE;border-radius:16px;padding:16px 20px 14px;box-shadow:0 1px 3px rgba(20,30,50,.04)}
+.hx-name{font-size:.8rem;font-weight:700;color:#3A4450;letter-spacing:.02em}.hx-name span{color:#8A93A0;font-weight:500}
+.hx-v{display:flex;align-items:baseline;gap:22px;margin:4px 0 2px;flex-wrap:wrap}
+.hx-v b{font-size:2.1rem;font-weight:800;color:#141B24;letter-spacing:-.02em}
+.hx-v span{font-size:.95rem;font-weight:700}
+.hx-sub{font-size:.78rem;color:#7A8490;margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.hx-chip{border-radius:6px;padding:1px 7px;font-weight:700;font-size:.72rem}
+.hx-chip.G{background:#E6F6EC;color:#1E8C4A}.hx-chip.Y{background:#FFF4D6;color:#A26B00}.hx-chip.R{background:#FDE8E9;color:#C0303A}
+.hx-chip.n{background:#F1F3F6;color:#51616C}
+.hx-br{height:8px;border-radius:5px;background:#EEF0F3;overflow:hidden;display:flex}
+.hx-br i{display:block;height:100%}
+.hx-brl{display:flex;justify-content:space-between;font-size:.7rem;color:#8A93A0;margin:3px 0 8px}
+.hx-fl{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.hx-f{font-size:.78rem;color:#3A4450;font-weight:600}
+.hx-f b{margin-left:4px}
+.hx-fb{position:relative;height:6px;background:#F1F3F6;border-radius:3px;margin-top:4px}
+.hx-fb i{position:absolute;top:0;bottom:0;border-radius:3px}
+.hx-fb em{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:#B9C0C8}
+.hx-today{display:flex;align-items:center;gap:18px;background:#fff;border:1px solid #E7E9EE;border-radius:14px;
+padding:12px 20px;margin-bottom:12px;flex-wrap:wrap}
+.hx-today .t{font-weight:800;color:#1C2430;font-size:.92rem;flex:none}
+.hx-today .m{flex:1;min-width:200px;font-size:.82rem;color:#5B6670}
+.hx-today .m b{color:#1C2430}
+.hx-g{display:flex;align-items:center;gap:12px;flex:none}
+.hx-gt{position:relative;width:190px;height:6px;border-radius:3px;background:linear-gradient(90deg,#6FA0E6,#E9ECF0 50%,#EF7A80)}
+.hx-gt i{position:absolute;top:-5px;width:14px;height:14px;border-radius:50%;background:#fff;border:3px solid #D6333B;transform:translateX(-50%)}
+.hx-gt i.dn{border-color:#1F66C9}
+.hx-gl{font-weight:800;font-size:.95rem}
+.hx-top em{font-style:normal}
+@media (max-width:700px){.hx-d{display:none}.hx-row{grid-template-columns:1fr;gap:10px}.hx-card{padding:12px 14px}.hx-v b{font-size:1.7rem}
+.hx-v{gap:12px}.hx-gt{width:130px}.hx-today{padding:10px 14px;gap:10px}}
+</style>"""
+
+
+def _hero_flow_cells(deal: dict | None) -> str:
+    d = deal or {}
+    vals = {k: d.get(k) for k in ("외국인", "기관", "개인")}
+    mx = max([abs(v) for v in vals.values() if v is not None and v == v] or [1.0]) or 1.0
+    out = ""
+    for k, v in vals.items():
+        if v is None or v != v:
+            out += f'<div class="hx-f">{k} <b>-</b><div class="hx-fb"><em></em></div></div>'
+            continue
+        w = abs(v) / mx * 50
+        col = _sign_color(v)
+        pos = f"left:50%;width:{w:.1f}%" if v >= 0 else f"left:{50 - w:.1f}%;width:{w:.1f}%"
+        out += (f'<div class="hx-f">{k} <b style="color:{col}">{_eok(v)}</b>'
+                f'<div class="hx-fb"><i style="{pos};background:{col}"></i><em></em></div></div>')
+    return f'<div class="hx-fl">{out}</div>'
+
+
+def _hero_card(name: str, sm: dict | None, df: pd.DataFrame | None, board: pd.DataFrame | None, b60) -> str:
+    sm = sm or {}
+    hsm = data.index_summary(df) if df is not None else None
+    last = sm.get("last") if sm.get("last") is not None else (hsm or {}).get("last")
+    eng = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}.get(name, name)
+    if last is None:
+        return f'<div class="hx-card"><div class="hx-name">{eng} <span>{name}</span></div><div class="idx-err">불러오지 못했어요</div></div>'
+    rate = sm.get("rate") if sm.get("rate") is not None else (hsm or {}).get("change")
+    diff = sm.get("diff")
+    if diff is None and rate is not None:
+        diff = last - last / (1 + rate / 100)
+    col = _sign_color(rate)
+    arrow = "▲" if (rate or 0) > 0 else ("▼" if (rate or 0) < 0 else "")
+    chg = f'<span style="color:{col}">{arrow} {abs(rate or 0):.2f}% {diff:+,.2f}</span>' if rate is not None and diff is not None else ""
+    s20, s60 = data.ma_signal(df, 20), data.ma_signal(df, 60)
+    if s60:
+        trend = {"G": "강한 상승 흐름", "Y": "방향을 고르는 중", "R": "하락 흐름"}[s60["code"]]
+        sub = f'60일선 {"위" if s60["above"] else "아래"} {s60["dist"]:+.1f}% · {trend}'
+    else:
+        sub = "60일선 계산 중"
+    chips = ""
+    for lab, sg in (("단기 20일", s20), ("장기 60일", s60)):
+        if sg:
+            chips += f'<span class="hx-chip {sg["code"]}">{lab} {sg["text"]}</span>'
+    try:
+        rs = data.index_rs(df, board).get("rs") if board is not None else None
+    except Exception:  # noqa: BLE001
+        rs = None
+    if rs is not None:
+        chips += f'<span class="hx-chip n">지수 RS {rs:.0f}</span>'
+    if b60:
+        chips += f'<span class="hx-chip n" title="보드 종목 중 60일선 위 비율">60일선 위 종목 {b60[0]:.0f}%</span>'
+    br = sm.get("breadth") or {}
+    up = (br.get("상승") or 0) + (br.get("상한") or 0)
+    flat = br.get("보합") or 0
+    dn = (br.get("하락") or 0) + (br.get("하한") or 0)
+    tot = up + flat + dn
+    bar = ""
+    if tot:
+        bar = (f'<div class="hx-br"><i style="width:{up / tot * 100:.1f}%;background:#E5484D"></i>'
+               f'<i style="width:{flat / tot * 100:.1f}%;background:#D5DAE0"></i>'
+               f'<i style="width:{dn / tot * 100:.1f}%;background:#4C82D9"></i></div>'
+               f'<div class="hx-brl"><span style="color:#D6333B">상승 {up:,.0f}</span><span>보합 {flat:,.0f}</span>'
+               f'<span style="color:#1F66C9">하락 {dn:,.0f}</span></div>')
+    return (f'<div class="hx-card"><div class="hx-name">{eng} <span>{name}</span></div>'
+            f'<div class="hx-v"><b>{last:,.2f}</b>{chg}</div>'
+            f'<div class="hx-sub">{sub}{chips}</div>{bar}{_hero_flow_cells(sm.get("deal"))}</div>')
+
+
+def _hero_today(overview: dict, hist: dict) -> str:
+    mood = data.market_mood(overview)
+    ratio = mood[1] if mood else 0.5
+    tot = {k: 0.0 for k in ("외국인", "기관", "개인")}
+    got = False
+    for sm in overview.values():
+        d = (sm or {}).get("deal") or {}
+        for k in tot:
+            if d.get(k) is not None and d.get(k) == d.get(k):
+                tot[k] += d[k]
+                got = True
+    if got:
+        buy = [k for k in ("외국인", "기관") if tot[k] > 0]
+        if len(buy) == 2:
+            flow = "수급은 <b>외국인·기관 동반 순매수</b>"
+        elif buy:
+            other = "기관" if buy[0] == "외국인" else "외국인"
+            flow = f"수급은 <b>{buy[0]} 중심 순매수</b>({other} 매도)"
+        else:
+            flow = "수급은 <b>외국인·기관 동반 순매도</b>" + (" — 개인이 받는 중" if tot["개인"] > 0 else "")
+    else:
+        flow = "투자자별 수급을 불러오는 중"
+    oks = []
+    for sym in data.MARKETS.values():
+        sm = data.index_summary(hist.get(sym, (data.empty_frame(), None))[0])
+        oks.append(None if not sm else sm.get("above60"))
+    if all(o is True for o in oks):
+        rule = "코스피·코스닥 모두 60일선 위 — <b>돌파매매 가능 구간</b>"
+    elif any(o is False for o in oks):
+        rule = "60일선 아래 지수가 있어요 — <b>원칙상 신규 돌파매매 쉬는 구간</b>"
+    else:
+        rule = ""
+    if ratio >= 0.57:
+        lab, cls, col = "상승 우위", "", "#D6333B"
+    elif ratio <= 0.43:
+        lab, cls, col = "하락 우위", "dn", "#1F66C9"
+    else:
+        lab, cls, col = "팽팽", "", "#51616C"
+    return (f'<div class="hx-today"><span class="t">오늘의 시장</span>'
+            f'<span class="m">{flow}{" · " + rule if rule else ""}</span>'
+            f'<span class="hx-g"><span class="hx-gt" title="상승 종목 비율 {ratio * 100:.0f}%"><i class="{cls}" style="left:{ratio * 100:.0f}%"></i></span>'
+            f'<span class="hx-gl" style="color:{col}">{lab}</span></span></div>')
+
+
+def _hero_live(overview: dict) -> str:
+    sm = overview.get("코스피") or {}
+    st_ = str(sm.get("status") or "")
+    t = str(sm.get("time") or "")
+    hm = data.now_kst().strftime("%H:%M")
+    try:
+        if re.fullmatch(r"\d{12,14}", t):                # 202610281000(00)
+            hm = f"{t[8:10]}:{t[10:12]}"
+        elif t:
+            ts = pd.Timestamp(t)
+            hm = ts.strftime("%H:%M")
+    except (ValueError, TypeError):
+        pass
+    live = st_ == "OPEN"
+    return (f'<div class="hx-top"><span><b>실시간 시장</b><em class="hx-d"> · 지수 · 수급 · 오늘 돈이 몰린 섹터</em></span>'
+            f'<span class="hx-live{"" if live else " off"}"><i></i>{"장중 실시간" if live else "장 마감"}<small>{hm} 기준</small></span></div>')
+
+
 def render_market(board: pd.DataFrame | None = None):
     """맨 위 시장 요약: 시장신호(신호등·지수 RS) → 코스피·코스닥 카드 + 오늘의 시장 → 해외 지수·환율·유가."""
     overview = load_overview()
     hist = load_indexes()
-    st.markdown(_signal_panel(hist, board), unsafe_allow_html=True)
     hist_sm = {idx["name"]: data.index_summary(hist.get(idx["symbol"], (data.empty_frame(), None))[0])
                for idx in data.INDEXES}
     try:
         b60 = _breadth60(board)
     except Exception:
         b60 = {}
-    cards = "".join(_market_card(name, overview.get(name), hist_sm.get(name), b60.get(name)) for name in data.MARKETS)
-    st.markdown(f'<div class="mk-row">{cards}{_mood_card(overview)}</div>', unsafe_allow_html=True)
-    render_turnover(overview)
+    cards = "".join(_hero_card(name, overview.get(name), hist.get(sym, (data.empty_frame(), None))[0], board, b60.get(name))
+                    for name, sym in data.MARKETS.items())
+    st.markdown(HERO_CSS + _hero_live(overview) + f'<div class="hx-row">{cards}</div>' + _hero_today(overview, hist),
+                unsafe_allow_html=True)
+    with st.expander("📊 거래대금 · 평소 대비(코스피·코스닥)"):
+        render_turnover(overview)
 
     chips = []
     for idx in data.INDEXES:
@@ -2419,48 +2590,47 @@ def _chip_leader(df: pd.DataFrame, group: str) -> str:
 
 # ─────────────────────────── 🔥 섹터 강세 카드(첫 화면) ───────────────────────────
 SM_CSS = """<style>
-.sm-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px;margin:.2rem 0 .6rem}
-.sm-card{background:#fff;border:1px solid #E6E3F0;border-radius:12px;overflow:hidden;box-shadow:0 1px 2px rgba(20,20,40,.04)}
-.sm-head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;color:#fff}
-.sm-head.r1{background:#C2185B}.sm-head.r2{background:#5E6B78}.sm-head.r3{background:#7B5CC4}.sm-head.rn{background:#46505A}
-.sm-ttl{display:flex;align-items:center;gap:6px;font-weight:800;font-size:1rem;min-width:0}
+.sm-hd{display:flex;align-items:center;gap:10px;margin:.3rem 0 .2rem;font-size:.82rem;color:#5B6670;font-weight:700}
+.sm-wrap{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:.3rem 0 .6rem}
+.sm-card{background:#fff;border:1px solid #E7E9EE;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(20,30,50,.05)}
+.sm-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;color:#fff;gap:10px}
+.sm-head.r1{background:#C2185B}.sm-head.r2{background:#556B7A}.sm-head.r3{background:#6A55C2}.sm-head.rn{background:#3F4B57}
+.sm-ttl{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.3rem;min-width:0;letter-spacing:-.01em}
 .sm-ttl span.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sm-rk{background:#F5C518;color:#3A2A00;border-radius:50%;min-width:20px;height:20px;display:inline-flex;align-items:center;
-justify-content:center;font-size:.75rem;font-weight:800}
-.sm-head.r2 .sm-rk,.sm-head.rn .sm-rk{background:#fff;color:#46505A}
-.sm-sum{text-align:right;line-height:1.05}
-.sm-sum b{display:block;background:#fff;color:#D6333B;border-radius:5px;padding:1px 6px;font-size:.82rem}
-.sm-sum b.dn{color:#1F66C9}
-.sm-sum small{display:block;font-size:.75rem;font-weight:700;margin-top:2px;opacity:.95;white-space:nowrap}
-.sm-sum small.cnt{font-weight:500;font-size:.68rem;margin-top:0;opacity:.85}
-.sm-news{display:flex;gap:6px;align-items:center;padding:5px 8px;background:#F4F1FB;font-size:.74rem;color:#3B3550;
-border-bottom:1px solid #EEE;white-space:nowrap;overflow:hidden}
-.sm-news a{color:#3B3550;text-decoration:none;overflow:hidden;text-overflow:ellipsis}
-.sm-news .t{background:#E3DCF7;color:#5B3FC0;border-radius:4px;padding:0 5px;font-weight:700;flex:none}
-a.sm-row{display:block;padding:5px 9px 4px;border-bottom:1px solid #F1F1F4;text-decoration:none;color:#26343E}
-a.sm-row:hover{background:#FAF9FE}
-.sm-l1,.sm-l2{display:flex;justify-content:space-between;align-items:center;gap:6px}
-.sm-nm{font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-rk{background:#fff;color:#1C2430;border-radius:50%;min-width:28px;height:28px;display:inline-flex;align-items:center;
+justify-content:center;font-size:.9rem;font-weight:800;flex:none}
+.sm-pill{background:#fff;color:#1C2430;border-radius:8px;padding:5px 0;min-width:120px;text-align:center;font-weight:800;font-size:.95rem;flex:none}
+.sm-sub{display:flex;justify-content:space-between;gap:8px;margin:10px 14px 4px;padding:6px 12px;background:#F2F4F7;border-radius:8px;
+font-size:.76rem;font-weight:700;color:#3A4450}
+.sm-sub span:last-child{color:#5B6670;white-space:nowrap}.sm-sub em{font-style:normal}
+.sm-news{margin:2px 16px 4px;font-size:.74rem;color:#7A8490;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-news a{color:#5B6670;text-decoration:none}.sm-news .t{color:#6A55C2;font-weight:700;margin-right:6px}
+a.sm-row{display:block;padding:10px 18px 9px;border-bottom:1px solid #F0F1F4;text-decoration:none;color:#1C2430}
+a.sm-row:hover{background:#FAFAFD}
+.sm-l1,.sm-l2{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.sm-nm{font-weight:700;font-size:1.02rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sm-nm.nh{color:#D6333B;text-decoration:underline}
-.sm-chg{font-weight:800;font-size:.86rem;flex:none}
-.sm-l2{font-size:.74rem;color:#6B7680}
+.sm-chg{font-weight:800;font-size:1.02rem;flex:none;min-width:78px;text-align:right}
+.sm-l2{font-size:.82rem;color:#7A8490;margin-top:3px}
 .sm-tv.big{color:#D6333B;font-weight:800}
-.sm-dot{width:7px;height:7px;border-radius:50%;background:#2EAD5B;display:inline-block;flex:none}
+.sm-dot{width:8px;height:8px;border-radius:50%;background:#2EAD5B;display:inline-block;flex:none}
 .sm-dot.off{background:#D5D9DE}
-.sm-ic{display:flex;align-items:center;gap:4px;flex:none}
-.sm-bar{position:relative;height:10px;margin-top:3px;background:#ECEEF1;border-radius:2px}
+.sm-ic{display:flex;align-items:center;gap:14px;flex:none}
+.sm-bar{position:relative;height:6px;margin-top:6px;background:#EEF0F3;border-radius:3px}
 .sm-bar i{position:absolute;top:0;bottom:0}
-.sm-bar i.z{width:2px;background:#26343E;top:-2px;bottom:-2px}
-.sm-bar i.w{top:4px;bottom:4px}
-.sm-bar i.b{top:1px;bottom:1px;border-radius:1px}
-.sm-card details summary{list-style:none;cursor:pointer;text-align:center;font-size:.76rem;color:#8A93A0;padding:5px}
+.sm-bar i.z{width:2px;background:#1C2430;top:-3px;bottom:-3px}
+.sm-bar i.w{top:2px;bottom:2px}
+.sm-bar i.b{top:0;bottom:0;border-radius:2px}
+.sm-card details summary{list-style:none;cursor:pointer;text-align:center;font-size:.8rem;color:#8A93A0;padding:8px}
 .sm-card details summary::-webkit-details-marker{display:none}
 .sm-card details[open] summary .more{display:none}.sm-card details:not([open]) summary .less{display:none}
-.sm-legend{font-size:.72rem;color:#7A8490;margin:-.2rem 0 .4rem}
-@media (max-width:640px){.sm-wrap{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
-.sm-nm,.sm-chg{font-size:.8rem}.sm-head{padding:6px 7px}.sm-ttl{font-size:.84rem;line-height:1.15}
+.sm-legend{font-size:.72rem;color:#8A93A0;margin:-.2rem 0 .5rem}
+@media (max-width:700px){.sm-wrap{gap:8px}.sm-head{padding:7px 8px;gap:4px}.sm-ttl{font-size:.86rem;gap:5px;line-height:1.15}
 .sm-ttl span.nm{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-a.sm-row{padding:4px 6px}.sm-l2{font-size:.7rem}}
+.sm-rk{min-width:20px;height:20px;font-size:.72rem}.sm-pill{min-width:0;padding:2px 6px;font-size:.78rem}
+.sm-sub{margin:6px 6px 2px;padding:4px 6px;font-size:.66rem;flex-direction:column;gap:0}.sm-news{margin:2px 7px;font-size:.66rem}
+a.sm-row{padding:5px 7px}.sm-nm,.sm-chg{font-size:.8rem}.sm-chg{min-width:0}.sm-ic{gap:4px}.sm-l2{font-size:.7rem;margin-top:1px}
+.sm-bar{margin-top:3px;height:5px}.sm-sub em.nm2{display:none}}
 </style>"""
 
 
@@ -2537,6 +2707,7 @@ def _sm_eok(v) -> str:
 
 def render_sector_movers(df: pd.DataFrame, quotes: dict):
     """첫 화면: 오늘 섹터별 강세 카드(순위 · 섹터 등락·거래대금 · 대표 뉴스 · 종목별 등락·거래대금·가로 캔들)."""
+    st.markdown('<div class="sm-hd">🔥 주도 테마 · 오늘 돈이 몰린 섹터</div>', unsafe_allow_html=True)
     with st.container(key="sm_box"):
         c1, c2, c3, c4 = st.columns([1.25, 1.25, 1, 1])
         by_lab = c1.segmented_control("묶기", ["세부 분류", "산업"], default="세부 분류", key="sm_by",
@@ -2544,7 +2715,7 @@ def render_sector_movers(df: pd.DataFrame, quotes: dict):
         sort_lab = c2.segmented_control("정렬", ["돈 몰린 순", "상승률 순"], default="돈 몰린 순", key="sm_sort",
                                         label_visibility="collapsed",
                                         help="돈 몰린 순 = 오늘 오른 종목들의 거래대금 합계가 큰 섹터부터 · 상승률 순 = 거래대금 가중 평균 등락") or "돈 몰린 순"
-        n_cards = c3.selectbox("카드", [4, 8, 12, 16], index=1, key="sm_n", label_visibility="collapsed",
+        n_cards = c3.selectbox("카드", [2, 4, 6, 8, 12], index=2, key="sm_n", label_visibility="collapsed",
                                format_func=lambda n: f"섹터 {n}개")
         n_rows = c4.selectbox("종목", [5, 8, 10], index=1, key="sm_rows", label_visibility="collapsed",
                               format_func=lambda n: f"먼저 {n}종목")
@@ -2561,6 +2732,7 @@ def render_sector_movers(df: pd.DataFrame, quotes: dict):
         lead_codes.append(top["code"])
     news = _sm_news(tuple(lead_codes))
     status = data.market_status(quotes)
+    upd = f'{"장중" if status.startswith("장중") else "마감"} {data.now_kst():%H:%M} 업데이트'
     cards = []
     for i, s in enumerate(secs, 1):
         rows = s["rows"]
@@ -2599,8 +2771,9 @@ def render_sector_movers(df: pd.DataFrame, quotes: dict):
         cards.append(
             f'<div class="sm-card"><div class="sm-head {rk}"><div class="sm-ttl"><span class="sm-rk">{i}</span>'
             f'<span class="nm">{html.escape(str(s["name"]))}</span></div>'
-            f'<div class="sm-sum"><b class="{"dn" if s["chg"] < 0 else ""}">{s["chg"]:+.1f}%</b>'
-            f'<small>{_sm_eok(s["tv"])}</small><small class="cnt">{s["n_up"]}/{s["n"]} 상승</small></div></div>'
+            f'<span class="sm-pill" style="color:{UP if s["chg"] > 0 else (DOWN if s["chg"] < 0 else "#1C2430")}">{s["chg"]:+.1f}%</span></div>'
+            f'<div class="sm-sub"><span><em class="nm2">{html.escape(str(s["name"]))} 강세 종목 · </em>거래대금 {_sm_eok(s["tv"])} · {s["n_up"]}/{s["n"]} 상승</span>'
+            f'<span>{upd}</span></div>'
             f'{news_html}{"".join(first)}{more}</div>')
     st.markdown(SM_CSS + f'<div class="sm-wrap">{"".join(cards)}</div>'
                 f'<div class="sm-legend">{html.escape(status)} · 섹터 등락 = 거래대금 가중 평균 · 거래대금 = 섹터 전체 합계 · '
