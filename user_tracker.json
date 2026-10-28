@@ -67,9 +67,60 @@
    "urls": [
     "https://t.me/maddingStock/18734"
    ]
+  },
+  {
+   "date": "2026-10-27",
+   "name": "동아에스티",
+   "code": "170900",
+   "op": 214.0,
+   "sales": null,
+   "cons": null,
+   "beat": 68.5,
+   "yoy": 27.7,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18849",
+   "post_id": 18849,
+   "urls": [
+    "https://t.me/maddingStock/18849"
+   ]
+  },
+  {
+   "date": "2026-10-27",
+   "name": "RFHIC",
+   "code": "218410",
+   "op": 217.0,
+   "sales": null,
+   "cons": null,
+   "beat": 36.5,
+   "yoy": 194.3,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18849",
+   "post_id": 18849,
+   "urls": [
+    "https://t.me/maddingStock/18849"
+   ]
+  },
+  {
+   "date": "2026-10-27",
+   "name": "샘씨엔에스",
+   "code": "252990",
+   "op": 112.0,
+   "sales": null,
+   "cons": null,
+   "beat": 13.1,
+   "yoy": 105.9,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/18849",
+   "post_id": 18849,
+   "urls": [
+    "https://t.me/maddingStock/18849"
+   ]
   }
  ],
- "updated": "2026-10-23T09:25+09:00",
+ "updated": "2026-10-28T12:54+09:00",
  "stakes": [
   {
    "date": "2026-10-22",
