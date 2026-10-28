@@ -3563,6 +3563,17 @@ def _persist_holdings(store: dict, stt: dict) -> tuple[bool, str]:
     return True, "이 서버에만 임시로 저장했어요(앱을 다시 켜면 사라질 수 있어요)."
 
 
+def _hold_groups(df: pd.DataFrame, hs: list) -> dict:
+    """보유 종목을 보드 세부분류로 묶기 — 깡토: 같은 섹터 정찰병 우르르 점검용."""
+    gmap = dict(zip(df["code"], df["group"])) if "group" in df else {}
+    out: dict = {}
+    for h in hs or []:
+        g = gmap.get(h.get("code"))
+        if g:
+            out.setdefault(g, []).append(h.get("name") or h.get("code"))
+    return out
+
+
 def _hold_context(df: pd.DataFrame) -> dict:
     hist = load_indexes()
     parts, oks = [], []
@@ -3959,6 +3970,12 @@ PRINCIPLES = [
         "IPO 셋업: 상장 첫날 시가를 넘을 때",
         "실적이 어긋나면 — 추세 계좌: 맞았냐보다 추세가 꺾였냐 / 가치 계좌: 단순히 다음 분기로 밀린 거면 홀딩",
         "고멀티플: 추세 계좌에선 시장이 높게 쳐준다는 뜻이라 오히려 괜찮음, 가치 계좌에선 후순위"]),
+    ("깡토 Q&A · 급락장(2026.10)", [
+        "추세추종은 늦은 매매 — 반등을 예상해 미리 사지 않고, 쉴 때는 쉰다. 재진입은 선 대신 FTD(바닥 반등 3~4일차 강한 상승) 뒤 점진적으로",
+        "정찰병은 죽는 게 당연 — 그래도 쉬는 중에 조금씩 넣어 두고 달리기 시작하면 빠르게 비중 확대. 같은 섹터에 우르르 넣지 않기",
+        "변동성이 커도 손절을 넓히지 않는다(넓히면 손실만 커짐). 존버는 추세추종 사전에 없다",
+        "늦었다/빠르다의 기준은 섹터의 첫 신고가 — 먼저 달리고, 먼저 거래량 터지고, 먼저 신고가 가는 종목",
+        "하락장에서 버틴 주도주를 길게, 과대낙폭은 반등만 빠르다. 계좌는 슈퍼루키 1~2종목이 끈다 — 늦게 사도 추세가 강하면 피라미딩"]),
     ("검증 메모", ["한국 논문(유명 트레이더 매매법 11장): 52주 최고가 하나만으로는 한국에서 예측력이 약하다는 결과도 있음 → 신고가는 주도섹터·실적·수급과 같이 볼 때 의미",
                 "정리본의 [복원]·[2차] 숫자는 원전값이 아님 — 앱의 기준치는 참고용이고 바꿔 가며 확인할 자리"]),
     ("계좌 분리", ["추세 계좌와 가치 계좌는 물과 기름 — 섞지 않는다",
@@ -4323,6 +4340,7 @@ def render_holdings_tab(df: pd.DataFrame, quotes: dict):
         return
 
     ctx = _hold_context(df)
+    ctx["hold_groups"] = _hold_groups(df, store["holdings"])
     rows = []
     for h in store["holdings"]:
         m, bars, quote = _hold_metrics(h["code"], df, quotes, h["name"])
@@ -4645,6 +4663,7 @@ def render_monitor_tab(df: pd.DataFrame, quotes: dict):
     run_all = c2.button("🤖 전체 AI 판단", key="mn_ai_all", disabled=not (stt["ai"] or data.MOCK), width="stretch")
 
     ctx = _hold_context(df)
+    ctx["hold_groups"] = _hold_groups(df, hs)
     now = data.now_kst()
     rows = []
     for h in hs:
@@ -7555,6 +7574,15 @@ def render_market_signal(df: pd.DataFrame):
                    "견조주(상위 10%, 평균 -8%)는 1년 +16.7%, FTD 뒤 반년은 17번 중 15번 과대낙폭을 앞섬. 과대낙폭을 산다면 짧게·나올 자리 먼저·물타기 금지. "
                    "거래대금 20일 평균 10억↑·주가 1,000원↑ 종목만.")
     _views_box_kt()
+    _views_box_kq(("시장", "재진입", "정찰병", "핵심"))
+
+
+def _views_box_kq(keys: tuple[str, ...] | None = None, title: str = "📚 관점 노트 — 깡토 급락장 Q&A(2026.10)"):
+    with st.expander(title):
+        for k, t, x in views.KQ_VIEWS:
+            if keys is None or k in keys:
+                st.markdown(f"- **{t}** — {x}")
+        st.caption(f"출처: {views.KQ_SRC} · 효석 원칙(리스크관리 > 멘탈 > 종목 > 타점)이 항상 우선이고, 이 관점은 재량 참고예요.")
 
 
 def _views_box_kt():
@@ -10008,6 +10036,7 @@ def render_bear_check(df: pd.DataFrame):
                    "뱃지: " + " · ".join(f"**{a}** {b}" for a, b in bear_check.TAG_TXT.values()))
 
     st.caption(bear_check.NOTE + " 효석 원칙(시장 → 주도섹터 → 종목, 리스크관리 우선)이 항상 먼저예요.")
+    _views_box_kq(("하락장", "재진입", "손절", "타점"), "📚 깡토 급락장 Q&A — 버틴 종목 · 다시 들어갈 자리")
 
 
 # ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────

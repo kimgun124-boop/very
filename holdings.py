@@ -646,6 +646,11 @@ def masters_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, flow_df
         items += nj_view(h, m, bars, ctx, stop_pct, max_r, _v)
     except Exception:  # noqa: BLE001
         pass
+    # 깡토 급락장 Q&A: 같은 섹터 정찰병 우르르 · 쉬는 장의 정찰병
+    try:
+        items += kq_view(h, m, ctx, stop_pct, max_r)
+    except Exception:  # noqa: BLE001
+        pass
     # 리 태너(오닐 CAN SLIM) 매도·추가 규칙
     try:
         items += lt_view(h, m, bars, ctx)
@@ -698,6 +703,25 @@ def nj_view(h: dict, m: dict, bars: pd.DataFrame | None, ctx: dict, stop_pct: fl
     if per is not None:
         st_, txt = _v.value_cushion(per, peg)
         items.append((st_, "너쟁이 · 밸류 쿠션", txt))
+    return items
+
+
+def kq_view(h: dict, m: dict, ctx: dict, stop_pct: float, max_r) -> list:
+    """깡토 급락장 Q&A(2026.10) 점검. 손절·익절 기준은 효석 원칙 그대로, 재량 참고만 보태요."""
+    items = []
+    grp = m.get("group") or ""
+    mates = [n for n in (ctx.get("hold_groups") or {}).get(grp, []) if n != h.get("name")]
+    if grp and len(mates) >= 2:
+        items.append(("warn", "깡토 · 같은 섹터 우르르", f"'{grp}'에 {len(mates) + 1}종목({', '.join(mates[:4])} 포함) — "
+                      "같은 섹터 정찰병을 한꺼번에 넣으면 작은 손절이 모여 계좌가 갈려요. 모니터링이 안 되면 "
+                      "섹터에서 먼저 신고가·거래량 터진 1~2종목으로 줄이기"))
+    price, avg = _f(m.get("price")), _f(h.get("avg"))
+    if price and avg and ctx.get("market_ok") is False:
+        r_now = (price / avg - 1) * 100 / stop_pct if stop_pct else None
+        if r_now is not None and r_now < 1 and (max_r or 0) < 1:
+            items.append(("info", "깡토 · 쉬는 장의 정찰병", "지수 60일선 아래 — 지금 포지션은 정찰병 크기가 맞는지 확인. "
+                          "정찰병은 죽는 게 당연하고, 변동성이 커도 손절을 넓히지 않아요(넓히면 손실만 커짐). "
+                          "재진입은 FTD(바닥 반등 3~4일차 강한 상승) 뒤 점진적으로"))
     return items
 
 
@@ -1079,7 +1103,7 @@ AI_JUDGE_RULES = """[효석 매매 원칙 — 판단의 기준. 원칙이 AI의 
 - 추세 계좌와 가치 계좌는 섞지 않음. 추세 계좌에서 '싸졌다'며 버티기·추가 매수 금지.
 - 가치 계좌 종목은 손절선이 아니라 가치우파(하락 멈춤·횡보·우상향) 확인 후 분할매수, 가치훼손이면 매도로 판단.
 
-[참고 관점 — 깡토 × 너쟁이(추노) 인터뷰 · 리 태너 강연 · 깡토 분산일/FTD·하락장 백테스트. 위 원칙과 충돌하면 위 원칙이 우선, 재량 판단에 보태는 용도]
+[참고 관점 — 깡토 × 너쟁이(추노) 인터뷰 · 리 태너 강연 · 깡토 분산일/FTD·하락장 백테스트 · 깡토 급락장 Q&A(2026.10). 위 원칙과 충돌하면 위 원칙이 우선, 재량 판단에 보태는 용도]
 """ + __import__("views").AI_VIEWS + "\n"
 
 AI_JUDGE_PROMPT = """너는 효석의 추세추종 원칙을 그대로 적용하는 보유 종목 점검 보조야. 예측하지 말고, 위 원칙과 아래 숫자·뉴스로
