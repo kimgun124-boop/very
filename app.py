@@ -2591,46 +2591,50 @@ def _chip_leader(df: pd.DataFrame, group: str) -> str:
 # ─────────────────────────── 🔥 섹터 강세 카드(첫 화면) ───────────────────────────
 SM_CSS = """<style>
 .sm-hd{display:flex;align-items:center;gap:10px;margin:.3rem 0 .2rem;font-size:.82rem;color:#5B6670;font-weight:700}
-.sm-wrap{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:.3rem 0 .6rem}
-.sm-card{background:#fff;border:1px solid #E7E9EE;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(20,30,50,.05)}
-.sm-head{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;color:#fff;gap:10px}
+.sm-wrap{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:.3rem 0 .6rem}
+.sm-card{background:#fff;border:1px solid #E7E9EE;border-radius:12px;overflow:hidden;box-shadow:0 1px 2px rgba(20,30,50,.05)}
+.sm-head{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;color:#fff;gap:6px}
 .sm-head.r1{background:#C2185B}.sm-head.r2{background:#556B7A}.sm-head.r3{background:#6A55C2}.sm-head.rn{background:#3F4B57}
-.sm-ttl{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.3rem;min-width:0;letter-spacing:-.01em}
-.sm-ttl span.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sm-rk{background:#fff;color:#1C2430;border-radius:50%;min-width:28px;height:28px;display:inline-flex;align-items:center;
-justify-content:center;font-size:.9rem;font-weight:800;flex:none}
-.sm-pill{background:#fff;color:#1C2430;border-radius:8px;padding:5px 0;min-width:120px;text-align:center;font-weight:800;font-size:.95rem;flex:none}
-.sm-sub{display:flex;justify-content:space-between;gap:8px;margin:10px 14px 4px;padding:6px 12px;background:#F2F4F7;border-radius:8px;
-font-size:.76rem;font-weight:700;color:#3A4450}
-.sm-sub span:last-child{color:#5B6670;white-space:nowrap}.sm-sub em{font-style:normal}
-.sm-news{margin:2px 16px 4px;font-size:.74rem;color:#7A8490;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sm-news a{color:#5B6670;text-decoration:none}.sm-news .t{color:#6A55C2;font-weight:700;margin-right:6px}
-a.sm-row{display:block;padding:10px 18px 9px;border-bottom:1px solid #F0F1F4;text-decoration:none;color:#1C2430}
+.sm-ttl{display:flex;align-items:center;gap:6px;font-weight:800;font-size:.92rem;min-width:0;line-height:1.15}
+.sm-ttl span.nm{overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.sm-rk{background:#fff;color:#1C2430;border-radius:50%;min-width:20px;height:20px;display:inline-flex;align-items:center;
+justify-content:center;font-size:.72rem;font-weight:800;flex:none}
+.sm-pill{background:#fff;color:#1C2430;border-radius:6px;padding:2px 7px;text-align:center;font-weight:800;font-size:.8rem;flex:none}
+.sm-sub{display:flex;justify-content:space-between;gap:6px;margin:6px 8px 2px;padding:3px 8px;background:#F2F4F7;border-radius:6px;
+font-size:.68rem;font-weight:700;color:#3A4450;flex-wrap:wrap}
+.sm-sub span:last-child{color:#7A8490;white-space:nowrap;font-weight:500}.sm-sub em{font-style:normal}.sm-sub em.nm2{display:none}
+.sm-news{margin:2px 10px 2px;font-size:.66rem;color:#7A8490;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-news a{color:#5B6670;text-decoration:none}.sm-news .t{color:#6A55C2;font-weight:700;margin-right:5px}
+a.sm-row{display:block;padding:5px 10px 4px;border-bottom:1px solid #F0F1F4;text-decoration:none;color:#1C2430}
 a.sm-row:hover{background:#FAFAFD}
-.sm-l1,.sm-l2{display:flex;justify-content:space-between;align-items:center;gap:8px}
-.sm-nm{font-weight:700;font-size:1.02rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-l1,.sm-l2{display:flex;justify-content:space-between;align-items:center;gap:5px}
+.sm-nm{font-weight:700;font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .sm-nm.nh{color:#D6333B;text-decoration:underline}
-.sm-chg{font-weight:800;font-size:1.02rem;flex:none;min-width:78px;text-align:right}
-.sm-l2{font-size:.82rem;color:#7A8490;margin-top:3px}
+.sm-chg{font-weight:800;font-size:.82rem;flex:none}.sm-chg em{font-style:normal}.sm-chg em.c1{display:none}
+.sm-l2{font-size:.7rem;color:#7A8490;margin-top:1px}
 .sm-tv.big{color:#D6333B;font-weight:800}
-.sm-dot{width:8px;height:8px;border-radius:50%;background:#2EAD5B;display:inline-block;flex:none}
+.sm-dot{width:6px;height:6px;border-radius:50%;background:#2EAD5B;display:inline-block;flex:none}
 .sm-dot.off{background:#D5D9DE}
-.sm-ic{display:flex;align-items:center;gap:14px;flex:none}
-.sm-bar{position:relative;height:6px;margin-top:6px;background:#EEF0F3;border-radius:3px}
+.sm-ic{display:flex;align-items:center;gap:4px;flex:none;font-size:.7rem}
+.sm-bar{position:relative;height:5px;margin-top:3px;background:#EEF0F3;border-radius:2px}
 .sm-bar i{position:absolute;top:0;bottom:0}
-.sm-bar i.z{width:2px;background:#1C2430;top:-3px;bottom:-3px}
-.sm-bar i.w{top:2px;bottom:2px}
-.sm-bar i.b{top:0;bottom:0;border-radius:2px}
-.sm-card details summary{list-style:none;cursor:pointer;text-align:center;font-size:.8rem;color:#8A93A0;padding:8px}
+.sm-bar i.z{width:2px;background:#1C2430;top:-2px;bottom:-2px}
+.sm-bar i.w{top:1.5px;bottom:1.5px}
+.sm-bar i.b{top:0;bottom:0;border-radius:1px}
+.sm-card details summary{list-style:none;cursor:pointer;text-align:center;font-size:.72rem;color:#8A93A0;padding:5px}
 .sm-card details summary::-webkit-details-marker{display:none}
 .sm-card details[open] summary .more{display:none}.sm-card details:not([open]) summary .less{display:none}
 .sm-legend{font-size:.72rem;color:#8A93A0;margin:-.2rem 0 .5rem}
-@media (max-width:700px){.sm-wrap{gap:8px}.sm-head{padding:7px 8px;gap:4px}.sm-ttl{font-size:.86rem;gap:5px;line-height:1.15}
-.sm-ttl span.nm{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.sm-rk{min-width:20px;height:20px;font-size:.72rem}.sm-pill{min-width:0;padding:2px 6px;font-size:.78rem}
-.sm-sub{margin:6px 6px 2px;padding:4px 6px;font-size:.66rem;flex-direction:column;gap:0}.sm-news{margin:2px 7px;font-size:.66rem}
-a.sm-row{padding:5px 7px}.sm-nm,.sm-chg{font-size:.8rem}.sm-chg{min-width:0}.sm-ic{gap:4px}.sm-l2{font-size:.7rem;margin-top:1px}
-.sm-bar{margin-top:3px;height:5px}.sm-sub em.nm2{display:none}}
+@media (max-width:1100px){.sm-nm,.sm-chg{font-size:.76rem}.sm-ttl{font-size:.84rem}.sm-sub{font-size:.62rem}}
+@media (max-width:700px){.sm-wrap{gap:4px}.sm-card{border-radius:8px}
+.sm-head{padding:4px 4px;gap:2px;flex-direction:column;align-items:stretch}
+.sm-ttl{font-size:.66rem;gap:3px}.sm-rk{min-width:14px;height:14px;font-size:.55rem}
+.sm-pill{font-size:.62rem;padding:0 3px;border-radius:4px}
+.sm-sub,.sm-news,.sm-l2,.sm-ic{display:none}
+.sm-chg em.c2{display:none}.sm-chg em.c1{display:inline}
+a.sm-row{padding:3px 4px 2px}.sm-l1{gap:2px}.sm-nm{font-size:.62rem;letter-spacing:-.03em}.sm-chg{font-size:.6rem;letter-spacing:-.03em}
+.sm-bar{height:3px;margin-top:2px}.sm-bar i.z{width:1px;top:-1px;bottom:-1px}.sm-bar i.w{top:1px;bottom:1px}
+.sm-card details summary{font-size:.6rem;padding:3px}.sm-legend{font-size:.64rem}}
 </style>"""
 
 
@@ -2715,7 +2719,7 @@ def render_sector_movers(df: pd.DataFrame, quotes: dict):
         sort_lab = c2.segmented_control("정렬", ["돈 몰린 순", "상승률 순"], default="돈 몰린 순", key="sm_sort",
                                         label_visibility="collapsed",
                                         help="돈 몰린 순 = 오늘 오른 종목들의 거래대금 합계가 큰 섹터부터 · 상승률 순 = 거래대금 가중 평균 등락") or "돈 몰린 순"
-        n_cards = c3.selectbox("카드", [2, 4, 6, 8, 12], index=2, key="sm_n", label_visibility="collapsed",
+        n_cards = c3.selectbox("카드", [4, 8, 12, 16], index=1, key="sm_n", label_visibility="collapsed",
                                format_func=lambda n: f"섹터 {n}개")
         n_rows = c4.selectbox("종목", [5, 8, 10], index=1, key="sm_rows", label_visibility="collapsed",
                               format_func=lambda n: f"먼저 {n}종목")
@@ -2753,7 +2757,7 @@ def render_sector_movers(df: pd.DataFrame, quotes: dict):
                 f'<a class="sm-row" target="_self" href="?chart={html.escape(str(r["code"]))}">'
                 f'<div class="sm-l1"><span class="sm-nm{" nh" if nh else ""}">{html.escape(str(r["name"]))}</span>'
                 f'<span class="sm-ic"><span class="sm-dot{"" if rs_ok else " off"}"></span>{"⚠️" if hot else ""}'
-                f'<span class="sm-chg" style="color:{col};font-weight:{wt}">{chg:+.2f}%</span></span></div>'
+                f'</span><span class="sm-chg" style="color:{col};font-weight:{wt}"><em class="c2">{chg:+.2f}%</em><em class="c1">{chg:+.1f}</em></span></div>'
                 f'<div class="sm-l2"><span>{r["price"]:,.0f}</span>'
                 f'<span class="sm-tv{" big" if tv >= 1e11 else ""}">{_sm_eok(tv)}</span></div>'
                 f'{_sm_bar(r, lo, hi)}</a>')
