@@ -20,13 +20,12 @@ jobs:
       - name: render all tabs (real data)
         continue-on-error: true
         run: timeout 3000 python _audit/run_tabs.py app.py out/tabs.json 2>&1 | grep -v "ScriptRunContext\|No runtime found\|st.iframe\|will be removed\|^$" | tee out/tabs_log.txt
-      - name: push results to audit-out branch
+      - name: push results
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan audit-out-tmp
-          git rm -rq --cached . 
+          ls -la out || true
           git add -f out
-          git commit -qm "audit results $(date -u +%H%M)"
-          git push -f origin audit-out-tmp:audit-out
+          git commit -m "audit results" || true
+          git push origin HEAD:refs/heads/audit-res -f
