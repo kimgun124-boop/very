@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import html
+from urllib.parse import quote_plus
 import re
 import os
 
@@ -9121,74 +9122,152 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 
-# ─────────────────────────── 🎯 메인 매매 보드: 지금 살 종목 · 왜 · 보유 대응 ───────────────────────────
-TB_CSS = """
+# ─────────────────────────── 🎯 대시보드(10/28 시안): 지금 살 종목 · 왜 · 보유 대응 ───────────────────────────
+DB_CSS = """
 <style>
-.tb{background:#fff;border:1px solid #ECEEF5;border-radius:16px;padding:.9rem 1rem 1rem;margin:.2rem 0 1rem;
-    box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 18px rgba(91,71,245,.06)}
-.tb-top{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;flex-wrap:wrap}
-.tb-top .k{font-size:.78rem;font-weight:700;color:#5B47F5;letter-spacing:.02em}
-.tb-top .t{font-size:.72rem;color:#9CA3AF}
-.tb-v{border-radius:12px;padding:.75rem .9rem;margin:.45rem 0 .7rem}
-.tb-v h3{margin:0;font-size:1.25rem;font-weight:850;line-height:1.3}
-.tb-v p{margin:.25rem 0 0;font-size:.84rem;color:#374151;line-height:1.45}
-.tb-v .chips{margin-top:.45rem;display:flex;flex-wrap:wrap;gap:.3rem}
-.tb-chip{display:inline-block;font-size:.72rem;font-weight:700;padding:.15rem .5rem;border-radius:999px;background:#fff;
-         border:1px solid rgba(0,0,0,.08);color:#374151}
-.tb-sec{font-size:.86rem;font-weight:800;color:#111827;margin:.75rem 0 .4rem}
-.tb-sec small{font-weight:600;color:#9CA3AF;margin-left:.3rem}
-.tb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:.5rem}
-.tb-c{border:1px solid #ECEEF5;border-radius:12px;padding:.6rem .75rem;background:#fff}
-.tb-c.main{border-color:#E8858B;background:#FFF8F8}.tb-c.scout{border-color:#C9C1FF;background:#FAF9FF}
-.tb-c.watch{background:#FBFBFD}
-.tb-c .h{display:flex;justify-content:space-between;align-items:baseline;gap:.4rem}
-.tb-c .h a{font-weight:850;font-size:.98rem;color:#111827;text-decoration:none}
-.tb-c .h .p{font-size:.86rem;font-weight:700;white-space:nowrap}
-.tb-c .g{font-size:.72rem;color:#6B7280;margin:.05rem 0 .3rem}
-.tb-tag{font-size:.68rem;font-weight:800;padding:.1rem .4rem;border-radius:6px;margin-right:.25rem}
-.tb-tag.main{background:#FDECEC;color:#C0262E}.tb-tag.scout{background:#EFEDFF;color:#4532D9}.tb-tag.watch{background:#F3F4F6;color:#6B7280}
-.tb-c .w{font-size:.78rem;color:#374151;line-height:1.4}
-.tb-c .f{font-size:.74rem;color:#6B7280;margin-top:.35rem;border-top:1px dashed #ECEEF5;padding-top:.3rem}
-.tb-c .f b{color:#111827}
-.tb-empty{font-size:.84rem;color:#4B5563;background:#F9FAFB;border:1px dashed #E5E7EB;border-radius:12px;padding:.65rem .8rem}
-.tb-h{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:.4rem}
-.tb-hi{border-radius:10px;padding:.45rem .6rem;font-size:.8rem;border:1px solid #ECEEF5;background:#fff}
-.tb-hi b{font-size:.88rem}.tb-hi small{display:block;color:#6B7280;font-size:.72rem;margin-top:.1rem}
-.tb-why{margin:.2rem 0 0;padding-left:1.05rem;font-size:.8rem;color:#374151;line-height:1.55}
-.tb-why li{margin:.1rem 0}
-.tb-ladder{display:flex;flex-wrap:wrap;gap:.25rem;margin:.1rem 0 .2rem}
-.tb-ladder span{font-size:.7rem;padding:.12rem .45rem;border-radius:999px;background:#F3F4F6;color:#9CA3AF;font-weight:700}
-.tb-ladder span.on{background:#5B47F5;color:#fff}
-@media (max-width:640px){.tb{padding:.75rem .7rem .8rem}.tb-v h3{font-size:1.1rem}}
+.db{--b:#2B7FF0;--bs:#EAF2FE;--ink:#111827;--sub:#6B7280;--mut:#9CA3AF;--ln:#ECEEF5;--card:#fff;--up:#E5484D;
+    --amb:#F59E0B;--ambs:#FFF7E8;--grn:#16A34A;--grns:#E9F7EE}
+.db *{box-sizing:border-box}
+.db-card{background:var(--card);border:1px solid var(--ln);border-radius:18px;box-shadow:0 1px 2px rgba(16,24,40,.04),0 6px 22px rgba(43,127,240,.05);
+         padding:1.05rem 1.15rem}
+.db-hero{display:flex;gap:1rem;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:1rem}
+.db-hl{display:flex;gap:.9rem;align-items:flex-start;min-width:280px;flex:1 1 420px}
+.db-ic{flex:0 0 auto;width:48px;height:48px;border-radius:14px;background:var(--bs);display:flex;align-items:center;justify-content:center}
+.db-k{font-size:.8rem;font-weight:700;color:#374151}
+.db-hl h2{margin:.1rem 0 .25rem!important;padding:0!important;font-size:1.65rem!important;font-weight:850!important;color:var(--ink)!important;
+          letter-spacing:-.035em;line-height:1.25!important}
+.db-hl p{margin:0;font-size:.88rem;color:var(--sub);line-height:1.5}
+.db-mode{display:inline-block;margin-top:.45rem;font-size:.74rem;font-weight:800;border-radius:999px;padding:.18rem .65rem}
+.db-stats{display:grid;grid-template-columns:repeat(3,minmax(150px,190px));gap:.6rem;flex:0 1 auto}
+.db-st{border:1px solid var(--ln);border-radius:14px;padding:.7rem .8rem;background:#fff;min-width:0}
+.db-st .t{display:flex;align-items:center;gap:.45rem;font-size:.72rem;font-weight:800;color:#374151;letter-spacing:.02em}
+.db-st .t span{width:26px;height:26px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-size:.85rem;font-weight:900}
+.db-st b{display:block;font-size:1.15rem;font-weight:850;color:var(--ink);margin:.35rem 0 .1rem;white-space:nowrap}
+.db-st small{font-size:.7rem;color:var(--mut)}
+.db-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1rem;margin-bottom:1rem}
+.db-hd{display:flex;justify-content:space-between;align-items:flex-start;gap:.5rem;margin-bottom:.7rem}
+.db-hd h3{margin:0!important;padding:0!important;font-size:1.22rem!important;font-weight:850!important;color:var(--ink)!important;letter-spacing:-.03em}
+.db-hd p{margin:.15rem 0 0;font-size:.78rem;color:var(--sub)}
+.db-pill{font-size:.72rem;font-weight:800;border-radius:999px;padding:.25rem .65rem;white-space:nowrap;text-decoration:none!important}
+.db-pill.b{background:var(--bs);color:#1A62CC}.db-pill.r{background:#FDECEC;color:#C0262E}.db-pill.g{background:#F3F4F6;color:#4B5563}
+.db-tbl{width:100%;border-collapse:separate;border-spacing:0}
+.db-tbl th{background:#F5F8FD;font-size:.72rem;font-weight:700;color:var(--mut);text-align:left;padding:.5rem .55rem}
+.db-tbl th:first-child{border-radius:10px 0 0 10px}.db-tbl th:last-child{border-radius:0 10px 10px 0}
+.db-tbl td{padding:.62rem .55rem;border-bottom:1px solid #F1F3F8;vertical-align:middle}
+.db-tbl tr:last-child td{border-bottom:none}
+.db-rk{width:30px;height:30px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;font-weight:850;font-size:.85rem;
+       background:#F1F5F9;color:#64748B}
+.db-rk.on{background:var(--b);color:#fff}
+.db-ar{width:30px;height:30px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;background:var(--bs);color:var(--b);
+       font-weight:900;font-size:.85rem}
+.db-ar.off{background:#F8FAFC;color:#CBD5E1}
+.db-nm a{font-weight:850;font-size:.98rem;color:var(--ink)!important;text-decoration:none!important}
+.db-nm small{display:block;font-size:.72rem;color:var(--sub);margin-top:.1rem;line-height:1.35}
+.db-nm em{display:block;font-style:normal;font-size:.72rem;color:#1A62CC;font-weight:700;margin-top:.1rem}
+.db-px{font-weight:800;font-size:.9rem;color:var(--ink);white-space:nowrap}
+.db-ch b{font-size:.92rem;font-weight:850;white-space:nowrap}
+.db-ch small{display:block;font-size:.7rem;font-weight:700;margin-top:.1rem}
+.db-empty{font-size:.85rem;color:#4B5563;background:#F9FAFB;border:1px dashed #E5E7EB;border-radius:12px;padding:.8rem .9rem}
+.db-modebox{display:flex;gap:.8rem;align-items:flex-start;border-radius:14px;padding:.85rem .95rem;margin-bottom:.75rem;border:1px solid}
+.db-modebox .i{flex:0 0 auto;width:38px;height:38px;border-radius:11px;background:#fff;display:flex;align-items:center;justify-content:center;
+               font-weight:900;font-size:1.05rem}
+.db-modebox small{font-size:.72rem;font-weight:800}
+.db-modebox b{display:block;font-size:1.15rem;font-weight:850;color:var(--ink);margin:.1rem 0}
+.db-modebox p{margin:0;font-size:.8rem;color:#4B5563;line-height:1.45}
+.db-flt{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;background:#F5F8FD;border-radius:12px;padding:.6rem .75rem;margin-bottom:.85rem}
+.db-flt small{font-size:.72rem;color:var(--mut);font-weight:700;margin-right:.2rem}
+.db-chip{font-size:.72rem;font-weight:800;border-radius:999px;padding:.22rem .6rem;background:#fff;border:1px solid var(--ln);color:#374151}
+.db-chip.a{background:var(--ambs);border-color:#FBE3B8;color:#B45309}.db-chip.b{background:var(--bs);border-color:#CFE2FC;color:#1A62CC}
+.db-chip.g{background:var(--grns);border-color:#C9EBD5;color:#15803D}
+.db-ckh{display:flex;align-items:baseline;gap:.7rem;margin:.1rem 0 .45rem}
+.db-ckh b{font-size:.95rem;font-weight:850;color:var(--ink)}.db-ckh small{font-size:.72rem;color:var(--sub)}
+.db-ck{display:grid;grid-template-columns:auto 110px 1fr auto;align-items:center;gap:.7rem;border:1px solid var(--ln);border-radius:12px;
+       padding:.55rem .75rem;margin-bottom:.45rem}
+.db-ck .n{width:28px;height:28px;border-radius:8px;background:var(--bs);color:#1A62CC;font-weight:850;font-size:.74rem;display:flex;align-items:center;justify-content:center}
+.db-ck b{font-size:.9rem;font-weight:850;color:var(--ink)}
+.db-ck .d{font-size:.76rem;color:var(--sub)}
+.db-ck .d em{font-style:normal;color:#111827;font-weight:700}
+.db-ck i{width:20px;height:20px;border-radius:50%;border:2px solid #CBD5E1;display:inline-flex;align-items:center;justify-content:center;
+         font-style:normal;font-size:.7rem;font-weight:900;color:#fff}
+.db-ck i.on{background:var(--b);border-color:var(--b)}
+.db-bar{height:9px;border-radius:9px;background:#EEF2F8;margin-top:.55rem;overflow:hidden}
+.db-bar div{height:100%;border-radius:9px;background:var(--b)}
+.db-barl{font-size:.7rem;color:var(--mut);margin-top:.25rem}
+.db-sig{display:grid;grid-template-columns:auto 64px 1fr;gap:.7rem;align-items:center;background:#F7F9FC;border-radius:12px;padding:.6rem .75rem;margin-bottom:.45rem}
+.db-sig .n{width:26px;height:26px;border-radius:8px;color:#fff;font-weight:850;font-size:.7rem;display:flex;align-items:center;justify-content:center}
+.db-sig b{font-size:.86rem;font-weight:850;color:var(--ink)}
+.db-sig .d{font-size:.78rem;color:#4B5563;line-height:1.45}
+.db-two{display:grid;grid-template-columns:1fr 1fr;gap:.7rem}
+.db-box{background:#F7F9FC;border-radius:14px;padding:.85rem .9rem;min-width:0}
+.db-box h4{margin:0 0 .5rem!important;padding:0!important;font-size:.95rem!important;font-weight:850!important;color:var(--ink)!important;display:flex;align-items:center;gap:.45rem}
+.db-box h4 span{width:30px;height:30px;border-radius:9px;background:#E7F6EC;color:#16A34A;display:inline-flex;align-items:center;justify-content:center;font-weight:900}
+.db-hold{font-size:.8rem;padding:.4rem 0;border-top:1px solid #E9EDF4;line-height:1.4}
+.db-hold:first-of-type{border-top:none}
+.db-hold b{font-size:.86rem}.db-hold small{display:block;color:var(--sub);font-size:.72rem}
+.db-box p{margin:.2rem 0;font-size:.8rem;color:#4B5563;line-height:1.5}
+.db-box ul{margin:0;padding-left:0;list-style:none}
+.db-box li{font-size:.8rem;color:#374151;margin:.35rem 0;padding-left:1.1rem;position:relative;line-height:1.45}
+.db-box li::before{content:"";position:absolute;left:0;top:.42rem;width:8px;height:8px;border-radius:50%;background:var(--b)}
+.db-foot{display:flex;justify-content:space-between;gap:.5rem;font-size:.7rem;color:var(--mut);border-top:1px solid var(--ln);padding:.6rem .1rem 0;margin-top:.2rem}
+.db-foot b{letter-spacing:.08em;font-weight:800}
+.db-bds{display:flex;flex-wrap:wrap;gap:.25rem;margin-top:.25rem}
+.db-bd{font-size:.68rem;font-weight:700;color:#1A62CC;background:#EAF2FE;border-radius:6px;padding:.08rem .4rem;white-space:nowrap}
+.db-step{display:grid;grid-template-columns:auto 1fr auto;gap:.7rem;align-items:center;border:1px solid var(--ln);border-radius:12px;
+         padding:.55rem .75rem;margin-bottom:.4rem;position:relative}
+.db-step .n{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:850;font-size:.8rem;
+            background:#F1F5F9;color:#64748B}
+.db-step b{display:block;font-size:.88rem;font-weight:850;color:var(--ink)}
+.db-step .d{font-size:.76rem;color:var(--sub)}
+.db-step .r{font-size:.74rem;font-weight:800;border-radius:999px;padding:.2rem .6rem;white-space:nowrap;background:#F3F4F6;color:#6B7280}
+.db-step.ok .n{background:var(--b);color:#fff}.db-step.ok .r{background:var(--grns);color:#15803D}
+.db-step.no .n{background:#FDECEC;color:#C0262E}.db-step.no .r{background:#FDECEC;color:#C0262E}
+.db-concl{border:1.5px solid;border-radius:14px;padding:.7rem .9rem;margin-top:.7rem}
+.db-concl small{font-size:.72rem;font-weight:800}
+.db-concl b{display:block;font-size:1.3rem;font-weight:900;margin:.05rem 0}
+.db-concl p{margin:0;font-size:.84rem;color:#374151;font-weight:600}
+.db-rule{display:flex;align-items:center;gap:.6rem;font-size:.86rem;color:#1F2937;font-weight:600;background:#F7F9FC;border-radius:12px;
+         padding:.6rem .75rem;margin-bottom:.45rem}
+.db-rule span{flex:0 0 auto;width:26px;height:26px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-weight:900}
+.db-quote{font-size:.84rem;color:#374151;border-left:3px solid var(--b);padding:.35rem .75rem;margin-top:.6rem;line-height:1.5}
+.db-quote small{display:block;font-size:.72rem;color:var(--mut);margin-top:.15rem}
+.db-hl p b{color:#111827}
+@media (max-width:1100px){.db-stats{grid-template-columns:repeat(3,minmax(0,1fr));flex:1 1 100%}}
+@media (max-width:900px){.db-grid,.db-two{grid-template-columns:minmax(0,1fr)}.db-hl h2{font-size:1.3rem!important}
+  .db-ck{grid-template-columns:auto 1fr auto;row-gap:.15rem}.db-ck .n{grid-row:1/3;grid-column:1}.db-ck b{grid-column:2;grid-row:1}.db-ck .d{grid-column:2;grid-row:2}.db-ck i{grid-row:1/3;grid-column:3}}
+@media (max-width:520px){.db-card{padding:.85rem .8rem}.db-stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}
+  .db-st{padding:.5rem .55rem}.db-st b{font-size:.92rem;white-space:normal}.db-st small{display:none}
+  .db-tbl th:nth-child(2),.db-tbl td:nth-child(2){display:none}.db-tbl td{padding:.5rem .35rem}.db-sig{grid-template-columns:auto 1fr;row-gap:.3rem}
+  .db-sig .d{grid-column:1/3}}
 </style>
 """
+_DB_SHORT = {
+    "corr": "반등을 예상해 미리 사지 않고, 하락장에서 버티는 견조주 목록만 준비합니다.",
+    "rally12": "정방향 신호(3일차 강세·FTD) 전까지 기다리고, 신고가·거래량·주도 섹터를 함께 확인합니다.",
+    "day3": "3일차 강세 확인 — 견조주 중 오늘 신고가 가는 선도주에 정찰병을 작게 넣습니다.",
+    "susp_ftd": "의심스러운 FTD — 의심의 벽을 타는 자리. 인더스트리 액션 섹터 선도주에 정찰병을 넣습니다.",
+    "ftd": "FTD 확인 — 정찰병 중 살아서 오르는 종목에 점진적으로 비중을 늘립니다.",
+    "press": "분산일이 평소보다 많아요. 신규는 정찰병 크기로, 약한 종목부터 정리합니다.",
+    "up": "상승 추세 — 주도섹터 대장주의 신고가 돌파를 원칙대로 삽니다.",
+}
+_IDX_EN = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
+_CLOCK = ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2B7FF0" stroke-width="2.2" stroke-linecap="round">'
+          '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>')
 
 
-def _tb_card(kind: str, tag: str, code: str, name: str, group: str, price, chg, why: str, foot: str) -> str:
-    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#6B7280")
-    pr = f"{price:,.0f}원" if price else "-"
-    ch = f" <span style='color:{col}'>{chg:+.1f}%</span>" if chg is not None and chg == chg else ""
-    return (f'<div class="tb-c {kind}"><div class="h"><a href="?chart={html.escape(code)}" target="_self">{html.escape(str(name))}</a>'
-            f'<span class="p">{pr}{ch}</span></div>'
-            f'<div class="g"><span class="tb-tag {kind}">{html.escape(tag)}</span>{html.escape(str(group))}</div>'
-            f'<div class="w">{html.escape(why)}</div><div class="f">{foot}</div></div>')
-
-
-def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[str, int]:
-    """보유 종목 매도·대응 요약(잠금이 풀렸을 때만). 자세한 점검은 💼 내 보유."""
+def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[list, str | None, int]:
+    """보유 종목 매도·대응 요약(잠금이 풀렸을 때만). (행 [(이모지, 이름, 손익, 할 일)], 안내문, 급한 수)"""
     ss = st.session_state
     try:
         locked = holdings.has_password(holdings.load_settings()) and not ss.get("hold_unlocked")
     except Exception:  # noqa: BLE001
         locked = True
     if locked:
-        return ('<div class="tb-empty">🔒 보유 종목은 잠겨 있어요 — 💼 내 보유에서 비밀번호로 열면 여기에 '
-                '손절·익절·본절 신호가 떠요.</div>', 0)
+        return [], "🔒 잠겨 있어요 — 💼 내 보유에서 비밀번호로 열면 여기에 손절·익절·본절 신호가 떠요.", 0
     hs = [h for h in (holdings.load().get("holdings") or []) if h.get("account", "추세") == "추세"]
     if not hs:
-        return '<div class="tb-empty">추세 계좌 보유 종목이 없어요 — 💼 내 보유에 넣으면 매도 신호가 여기 떠요.</div>', 0
+        return [], "표시할 보유 종목이 없습니다. 💼 내 보유에 넣으면 여기서 매도 신호를 봐요.", 0
     px = dict(zip(df["code"], pd.to_numeric(df["price"], errors="coerce")))
-    atr = dict(zip(df["code"], pd.to_numeric(df.get("atr_pct"), errors="coerce"))) if "atr_pct" in df else {}
+    atr = dict(zip(df["code"], pd.to_numeric(df["atr_pct"], errors="coerce"))) if "atr_pct" in df else {}
     rows, urgent = [], 0
     order = {"🔴": 0, "🔵": 1, "🟠": 2, "🟣": 3, "🟢": 4, "⚪": 5}
     for h in hs:
@@ -9200,28 +9279,25 @@ def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[str, int]:
         sp = holdings._f(h.get("stop_pct")) or max(8.0, a if a == a and a else 0.0)
         pnl = (p / avg - 1) * 100
         r = pnl / sp if sp else 0
-        stop = avg * (1 - sp / 100)
-        t3 = avg * (1 + 3 * sp / 100)
+        stop, t3 = avg * (1 - sp / 100), avg * (1 + 3 * sp / 100)
         if p <= stop:
             em, act = "🔴", f"손절선 {stop:,.0f} 이탈 — 원칙대로 정리"
         elif r >= 3 and not h.get("half_taken"):
             em, act = "🔵", f"3R {t3:,.0f} 도달 — 절반 익절, 나머지는 5일선이 50일선에 닿을 때까지"
         elif r >= 2:
-            em, act = "🟣", f"+{r:.1f}R — 손절선을 본전({avg:,.0f}) 이상으로 올리기(R 사다리)"
+            em, act = "🟣", f"+{r:.1f}R — 손절선을 본전({avg:,.0f}) 이상으로 올리기"
         elif phase in ("corr", "rally12") and r < 1:
-            em, act = "🟠", f"쉬는 장 · 쿠션 {pnl:+.1f}% — 정찰병 크기인지 확인, 손절 {stop:,.0f} 넓히지 않기"
+            em, act = "🟠", f"쉬는 장 · 쿠션 없음 — 정찰병 크기인지 확인, 손절 {stop:,.0f} 넓히지 않기"
         else:
             em, act = "🟢", f"보유 유지 — 손절 {stop:,.0f} · 3R {t3:,.0f}"
         urgent += em in ("🔴", "🔵")
         rows.append((em, h["name"], f"{pnl:+.1f}% ({r:+.1f}R)", act))
     rows.sort(key=lambda x: order.get(x[0], 9))
-    body = "".join(f'<div class="tb-hi">{em} <b>{html.escape(n)}</b> {html.escape(v)}<small>{html.escape(a)}</small></div>'
-                   for em, n, v, a in rows)
-    return f'<div class="tb-h">{body}</div>', urgent
+    return rows, None, urgent
 
 
 def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
-    """첫 화면 맨 위: 오늘 판정(스승님 국면 플레이북 + 내 원칙) → 지금 살 종목과 이유 → 보유 매도·대응 → 해설."""
+    """🎯 대시보드: 오늘 판정 + 지수·진입 신호 → 준비/살 종목 TOP 6 · 오늘의 매매 판단 → 시장 흐름 · 보유·리스크."""
     try:
         sig = _ia_sig(df, histories, quotes)
     except Exception:  # noqa: BLE001
@@ -9240,95 +9316,212 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     allowed = scout.scout_allowed(phase)
     market_ok = sig.get("market_ok")
     pb = scout.PLAYBOOK.get(phase or "corr")
+    ph_key = phase or "corr"
+    esc = html.escape
 
-    # 지금 살 종목: ① 원칙 전부 통과(🔔 본매매) ② 정찰병(견조주 신고가)
-    cards, seen = [], set()
+    # ── TOP 6: 원칙 매수 → 정찰병 → (남는 칸) 준비 종목
+    rows, seen = [], set()
     for x in sig.get("signals") or []:
         seen.add(x["code"])
-        why = " · ".join(t for t in ("인더스트리 액션 섹터", f"거래량 {x['vx']:.1f}배", x["lead"], "⭐ 첫 돌파" if x["first"] else None,
-                                     "52주 신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%", "RS 70↑·지수 60일선 위·실적") if t)
-        cards.append(_tb_card("main", "🔔 원칙 매수 · 1유닛", x["code"], x["name"], x["group"], x["price"], x["chg"], why,
-                              f"손절 <b>{x['stop']:,.0f}</b> · 3R <b>{x['target']:,.0f}</b> · 아침·종가 나눠 사기"))
-    go = scout.pick(cands, n=6, per_group=2) if len(cands) else cands
+        why = " · ".join(t for t in (f"거래량 {x['vx']:.1f}배", x["lead"], "⭐ 첫 돌파" if x["first"] else None,
+                                     "신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%") if t)
+        rows.append({"kind": "main", "tag": "원칙 매수", "code": x["code"], "name": x["name"], "group": x["group"], "price": x["price"],
+                     "chg": x["chg"], "why": why, "plan": f"손절 {x['stop']:,.0f} · 3R {x['target']:,.0f} · 1유닛"})
     if allowed and phase != "up":
-        for r in go.itertuples():
-            if r.code in seen or len(cards) >= 8:
+        for r in scout.pick(cands, n=6, per_group=2).itertuples() if len(cands) else []:
+            if r.code in seen:
                 continue
             seen.add(r.code)
-            cards.append(_tb_card("scout", "🛰️ 정찰병", r.code, r.name, r.group, r.price, r.chg, r.why,
-                                  f"계좌 약 <b>{scout.SCOUT_WEIGHT:.0f}%</b> · 손절 <b>{r.stop:,.0f}</b> · 3R <b>{r.target:,.0f}</b>"))
-    n_main, n_scout = len(sig.get("signals") or []), len(cards) - len(sig.get("signals") or [])
+            rows.append({"kind": "scout", "tag": "정찰병", "code": r.code, "name": r.name, "group": r.group, "price": r.price,
+                         "chg": r.chg, "why": r.why, "plan": f"손절 {r.stop:,.0f} · 3R {r.target:,.0f} · 계좌 {scout.SCOUT_WEIGHT:.0f}%"})
+    n_buy = len(rows)
+    n_main = len(sig.get("signals") or [])
+    if len(rows) < 6 and len(cands):
+        pool = pd.concat([scout.pick(cands, 12, 2, "투입"), scout.pick(cands, 12, 2, "대기")])
+        for r in pool.itertuples():
+            if len(rows) >= 6:
+                break
+            if r.code in seen:
+                continue
+            seen.add(r.code)
+            rows.append({"kind": "watch", "tag": "우선 검토" if r.tier == "투입" else "관찰 후보", "code": r.code, "name": r.name,
+                         "group": r.group, "price": r.price, "chg": r.chg, "why": r.why, "plan": None})
     for x in (sig.get("signals") or []):
         if x["code"] not in st.session_state.setdefault("ia_toasted", set()):
             st.session_state["ia_toasted"].add(x["code"])
             st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
 
-    # 판정 한 줄
+    # ── 모드
     if n_main:
-        head, col, bg = f"🔔 지금 살 종목 {n_main + max(n_scout, 0)}개 — 원칙 매수 신호", "#C0262E", "#FDECEC"
-    elif n_scout > 0:
-        head, col, bg = f"🛰️ 정찰병 투입 — {n_scout}종목", pb["color"], pb["bg"]
+        mode, mcol, mbg, micon, mtitle = "매수 모드", "#15803D", "#E9F7EE", "✓", "매수 · 원칙 진입"
+        mdesc = f"원칙을 모두 통과한 종목 {n_main}개 — 아침·종가로 나눠 사고, 손절선을 먼저 정해 둡니다."
+        action = f"원칙 매수 {n_main}종목"
+    elif n_buy:
+        mode, mcol, mbg, micon, mtitle = "정찰병 모드", "#1A62CC", "#EAF2FE", "↗", "정찰병 · 소량 진입"
+        mdesc = f"견조주 중 오늘 신고가 가는 {n_buy}종목에 계좌 약 {scout.SCOUT_WEIGHT:.0f}%씩. 정찰병은 죽는 게 당연 — 1R 손절 그대로."
+        action = f"정찰병 투입 {n_buy}종목"
     elif allowed:
-        head, col, bg = "🛰️ 정찰병 허락 · 오늘 조건 맞는 종목은 아직 없음", pb["color"], pb["bg"]
+        mode, mcol, mbg, micon, mtitle = "정찰병 모드", "#1A62CC", "#EAF2FE", "…", "정찰병 허락 · 종목 대기"
+        mdesc = "국면은 정찰병을 허락했지만 조건 맞는 종목이 아직 없어요. 억지로 사지 않습니다."
+        action = "정찰병 허락 · 종목 대기"
     else:
-        head, col, bg = "🧘 오늘은 사지 않는 게 매매 — 견조주 목록만 준비", pb["color"], pb["bg"]
-    chips = [f"{pb['em']} {pb['title']}", pb["size"],
-             "지수 60일선 " + ("위 ✓" if market_ok else ("아래 ✕ → 정찰병만" if market_ok is False else "?"))]
-    if sig.get("d20") is not None:
-        chips.append(f"20 DOWN {sig['d20']:.0f}%")
-    if ia_secs:
-        chips.append("인더스트리 액션: " + ", ".join(ia_secs[:2]))
-    if n_res is not None:
-        chips.append(f"견조주 {n_res}개 추적")
-    ladder = "".join(f'<span class="{"on" if k == phase else ""}">{scout.PLAYBOOK[k]["em"]} {scout.PLAYBOOK[k]["title"].split(" — ")[0]}</span>'
-                     for k in scout.PHASE_ORDER)
-    now = data.now_kst()
-    out = [TB_CSS, '<div class="tb"><div class="tb-top"><span class="k">🎯 오늘의 매매 보드 · 추세추종</span>'
-           f'<span class="t">{now:%m/%d %H:%M} · {html.escape(ph_txt)}</span></div>',
-           f'<div class="tb-v" style="background:{bg};border:1.5px solid {col}33"><h3 style="color:{col}">{html.escape(head)}</h3>'
-           f'<p>{html.escape(pb["buy"])}</p><div class="chips">'
-           + "".join(f'<span class="tb-chip">{html.escape(c)}</span>' for c in chips) + '</div></div>',
-           f'<div class="tb-ladder">{ladder}</div>']
+        mode, mcol, mbg, micon, mtitle = "관찰 모드", "#B45309", "#FFF7E8", "!", "관찰 · 진입 대기"
+        mdesc = "아직 정방향 신호가 없습니다. 반등을 예상해 먼저 사지 않습니다."
+        action = "신규 매수는 대기"
+    headline = f"{pb['title'].split(' — ')[0]} · {action}"
 
-    out.append('<div class="tb-sec">🛒 지금 살 종목<small>원칙 매수(🔔)가 먼저, 그다음 정찰병(🛰️) · 이름을 누르면 차트</small></div>')
-    if cards:
-        out.append(f'<div class="tb-grid">{"".join(cards)}</div>')
+    # ── 지수 카드
+    hist_idx = load_indexes()
+    stats = []
+    for name, sym in data.MARKETS.items():
+        sm = data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}
+        ab = sm.get("above60")
+        ic, icol, ibg = ("↑", "#16A34A", "#E7F6EC") if ab else (("↓", "#D97706", "#FEF3E2") if ab is False else ("·", "#94A3B8", "#F1F5F9"))
+        ph = phases.get(name)
+        note = (scout.PLAYBOOK[ph["phase"]]["title"].split(" — ")[0] if ph else "-") + \
+            (f" · {sm['dist60']:+.1f}%" if sm.get("dist60") is not None else "")
+        stats.append(f'<div class="db-st"><div class="t"><span style="background:{ibg};color:{icol}">{ic}</span>{esc(_IDX_EN.get(name, name))}</div>'
+                     f'<b>60일선 {"위" if ab else ("아래" if ab is False else "-")}</b><small>{esc(note)}</small></div>')
+    sv = (f"매수 {n_main}" if n_main else (f"정찰병 {n_buy}" if n_buy else ("정찰병 허락" if allowed else "확인 대기")))
+    sic, scol, sbg = (("✓", "#16A34A", "#E7F6EC") if n_main else (("↗", "#1A62CC", "#EAF2FE") if (n_buy or allowed) else ("—", "#1A62CC", "#EAF2FE")))
+    stats.append(f'<div class="db-st"><div class="t"><span style="background:{sbg};color:{scol}">{sic}</span>진입 신호</div>'
+                 f'<b>{esc(sv)}</b><small>{esc((phases.get(best) or {}).get("why", "")[:28] or "정방향 신호 없음")}</small></div>')
+
+    # ── 진입 전 체크
+    kr = df[df["code"].map(data.is_kr)]
+    n_nh = int((pd.to_numeric(kr.get("days_since_high"), errors="coerce") == 0).sum()) if "days_since_high" in kr else 0
+    scan = sig.get("scan")
+    n_vol = int(((scan["vx"] >= 1.5) & scan["up"] & (pd.to_numeric(scan["chg"], errors="coerce") > 0)).sum()) if scan is not None and len(scan) else 0
+    n_lead = len(lead_groups(df))
+    checks = [("신고가", "52주 신고가 종목 2개 이상", f"오늘 {n_nh}개", n_nh >= 2),
+              ("거래량", "평균 대비 1.5배↑ 동반 상승", f"{n_vol}종목 · 액션 섹터 {len(ia_secs)}", bool(ia_secs)),
+              ("주도 섹터", "강한 종목이 섹터 안에서 확산", f"주도섹터 {n_lead}개", n_lead >= 1)]
+    ok_n = sum(1 for c in checks if c[3]) + (1 if allowed else 0)
+
+    # ── 판단 회로: 시장 → 지수 → 섹터 → 종목 → 결론
+    n_go = int((cands["tier"] == "투입").sum()) if len(cands) else 0
+    ph_short = pb["title"].split(" — ")[0]
+    sec_name = ", ".join(ia_secs[:2]) if ia_secs else (f"주도섹터 {n_lead}개" if n_lead else "없음")
+    steps = [
+        ("시장 국면", ph_short, allowed, "정찰병 허락" if allowed else "아직 대기"),
+        ("지수 60일선", " · ".join(f"{n} {'위' if (data.index_summary(hist_idx.get(sym, (data.empty_frame(), None))[0]) or {}).get('above60') else '아래'}"
+                                  for n, sym in data.MARKETS.items()),
+         True if market_ok else (False if market_ok is False else None), "본매매 가능" if market_ok else "정찰병만"),
+        ("주도·액션 섹터", sec_name, bool(ia_secs or n_lead), "있음" if (ia_secs or n_lead) else "돌파매매 쉼"),
+        ("종목 신호", f"원칙 매수 {n_main} · 견조주 신고가 {n_go}", bool(n_main or n_go), "후보 있음" if (n_main or n_go) else "후보 없음"),
+    ]
+    if n_main:
+        concl = ("매수", "원칙 매수 1유닛 · 아침·종가 나눠 사기 · 손절 -8%")
+    elif n_buy:
+        concl = ("정찰병", f"계좌 {scout.SCOUT_WEIGHT:.0f}%씩 · 손절 -8% · 같은 섹터 2개까지")
+    elif allowed:
+        concl = ("대기", "정찰병은 허락 — 조건 맞는 종목이 나올 때까지 사지 않기")
     else:
-        wait = (pd.concat([scout.pick(cands, 6, 2, "투입"), scout.pick(cands, 6, 2, "대기")]).head(6)
-                if len(cands) else cands)
-        reason = ("정찰병은 허락됐지만 견조주 중 오늘 신고가 가는 종목이 없어요 — 억지로 사지 않기" if allowed and phase != "up" else
-                  "원칙을 모두 통과한 종목이 없어요" if phase == "up" else
-                  "아직 정찰병 전 단계예요 — 반등을 예상해 미리 사지 않아요")
-        out.append(f'<div class="tb-empty">{html.escape(reason)}.</div>')
-        if len(wait):
-            out.append('<div class="tb-sec">👀 준비 목록<small>견조주 중 신고가 근처 — 국면이 허락하고 신고가를 가면 정찰병</small></div>')
-            out.append('<div class="tb-grid">' + "".join(
-                _tb_card("watch", "대기" if r.tier == "대기" else "신고가(국면 대기)", r.code, r.name, r.group, r.price, r.chg, r.why,
-                         f"신고가까지 <b>{max(r.to_res or 0, 0):.1f}%</b> · 손절 기준 {r.stop:,.0f}")
-                for r in wait.itertuples()) + '</div>')
+        concl = ("쉬기", "사지 않는 게 매매 — 견조주 목록만 준비")
+    ok_n = sum(1 for s_ in steps if s_[2])
 
-    hold_html, urgent = _tb_holdings(df, phase)
-    out.append(f'<div class="tb-sec">💼 보유 종목 — 매도·대응<small>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else pb["hold"]}</small></div>')
-    out.append(hold_html)
+    why_bits = [x for x in ((phases.get(best) or {}).get("why", "").split(" — ")[0],
+                            f"액션 섹터 {ia_secs[0]}" if ia_secs else None,
+                            "60일선 아래 → 정찰병만" if market_ok is False else None) if x]
 
-    notes = scout.commentary(phase, ph_txt, market_ok, sig.get("d20"), cands, ia_secs, n_res, len(lead_groups(df)))
-    out.append('<div class="tb-sec">🧭 왜 이렇게 보나 — 해설</div><ul class="tb-why">'
-               + "".join(f"<li>{x}</li>" for x in notes) + "</ul></div>")
-    st.markdown("".join(out), unsafe_allow_html=True)
+    # ── HTML
+    o = [DB_CSS, '<div class="db">',
+         f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
+         f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" · ".join(why_bits))}</p>'
+         f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
+         f'<div class="db-stats">{"".join(stats)}</div></div>',
+         '<div class="db-grid">']
+    # 왼쪽: TOP 6 — 종목마다 '왜'는 배지 3개, '어떻게'는 손절·3R 한 줄
+    if n_buy:
+        t_title, t_sub = "지금 살 종목 TOP 6", "원칙 매수 → 정찰병 순 · 이름을 누르면 차트"
+    else:
+        t_title, t_sub = "준비 종목 TOP 6", "국면이 허락하고 신고가를 가면 정찰병 후보"
+    link = "?tab=" + quote_plus("🏁 신고가 후보")
+    o.append(f'<div class="db-card"><div class="db-hd"><div><h3>{t_title}</h3><p>{t_sub}</p></div>'
+             f'<a class="db-pill b" href="{link}" target="_self">전체 보기 →</a></div>')
+    _short = (("52주 신고가 종가 돌파", "신고가 돌파"), ("신고가 돌파", "신고가 돌파"), ("오늘 인더스트리 액션 섹터", "액션 섹터"),
+              ("섹터에서 먼저 신고가", "섹터 첫 신고가"), ("⭐ 첫 돌파", "첫 돌파"), ("👑 대장주", "대장주"))
+
+    def badges(why: str) -> str:
+        out = []
+        for w in (why or "").split(" · "):
+            if w.startswith("조정 바닥"):
+                w = "견조주"
+            for a, b in _short:
+                if w == a:
+                    w = b
+            if w and w not in out:
+                out.append(w)
+        return "".join(f'<span class="db-bd">{esc(x)}</span>' for x in out[:3])
+
+    if rows:
+        trs = []
+        for i, r in enumerate(rows[:6], 1):
+            chg = r["chg"]
+            if chg is None or chg != chg:
+                continue
+            on = r["kind"] in ("main", "scout") or r["tag"] == "우선 검토"
+            ccol = "#E5484D" if chg > 0 else ("#1F66C9" if chg < 0 else "#6B7280")
+            tcol = {"main": "#15803D", "scout": "#1A62CC"}.get(r["kind"], "#1A62CC" if r["tag"] == "우선 검토" else "#9CA3AF")
+            trs.append(f'<tr><td><span class="db-rk{" on" if on else ""}">{i}</span></td>'
+                       f'<td><span class="db-ar{"" if on else " off"}">{"↗" if on else "·"}</span></td>'
+                       f'<td class="db-nm"><a href="?chart={esc(r["code"])}" target="_self">{esc(str(r["name"]))}</a>'
+                       f'<small>{esc(str(r["group"]))}</small><div class="db-bds">{badges(r["why"])}</div>'
+                       + (f'<em>{esc(r["plan"])}</em>' if r["plan"] else "") + '</td>'
+                       f'<td class="db-px">{r["price"]:,.0f}원</td>'
+                       f'<td class="db-ch"><b style="color:{ccol}">{chg:+.1f}%</b><small style="color:{tcol}">{esc(r["tag"])}</small></td></tr>')
+        o.append('<table class="db-tbl"><thead><tr><th>순위</th><th></th><th>종목 / 왜</th><th>현재가</th><th>등락률</th></tr></thead>'
+                 f'<tbody>{"".join(trs)}</tbody></table>')
+    else:
+        o.append('<div class="db-empty">조건에 맞는 견조주 후보가 아직 없어요 — 📉 하락장 점검에서 버티는 종목부터 확인.</div>')
+    o.append('</div>')
+    # 오른쪽: 판단 회로
+    live = data.market_status(quotes).startswith("장중")
+    o.append(f'<div class="db-card"><div class="db-hd"><div><h3>판단 회로</h3><p>위에서 아래로 — 하나라도 막히면 그 단계에서 멈춤</p></div>'
+             f'<span class="db-pill {"r" if live else "g"}">{"LIVE" if live else "장 마감"}</span></div>')
+    for i, (t, v, ok, res_) in enumerate(steps, 1):
+        cls = "ok" if ok else ("no" if ok is False else "na")
+        o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{t}</b><span class="d">{esc(v)}</span></div>'
+                 f'<span class="r">{"✓" if ok else ("✕" if ok is False else "?")} {esc(res_)}</span></div>')
+    o.append(f'<div class="db-bar"><div style="width:{ok_n / 4 * 100:.0f}%"></div></div>'
+             f'<div class="db-concl" style="background:{mbg};border-color:{mcol}55"><small style="color:{mcol}">결론</small>'
+             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p></div></div></div>')
+
+    # 아래 왼쪽: 보유 → 매도 회로
+    hrows, hmsg, urgent = _tb_holdings(df, phase)
+    hold_html = ("".join(f'<div class="db-hold">{em} <b>{esc(n)}</b> {esc(v)}<small>{esc(a)}</small></div>' for em, n, v, a in hrows[:6])
+                 if hrows else f'<div class="db-empty">{esc(hmsg or "")}</div>')
+    o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>보유 → 매도 판단</h3>'
+             f'<p>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else "🔴 손절 · 🔵 3R 절반 · 🟣 본절 올리기 · 🟢 유지"}</p></div>'
+             f'<a class="db-pill b" href="?tab={quote_plus("💼 내 보유")}" target="_self">내 보유 →</a></div>{hold_html}</div>')
+    # 아래 오른쪽: 오늘 지킬 것
+    do_now = {"corr": "사지 않기 · 버티는 견조주 목록 만들기", "rally12": "3일차 강세까지 기다리기 · 견조주 신고가 근접 체크",
+              "day3": "견조주 중 거래량 실은 신고가만 · 정찰병 3%", "susp_ftd": "액션 섹터 선도주에 정찰병 · 랠리 저점 깨면 되돌림",
+              "ftd": "살아서 오르는 정찰병에만 비중 추가", "press": "신규는 작게 · 약한 종목부터 정리",
+              "up": "주도섹터 대장주 신고가 돌파 · 1유닛부터"}[ph_key]
+    rules = [("✓", "#16A34A", do_now), ("✕", "#E5484D", "물타기 · 손절 넓히기 · 같은 섹터 우르르"),
+             ("✓", "#16A34A", "1R -8% · 종목당 위험 1.5% · 3R(+24%) 절반 익절")]
+    o.append('<div class="db-card"><div class="db-hd"><div><h3>오늘 지킬 것</h3><p>스승님 플레이북 + 내 원칙</p></div>'
+             '<span class="db-pill g">오늘 기준</span></div>'
+             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span>{esc(x)}</div>' for m, c, x in rules)
+             + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님</small></div></div></div>')
+    o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div></div>')
+    st.markdown("".join(o), unsafe_allow_html=True)
 
     with st.expander("📖 스승님 국면별 플레이북 — 이런 장에선 이렇게"):
-        rows = [{"단계": f"{v['em']} {v['title']}", "비중": v["size"], "매수": v["buy"], "보유·매도": v["hold"], "스승님": v["mentor"],
-                 "지금": "👉" if k == phase else ""} for k, v in ((k, scout.PLAYBOOK[k]) for k in scout.PHASE_ORDER)]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+        tb = [{"단계": f"{v['em']} {v['title']}", "비중": v["size"], "매수": v["buy"], "보유·매도": v["hold"], "스승님": v["mentor"],
+               "지금": "👉" if k == phase else ""} for k, v in ((k, scout.PLAYBOOK[k]) for k in scout.PHASE_ORDER)]
+        st.dataframe(pd.DataFrame(tb), hide_index=True, width="stretch",
                      column_config={"매수": st.column_config.TextColumn(width="large"),
                                     "보유·매도": st.column_config.TextColumn(width="large"),
                                     "스승님": st.column_config.TextColumn(width="medium")})
         for n, v in phases.items():
             if v:
                 st.caption(f"{n}: {v['em']} {v['title']} — {v['why']}")
+        notes = scout.commentary(phase, ph_txt, market_ok, sig.get("d20"), cands, ia_secs, n_res, n_lead)
+        st.markdown("**🧭 해설**\n" + "\n".join("- " + re.sub(r"</?b>", "**", x) for x in notes))
         st.caption(f"출처: {scout.MENTOR_SRC} · 정찰병 = 1유닛(계좌 6% 안팎)보다 작게, 약 {scout.SCOUT_WEIGHT:.0f}%. "
-                   "견조주 = 지수 조정 바닥날 52주 고점에 가장 가까웠던 상위 20%. 효석 원칙(리스크관리 우선, 60일선 아래 본매매 휴식)이 항상 먼저예요. "
-                   "매매 추천이 아니라 원칙·스승님 플레이북 확인용이에요.")
+                   "견조주 = 지수 조정 바닥날 52주 고점에 가장 가까웠던 상위 20%. 효석 원칙(리스크관리 우선, 60일선 아래 본매매 휴식)이 항상 먼저예요.")
 
 
 def _ia_sig(df: pd.DataFrame, histories: dict, quotes: dict) -> dict:
@@ -10304,6 +10497,14 @@ def _nav_pick_tab(gi: int):
 def main_nav() -> str:
     """1줄: 6개 묶음 카드 · 2줄: 고른 묶음의 탭 알약 · 3줄: 지금 탭 한 줄 설명. 보고 있는 탭만 계산해요."""
     ss = st.session_state
+    try:                          # 매매 보드 안 링크(?tab=탭 이름)로 탭 이동
+        qt = st.query_params.get("tab")
+        if qt:
+            if qt in _NAV_OF:
+                ss["main_tab_sel"] = qt
+            del st.query_params["tab"]
+    except Exception:  # noqa: BLE001
+        pass
     cur = ss.get("main_tab_sel")
     if cur not in _NAV_OF:
         cur = NAV_GROUPS[0][1][0]
