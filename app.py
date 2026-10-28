@@ -9228,18 +9228,29 @@ DB_CSS = """
 .db-concl p{margin:0;font-size:0.97rem;color:#374151;font-weight:600}
 .db-rule{display:flex;align-items:center;gap:.6rem;font-size:1.00rem;color:#1F2937;font-weight:600;background:#F7F9FC;border-radius:12px;
          padding:.6rem .75rem;margin-bottom:.45rem}
-.db-rule span{flex:0 0 auto;width:26px;height:26px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-weight:900}
+.db-rule > span{flex:0 0 auto;width:26px;height:26px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-weight:900}
 .db-quote{font-size:0.97rem;color:#374151;border-left:3px solid var(--b);padding:.35rem .75rem;margin-top:.6rem;line-height:1.5}
 .db-quote small{display:block;font-size:0.84rem;color:var(--mut);margin-top:.15rem}
 .db-hl p b{color:#111827}
 @media (max-width:520px){.db-step{grid-template-columns:auto 1fr}.db-step .r{grid-column:2;justify-self:start;margin-top:.1rem}}
+.db .ln{display:block;margin:.14rem 0;line-height:1.55}
+.db .ln.lead{font-weight:800;color:#111827}
+.db-nt{font-size:0.88rem;font-weight:850;color:#111827;margin-bottom:.3rem}
+.db-dl{display:grid;grid-template-columns:78px 1fr;gap:.7rem;padding:.45rem 0;border-top:1px solid #E6EAF2}
+.db-dl:first-of-type{border-top:none}.db-dl b{font-size:0.86rem;font-weight:850}
+.db-cmr{display:grid;grid-template-columns:118px 1fr;gap:.8rem;padding:.6rem 0;border-top:1px solid #F1F3F8;font-size:0.92rem;color:#374151}
+.db-cmr:first-of-type{border-top:none}
+.db-cmr b{align-self:start;font-size:0.82rem;font-weight:850;color:#1A62CC;background:#EAF2FE;border-radius:8px;padding:.2rem .5rem;text-align:center}
+.db-sig{align-items:start}.db-sig .n{margin-top:.1rem}.db-sig b{margin-top:.15rem}
+.db-step .x .ln{margin:.1rem 0}
+@media (max-width:520px){.db-dl{grid-template-columns:1fr;gap:.15rem}.db-cmr{grid-template-columns:1fr;gap:.3rem}.db-cmr b{justify-self:start}}
 .db .db-a{font-family:'Pretendard Variable',Pretendard,'Malgun Gothic','Apple SD Gothic Neo',sans-serif!important}
 .db-step .x{margin:.25rem 0 0;font-size:0.88rem;color:#4B5563;line-height:1.5}
 .db-step{align-items:start}.db-step .r{margin-top:.15rem}
 .db-concl .x{margin-top:.3rem!important;font-size:0.93rem!important;color:#4B5563!important;font-weight:500!important;line-height:1.5}
 .db-note{font-size:0.89rem;color:#4B5563;line-height:1.6;background:#F7F9FC;border-radius:12px;padding:.6rem .75rem;margin-top:.7rem}
 .db-note b{color:#111827}
-.db-rule{align-items:flex-start}.db-rule small{display:block;font-size:0.88rem;font-weight:500;color:#6B7280;margin-top:.15rem;line-height:1.5}
+.db-rule{align-items:flex-start}.db-rule small{display:block;margin-top:.2rem!important;font-size:0.88rem;font-weight:500;color:#6B7280;margin-top:.15rem;line-height:1.5}
 .db-cm{margin:0;padding-left:1.1rem;font-size:0.95rem;color:#374151;line-height:1.65}
 .db-cm li{margin:.2rem 0}.db-cm b{color:#111827}
 @media (max-width:1100px){.db-stats{grid-template-columns:repeat(3,minmax(0,1fr));flex:1 1 100%}}
@@ -9263,6 +9274,24 @@ _DB_SHORT = {
 _IDX_EN = {"코스피": "KOSPI", "코스닥": "KOSDAQ"}
 _CLOCK = ('<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2B7FF0" stroke-width="2.2" stroke-linecap="round">'
           '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>')
+
+
+def _db_lines(text, by_mid: bool = False, lead: bool = False) -> str:
+    """긴 설명을 한 줄에 한 가지씩: 문장 끝(. )마다, by_mid면 ' · '마다 줄을 나눠요."""
+    parts = [str(text or "").strip()]
+    parts = [q for x in parts for q in re.split(r"(?<=[.])\s+(?=[^\d\s])", x)]
+    if by_mid:
+        parts = [q for x in parts for q in x.split(" · ")]
+    parts = [q.strip() for q in parts if q and q.strip()]
+    return "".join(f'<span class="ln{" lead" if lead and i == 0 else ""}">{html.escape(q)}</span>' for i, q in enumerate(parts))
+
+
+def _db_note_row(x: str) -> str:
+    """해설 한 항목('<b>제목</b>: 내용') → 제목 칸 + 줄 나눈 내용."""
+    m = re.match(r"<b>(.*?)</b>\s*:?\s*(.*)", x, flags=re.S)
+    label, body = (m.group(1), m.group(2)) if m else ("", x)
+    body = re.sub(r"</?b>", "", body)
+    return f'<div class="db-cmr"><b>{html.escape(label)}</b><div>{_db_lines(body, by_mid=True)}</div></div>'
 
 
 def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[list, str | None, int]:
@@ -9508,11 +9537,17 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
                        f'<td class="db-ch"><b style="color:{ccol}">{chg:+.1f}%</b><small style="color:{tcol}">{esc(r["tag"])}</small></td></tr>')
         o.append('<table class="db-tbl"><thead><tr><th>순위</th><th></th><th>종목 / 왜</th><th>현재가</th><th>등락률</th></tr></thead>'
                  f'<tbody>{"".join(trs)}</tbody></table>')
-        o.append('<div class="db-note"><b>읽는 법</b> · <b style="color:#15803D">원칙 매수</b> = 오늘 인더스트리 액션 섹터에서 내 원칙'
-                 '(지수 60일선 위·RS 70↑·거래량·장대양봉·저항 돌파·실적)을 모두 통과 → 1유닛, 아침·종가 나눠 사기. '
-                 f'<b style="color:#1A62CC">정찰병</b> = 조정 때 버틴 견조주 중 오늘 거래량 실어 52주 신고가 → 계좌 약 {scout.SCOUT_WEIGHT:.0f}%, '
-                 '손절 -8%, 같은 섹터 2개까지. 살아서 3R 쪽으로 가면 그때 키워요. '
-                 '<b>우선 검토</b> = 신고가는 갔지만 국면이 아직 허락 전 · <b>관찰 후보</b> = 신고가까지 3% 안.</div>')
+        legend = [("#15803D", "원칙 매수", ["오늘 인더스트리 액션 섹터 + 내 원칙 전부 통과",
+                                           "지수 60일선 위 · RS 70↑ · 거래량 · 장대양봉 · 저항 돌파 · 실적",
+                                           "→ 1유닛, 아침·종가 나눠 사기"]),
+                  ("#1A62CC", "정찰병", ["조정 때 버틴 견조주 중 오늘 거래량 실어 52주 신고가",
+                                       f"→ 계좌 약 {scout.SCOUT_WEIGHT:.0f}% · 손절 -8% · 같은 섹터 2개까지",
+                                       "살아서 3R 쪽으로 가면 그때 키우기"]),
+                  ("#111827", "우선 검토", ["신고가는 갔지만 국면이 아직 허락 전"]),
+                  ("#6B7280", "관찰 후보", ["신고가까지 3% 안 — 지켜보기"])]
+        o.append('<div class="db-note"><div class="db-nt">읽는 법</div>' + "".join(
+            f'<div class="db-dl"><b style="color:{c}">{t}</b><div>' + "".join(f'<span class="ln">{esc(x)}</span>' for x in ls) + '</div></div>'
+            for c, t, ls in legend) + '</div>')
     else:
         o.append('<div class="db-empty">조건에 맞는 견조주 후보가 아직 없어요 — 📉 하락장 점검에서 버티는 종목부터 확인.</div>')
     o.append('</div>')
@@ -9523,35 +9558,41 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     for i, (t, v, ok, res_) in enumerate(steps, 1):
         cls = "ok" if ok else ("no" if ok is False else "na")
         o.append(f'<div class="db-step {cls}"><span class="n">{i}</span><div><b>{t}</b><span class="d">{esc(v)}</span>'
-                 f'<p class="x">{esc(step_x[i - 1])}</p></div>'
+                 f'<div class="x">{_db_lines(step_x[i - 1])}</div></div>'
                  f'<span class="r">{"✓" if ok else ("✕" if ok is False else "?")} {esc(res_)}</span></div>')
     o.append(f'<div class="db-bar"><div style="width:{ok_n / 4 * 100:.0f}%"></div></div>'
              f'<div class="db-concl" style="background:{mbg};border-color:{mcol}55"><small style="color:{mcol}">결론</small>'
-             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p><p class="x">{esc(mdesc)}</p></div></div></div>')
+             f'<b style="color:{mcol}">{micon} {esc(concl[0])}</b><p>{esc(concl[1])}</p><div class="x">{_db_lines(mdesc)}</div></div></div></div>')
 
     # 아래 1줄: 시장 흐름 · 핵심 신호 | 보유 → 매도 판단
     rule60 = ("코스피·코스닥 60일선 아래 → 본매매(유닛)는 쉬고 정찰병 크기만." if market_ok is False else
               "지수 60일선 위 → 원칙 유닛 매매 가능." if market_ok else "")
-    sec_txt = step_x[2]
-    stock_txt = step_x[3] + " RS·실적·거래량을 함께 확인하고, 숫자 없는 테마성 급등은 비중을 줄여요."
     d20 = sig.get("d20")
-    mkt_txt = (f"{pb['em']} {pb['title']} — {(phases.get(best) or {}).get('why', '')}. {rule60}"
-               + (f" 20 DOWN {d20:.0f}%" + (" — 과매도권(저가매수는 가치 계좌에서 3~5유닛 분할)." if d20 >= 80 else ".") if d20 is not None else ""))
-    sigs = [("01", "#2B7FF0", "시장", mkt_txt), ("02", "#7C5CF0", "섹터", sec_txt), ("03", "#16A34A", "종목", stock_txt),
-            ("04", "#F59E0B", "스승님", f"“{pb['mentor']}” — 장이 좋아질지 다시 내려갈지는 아무도 몰라요. 정해진 규칙대로 대응.")]
+    mkt_lines = [f"{pb['em']} {pb['title']}", (phases.get(best) or {}).get("why", ""), rule60]
+    if d20 is not None:
+        mkt_lines.append(f"20 DOWN {d20:.0f}%" + (" — 과매도권 (저가매수는 가치 계좌에서 3~5유닛 분할)" if d20 >= 80 else ""))
+    sigs = [("01", "#2B7FF0", "시장", "".join(f'<span class="ln{" lead" if i == 0 else ""}">{esc(x)}</span>'
+                                               for i, x in enumerate(mkt_lines) if x)),
+            ("02", "#7C5CF0", "섹터", _db_lines(step_x[2])),
+            ("03", "#16A34A", "종목", _db_lines(step_x[3]) + '<span class="ln">RS·실적·거래량을 함께 확인 — 숫자 없는 테마성 급등은 비중 축소</span>'),
+            ("04", "#F59E0B", "스승님", f'<span class="ln lead">“{esc(pb["mentor"])}”</span>'
+                                       '<span class="ln">장이 좋아질지 다시 내려갈지는 아무도 몰라요 → 정해진 규칙대로 대응</span>')]
     hrows, hmsg, urgent = _tb_holdings(df, phase)
     hold_html = ("".join(f'<div class="db-hold">{em} <b>{esc(n)}</b> {esc(v)}<small>{esc(a)}</small></div>' for em, n, v, a in hrows[:6])
                  if hrows else f'<div class="db-empty">{esc(hmsg or "")}</div>')
     o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>시장 흐름 · 핵심 신호</h3>'
              '<p>시장 → 섹터 → 종목 순서로 지금 상황을 풀어서 봐요.</p></div><span class="db-pill g">오늘 기준</span></div>'
-             + "".join(f'<div class="db-sig"><span class="n" style="background:{c}">{n}</span><b>{t}</b><span class="d">{esc(x)}</span></div>'
+             + "".join(f'<div class="db-sig"><span class="n" style="background:{c}">{n}</span><b>{t}</b><span class="d">{x}</span></div>'
                        for n, c, t, x in sigs) + '</div>')
     o.append('<div class="db-card"><div class="db-hd"><div><h3>보유 → 매도 판단</h3>'
              f'<p>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else "🔴 손절 · 🔵 3R 절반 · 🟣 본절 올리기 · 🟢 유지"}</p></div>'
              f'<a class="db-pill b" href="?tab={quote_plus("💼 내 보유")}" target="_self">내 보유 →</a></div>{hold_html}'
-             '<div class="db-note"><b>매도 기준</b> · 🔴 손절선(평단 -8%, ATR이 8%보다 크면 ATR) 이탈은 예외 없이 정리 · '
-             '🔵 3R(+24%)에서 절반 익절, 나머지는 일봉 5일선이 50일선에 닿을 때 · 🟣 +2R이면 손절선을 본전으로, +4R이면 +1R로 · '
-             f'추가 매수(불타기) 때 3R 익절가는 처음 가격 그대로.<br><b>지금 장</b> · {esc(pb["hold"])}</div></div></div>')
+             '<div class="db-note"><div class="db-nt">매도 기준</div>'
+             '<span class="ln">🔴 손절선 이탈 → 예외 없이 정리 (평단 -8%, ATR이 8%보다 크면 ATR)</span>'
+             '<span class="ln">🔵 3R(+24%) → 절반 익절, 나머지는 일봉 5일선이 50일선에 닿을 때</span>'
+             '<span class="ln">🟣 +2R → 손절선을 본전으로, +4R → +1R로 올리기</span>'
+             '<span class="ln">➕ 불타기 때 3R 익절가는 처음 가격 그대로</span>'
+             f'<div class="db-nt" style="margin-top:.55rem">지금 장</div>{_db_lines(pb["hold"], by_mid=True)}</div></div></div>')
     # 아래 2줄: 오늘 지킬 것 | 해설
     do_now = {"corr": "사지 않기 · 버티는 견조주 목록 만들기", "rally12": "3일차 강세까지 기다리기 · 견조주 신고가 근접 체크",
               "day3": "견조주 중 거래량 실은 신고가만 · 정찰병 3%", "susp_ftd": "액션 섹터 선도주에 정찰병 · 랠리 저점 깨면 되돌림",
@@ -9565,11 +9606,11 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     notes = scout.commentary(phase, ph_txt, market_ok, d20, cands, ia_secs, n_res, n_lead)
     o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>오늘 지킬 것</h3><p>스승님 플레이북 + 내 원칙</p></div>'
              '<span class="db-pill g">오늘 기준</span></div>'
-             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div>{esc(x)}<small>{esc(y)}</small></div></div>'
+             + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div>{esc(x)}<small>{_db_lines(y)}</small></div></div>'
                        for m, c, x, y in rules)
              + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님 · {esc(pb["title"])}</small></div></div>')
     o.append('<div class="db-card"><div class="db-hd"><div><h3>🧭 해설</h3><p>지금 장을 스승님 플레이북으로 읽고 내 원칙과 겹쳐 본 결론</p></div></div>'
-             '<ul class="db-cm">' + "".join(f"<li>{x}</li>" for x in notes) + '</ul></div></div>')
+             + "".join(_db_note_row(x) for x in notes) + '</div></div>')
     o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div></div>')
     out = "".join(o)
     for ch in "→↑↓←↗":            # SUIT는 화살표를 꺾쇠(> ^)처럼 그려서, 화살표만 원래 글꼴로
