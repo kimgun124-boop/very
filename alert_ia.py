@@ -20,6 +20,8 @@ from pathlib import Path
 import requests
 
 import data
+import market as msig
+import scout
 import stocks as stock_list
 
 STATE = Path(".alert_state/sent.json")
@@ -118,7 +120,29 @@ def main():
                 for c in broke))
             for c in broke:
                 sent[c].append("cancel")
-    save_state(st)
+    # 🛰️ 정찰병 신호(스승님 플레이북): 지수가 60일선 아래라 '매수하세요'가 안 뜨는 반등장에서도
+    # 3일차 강세·의심스러운 FTD·FTD면 견조주 중 오늘 거래량 실어 신고가 가는 종목을 알려요(하루 한 번씩만)
+    try:
+        ms = {name: msig.analyze((idx.get(sym) or (None, None))[0]) for name, sym in data.MARKETS.items()}
+        phases = {n: scout.index_phase(m) for n, m in ms.items()}
+        ph, ph_txt = scout.combine(phases)
+        if scout.scout_allowed(ph) and ph != "up":
+            best = max(((n, v) for n, v in phases.items() if v), key=lambda kv: kv[1]["rank"])[0]
+            res = scout.resilient(df, histories, ms[best].get("low_date"), ms[best].get("peak_date"))
+            picks = scout.pick(scout.candidates(df, sig.get("scan"), res, set(sig.get("ia_all") or [])))
+            done = st.setdefault("scout", [])
+            new = [r for r in picks.itertuples() if r.code not in done]
+            if new:
+                pb = scout.PLAYBOOK[ph]
+                send(f"🛰️ **정찰병 신호 — {pb['title']}**  ({now:%m/%d %H:%M})\n{ph_txt}\n"
+                     + "\n".join(f"• **{r.name}** {r.price:,.0f}원 {r.chg:+.1f}% · {r.group} — {r.why}\n"
+                                 f"   손절 {r.stop:,.0f} · 3R {r.target:,.0f} · 계좌 약 {scout.SCOUT_WEIGHT:.0f}%"
+                                 for r in new)
+                     + f"\n스승님: “{pb['mentor']}” · 정해진 규칙대로, 같은 섹터 우르르 금지")
+                done.extend(r.code for r in new)
+                save_state(st)
+    except Exception as exc:  # noqa: BLE001 — 정찰병 알림이 실패해도 '매수하세요' 알림은 그대로
+        print("정찰병 신호 실패:", exc)
 
 
 if __name__ == "__main__":

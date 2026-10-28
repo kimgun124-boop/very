@@ -4372,7 +4372,8 @@ def ia_buy_signals(df: pd.DataFrame, histories: dict, quotes: dict, idx_hist: di
     """'매수하세요' 신호: 오늘 인더스트리 액션 섹터 안에서 매수 조건을 모두 통과한 종목 + 시장 60일선 위.
     앱 상단 알림과 휴대폰 알림(alert_ia.py)이 같은 판정을 써요."""
     p = {**IA_DEFAULTS, **(p or {})}
-    out = {"market_ok": None, "market_text": "", "d20": None, "signals": [], "watch": [], "sectors": {}, "day": None}
+    out = {"market_ok": None, "market_text": "", "d20": None, "signals": [], "watch": [], "sectors": {}, "day": None,
+           "scan": None, "ia_all": []}
     oks, parts = [], []
     for name, sym in MARKETS.items():
         sm = index_summary((idx_hist.get(sym) or (empty_frame(), None))[0])
@@ -4393,11 +4394,13 @@ def ia_buy_signals(df: pd.DataFrame, histories: dict, quotes: dict, idx_hist: di
     today = now_kst().date()
     day = scan["date"].max()
     out["day"] = day
+    out["scan"] = scan[scan["date"] == day].reset_index(drop=True)      # 정찰병 신호(scout.py)가 같이 써요
+    secs = industry_action_sectors(scan, day, p)
+    out["ia_all"] = list(secs.loc[secs["ia"], "group"])
     if day != today:          # 오늘 봉이 없으면(주말·휴일·장 전) 신호 없음
         return out
     leaders = {g for g, _ in leading_groups(df, recent_days, min_count)}
     pot = potential_groups(df, leaders)
-    secs = industry_action_sectors(scan, day, p)
     if not scope_all:
         secs = secs[secs["group"].isin(list(pot))]
     ia = secs[secs["ia"]]

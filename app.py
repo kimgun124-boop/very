@@ -164,6 +164,7 @@ import tracker
 import cashflow
 import views
 import market as msig
+import scout
 import bear_check
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
@@ -3970,6 +3971,11 @@ PRINCIPLES = [
         "IPO 셋업: 상장 첫날 시가를 넘을 때",
         "실적이 어긋나면 — 추세 계좌: 맞았냐보다 추세가 꺾였냐 / 가치 계좌: 단순히 다음 분기로 밀린 거면 홀딩",
         "고멀티플: 추세 계좌에선 시장이 높게 쳐준다는 뜻이라 오히려 괜찮음, 가치 계좌에선 후순위"]),
+    ("스승님 10/28 · 반등장 정찰병", [
+        "반등 3일차가 강세로 끝나면 다음 날 시초가부터 정찰병 — 정석 FTD를 기다리지 않아도 됨",
+        "의심스러운 FTD가 정석보다 좋을 때가 있다 — 주가는 의심의 벽을 타고 오른다",
+        "조정 중에 견조주(하락장에서 양호한 종목)를 미리 체크 → 그중 신고가 가는 종목부터 편입",
+        "그날 인더스트리 액션 섹터의 선도주(먼저 신고가)가 1순위 · 정해진 규칙대로, 수익 쿠션이 넉넉할수록 여유"]),
     ("깡토 Q&A · 급락장(2026.10)", [
         "추세추종은 늦은 매매 — 반등을 예상해 미리 사지 않고, 쉴 때는 쉰다. 재진입은 선 대신 FTD(바닥 반등 3~4일차 강한 상승) 뒤 점진적으로",
         "정찰병은 죽는 게 당연 — 그래도 쉬는 중에 조금씩 넣어 두고 달리기 시작하면 빠르게 비중 확대. 같은 섹터에 우르르 넣지 않기",
@@ -9115,17 +9121,232 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
 
 
 
-def render_buy_alert(df: pd.DataFrame, histories: dict, quotes: dict):
-    """🔔 매수하세요: 오늘 인더스트리 액션 섹터에서 매수 조건을 모두 통과 + 시장 60일선 위인 종목. 어느 탭에서든 보여요."""
+# ─────────────────────────── 🎯 메인 매매 보드: 지금 살 종목 · 왜 · 보유 대응 ───────────────────────────
+TB_CSS = """
+<style>
+.tb{background:#fff;border:1px solid #ECEEF5;border-radius:16px;padding:.9rem 1rem 1rem;margin:.2rem 0 1rem;
+    box-shadow:0 1px 2px rgba(16,24,40,.04),0 4px 18px rgba(91,71,245,.06)}
+.tb-top{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+.tb-top .k{font-size:.78rem;font-weight:700;color:#5B47F5;letter-spacing:.02em}
+.tb-top .t{font-size:.72rem;color:#9CA3AF}
+.tb-v{border-radius:12px;padding:.75rem .9rem;margin:.45rem 0 .7rem}
+.tb-v h3{margin:0;font-size:1.25rem;font-weight:850;line-height:1.3}
+.tb-v p{margin:.25rem 0 0;font-size:.84rem;color:#374151;line-height:1.45}
+.tb-v .chips{margin-top:.45rem;display:flex;flex-wrap:wrap;gap:.3rem}
+.tb-chip{display:inline-block;font-size:.72rem;font-weight:700;padding:.15rem .5rem;border-radius:999px;background:#fff;
+         border:1px solid rgba(0,0,0,.08);color:#374151}
+.tb-sec{font-size:.86rem;font-weight:800;color:#111827;margin:.75rem 0 .4rem}
+.tb-sec small{font-weight:600;color:#9CA3AF;margin-left:.3rem}
+.tb-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:.5rem}
+.tb-c{border:1px solid #ECEEF5;border-radius:12px;padding:.6rem .75rem;background:#fff}
+.tb-c.main{border-color:#E8858B;background:#FFF8F8}.tb-c.scout{border-color:#C9C1FF;background:#FAF9FF}
+.tb-c.watch{background:#FBFBFD}
+.tb-c .h{display:flex;justify-content:space-between;align-items:baseline;gap:.4rem}
+.tb-c .h a{font-weight:850;font-size:.98rem;color:#111827;text-decoration:none}
+.tb-c .h .p{font-size:.86rem;font-weight:700;white-space:nowrap}
+.tb-c .g{font-size:.72rem;color:#6B7280;margin:.05rem 0 .3rem}
+.tb-tag{font-size:.68rem;font-weight:800;padding:.1rem .4rem;border-radius:6px;margin-right:.25rem}
+.tb-tag.main{background:#FDECEC;color:#C0262E}.tb-tag.scout{background:#EFEDFF;color:#4532D9}.tb-tag.watch{background:#F3F4F6;color:#6B7280}
+.tb-c .w{font-size:.78rem;color:#374151;line-height:1.4}
+.tb-c .f{font-size:.74rem;color:#6B7280;margin-top:.35rem;border-top:1px dashed #ECEEF5;padding-top:.3rem}
+.tb-c .f b{color:#111827}
+.tb-empty{font-size:.84rem;color:#4B5563;background:#F9FAFB;border:1px dashed #E5E7EB;border-radius:12px;padding:.65rem .8rem}
+.tb-h{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:.4rem}
+.tb-hi{border-radius:10px;padding:.45rem .6rem;font-size:.8rem;border:1px solid #ECEEF5;background:#fff}
+.tb-hi b{font-size:.88rem}.tb-hi small{display:block;color:#6B7280;font-size:.72rem;margin-top:.1rem}
+.tb-why{margin:.2rem 0 0;padding-left:1.05rem;font-size:.8rem;color:#374151;line-height:1.55}
+.tb-why li{margin:.1rem 0}
+.tb-ladder{display:flex;flex-wrap:wrap;gap:.25rem;margin:.1rem 0 .2rem}
+.tb-ladder span{font-size:.7rem;padding:.12rem .45rem;border-radius:999px;background:#F3F4F6;color:#9CA3AF;font-weight:700}
+.tb-ladder span.on{background:#5B47F5;color:#fff}
+@media (max-width:640px){.tb{padding:.75rem .7rem .8rem}.tb-v h3{font-size:1.1rem}}
+</style>
+"""
+
+
+def _tb_card(kind: str, tag: str, code: str, name: str, group: str, price, chg, why: str, foot: str) -> str:
+    col = UP if (chg or 0) > 0 else (DOWN if (chg or 0) < 0 else "#6B7280")
+    pr = f"{price:,.0f}원" if price else "-"
+    ch = f" <span style='color:{col}'>{chg:+.1f}%</span>" if chg is not None and chg == chg else ""
+    return (f'<div class="tb-c {kind}"><div class="h"><a href="?chart={html.escape(code)}" target="_self">{html.escape(str(name))}</a>'
+            f'<span class="p">{pr}{ch}</span></div>'
+            f'<div class="g"><span class="tb-tag {kind}">{html.escape(tag)}</span>{html.escape(str(group))}</div>'
+            f'<div class="w">{html.escape(why)}</div><div class="f">{foot}</div></div>')
+
+
+def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[str, int]:
+    """보유 종목 매도·대응 요약(잠금이 풀렸을 때만). 자세한 점검은 💼 내 보유."""
+    ss = st.session_state
+    try:
+        locked = holdings.has_password(holdings.load_settings()) and not ss.get("hold_unlocked")
+    except Exception:  # noqa: BLE001
+        locked = True
+    if locked:
+        return ('<div class="tb-empty">🔒 보유 종목은 잠겨 있어요 — 💼 내 보유에서 비밀번호로 열면 여기에 '
+                '손절·익절·본절 신호가 떠요.</div>', 0)
+    hs = [h for h in (holdings.load().get("holdings") or []) if h.get("account", "추세") == "추세"]
+    if not hs:
+        return '<div class="tb-empty">추세 계좌 보유 종목이 없어요 — 💼 내 보유에 넣으면 매도 신호가 여기 떠요.</div>', 0
+    px = dict(zip(df["code"], pd.to_numeric(df["price"], errors="coerce")))
+    atr = dict(zip(df["code"], pd.to_numeric(df.get("atr_pct"), errors="coerce"))) if "atr_pct" in df else {}
+    rows, urgent = [], 0
+    order = {"🔴": 0, "🔵": 1, "🟠": 2, "🟣": 3, "🟢": 4, "⚪": 5}
+    for h in hs:
+        p, avg = px.get(h["code"]), holdings._f(h.get("avg"))
+        if not p or p != p or not avg:
+            rows.append(("⚪", h["name"], "시세 없음", "보드에 없는 종목 — 💼 내 보유에서 점검"))
+            continue
+        a = atr.get(h["code"])
+        sp = holdings._f(h.get("stop_pct")) or max(8.0, a if a == a and a else 0.0)
+        pnl = (p / avg - 1) * 100
+        r = pnl / sp if sp else 0
+        stop = avg * (1 - sp / 100)
+        t3 = avg * (1 + 3 * sp / 100)
+        if p <= stop:
+            em, act = "🔴", f"손절선 {stop:,.0f} 이탈 — 원칙대로 정리"
+        elif r >= 3 and not h.get("half_taken"):
+            em, act = "🔵", f"3R {t3:,.0f} 도달 — 절반 익절, 나머지는 5일선이 50일선에 닿을 때까지"
+        elif r >= 2:
+            em, act = "🟣", f"+{r:.1f}R — 손절선을 본전({avg:,.0f}) 이상으로 올리기(R 사다리)"
+        elif phase in ("corr", "rally12") and r < 1:
+            em, act = "🟠", f"쉬는 장 · 쿠션 {pnl:+.1f}% — 정찰병 크기인지 확인, 손절 {stop:,.0f} 넓히지 않기"
+        else:
+            em, act = "🟢", f"보유 유지 — 손절 {stop:,.0f} · 3R {t3:,.0f}"
+        urgent += em in ("🔴", "🔵")
+        rows.append((em, h["name"], f"{pnl:+.1f}% ({r:+.1f}R)", act))
+    rows.sort(key=lambda x: order.get(x[0], 9))
+    body = "".join(f'<div class="tb-hi">{em} <b>{html.escape(n)}</b> {html.escape(v)}<small>{html.escape(a)}</small></div>'
+                   for em, n, v, a in rows)
+    return f'<div class="tb-h">{body}</div>', urgent
+
+
+def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
+    """첫 화면 맨 위: 오늘 판정(스승님 국면 플레이북 + 내 원칙) → 지금 살 종목과 이유 → 보유 매도·대응 → 해설."""
+    try:
+        sig = _ia_sig(df, histories, quotes)
+    except Exception:  # noqa: BLE001
+        sig = {"signals": [], "watch": [], "scan": None, "ia_all": [], "market_ok": None, "d20": None, "market_text": ""}
+    msigs = market_signals()
+    phases = {n: scout.index_phase(m) for n, m in msigs.items()}
+    phase, ph_txt = scout.combine(phases)
+    best = max(((n, v) for n, v in phases.items() if v), key=lambda kv: kv[1]["rank"], default=(None, None))[0]
+    m_best = msigs.get(best) if best else None
+    low, peak = (m_best or {}).get("low_date"), (m_best or {}).get("peak_date")
+    res = tab_memo("scout_res", (str(low), str(peak), len(df)), lambda: scout.resilient(df, histories, low, peak))
+    n_res = int(res["resilient"].sum()) if res is not None else None
+    ia_secs = list(sig.get("ia_all") or [])
+    cands = tab_memo("scout_cands", (str(low), tuple(ia_secs), len(df)),
+                     lambda: scout.candidates(df, sig.get("scan"), res, set(ia_secs)))
+    allowed = scout.scout_allowed(phase)
+    market_ok = sig.get("market_ok")
+    pb = scout.PLAYBOOK.get(phase or "corr")
+
+    # 지금 살 종목: ① 원칙 전부 통과(🔔 본매매) ② 정찰병(견조주 신고가)
+    cards, seen = [], set()
+    for x in sig.get("signals") or []:
+        seen.add(x["code"])
+        why = " · ".join(t for t in ("인더스트리 액션 섹터", f"거래량 {x['vx']:.1f}배", x["lead"], "⭐ 첫 돌파" if x["first"] else None,
+                                     "52주 신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%", "RS 70↑·지수 60일선 위·실적") if t)
+        cards.append(_tb_card("main", "🔔 원칙 매수 · 1유닛", x["code"], x["name"], x["group"], x["price"], x["chg"], why,
+                              f"손절 <b>{x['stop']:,.0f}</b> · 3R <b>{x['target']:,.0f}</b> · 아침·종가 나눠 사기"))
+    go = scout.pick(cands, n=6, per_group=2) if len(cands) else cands
+    if allowed and phase != "up":
+        for r in go.itertuples():
+            if r.code in seen or len(cards) >= 8:
+                continue
+            seen.add(r.code)
+            cards.append(_tb_card("scout", "🛰️ 정찰병", r.code, r.name, r.group, r.price, r.chg, r.why,
+                                  f"계좌 약 <b>{scout.SCOUT_WEIGHT:.0f}%</b> · 손절 <b>{r.stop:,.0f}</b> · 3R <b>{r.target:,.0f}</b>"))
+    n_main, n_scout = len(sig.get("signals") or []), len(cards) - len(sig.get("signals") or [])
+    for x in (sig.get("signals") or []):
+        if x["code"] not in st.session_state.setdefault("ia_toasted", set()):
+            st.session_state["ia_toasted"].add(x["code"])
+            st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
+
+    # 판정 한 줄
+    if n_main:
+        head, col, bg = f"🔔 지금 살 종목 {n_main + max(n_scout, 0)}개 — 원칙 매수 신호", "#C0262E", "#FDECEC"
+    elif n_scout > 0:
+        head, col, bg = f"🛰️ 정찰병 투입 — {n_scout}종목", pb["color"], pb["bg"]
+    elif allowed:
+        head, col, bg = "🛰️ 정찰병 허락 · 오늘 조건 맞는 종목은 아직 없음", pb["color"], pb["bg"]
+    else:
+        head, col, bg = "🧘 오늘은 사지 않는 게 매매 — 견조주 목록만 준비", pb["color"], pb["bg"]
+    chips = [f"{pb['em']} {pb['title']}", pb["size"],
+             "지수 60일선 " + ("위 ✓" if market_ok else ("아래 ✕ → 정찰병만" if market_ok is False else "?"))]
+    if sig.get("d20") is not None:
+        chips.append(f"20 DOWN {sig['d20']:.0f}%")
+    if ia_secs:
+        chips.append("인더스트리 액션: " + ", ".join(ia_secs[:2]))
+    if n_res is not None:
+        chips.append(f"견조주 {n_res}개 추적")
+    ladder = "".join(f'<span class="{"on" if k == phase else ""}">{scout.PLAYBOOK[k]["em"]} {scout.PLAYBOOK[k]["title"].split(" — ")[0]}</span>'
+                     for k in scout.PHASE_ORDER)
+    now = data.now_kst()
+    out = [TB_CSS, '<div class="tb"><div class="tb-top"><span class="k">🎯 오늘의 매매 보드 · 추세추종</span>'
+           f'<span class="t">{now:%m/%d %H:%M} · {html.escape(ph_txt)}</span></div>',
+           f'<div class="tb-v" style="background:{bg};border:1.5px solid {col}33"><h3 style="color:{col}">{html.escape(head)}</h3>'
+           f'<p>{html.escape(pb["buy"])}</p><div class="chips">'
+           + "".join(f'<span class="tb-chip">{html.escape(c)}</span>' for c in chips) + '</div></div>',
+           f'<div class="tb-ladder">{ladder}</div>']
+
+    out.append('<div class="tb-sec">🛒 지금 살 종목<small>원칙 매수(🔔)가 먼저, 그다음 정찰병(🛰️) · 이름을 누르면 차트</small></div>')
+    if cards:
+        out.append(f'<div class="tb-grid">{"".join(cards)}</div>')
+    else:
+        wait = (pd.concat([scout.pick(cands, 6, 2, "투입"), scout.pick(cands, 6, 2, "대기")]).head(6)
+                if len(cands) else cands)
+        reason = ("정찰병은 허락됐지만 견조주 중 오늘 신고가 가는 종목이 없어요 — 억지로 사지 않기" if allowed and phase != "up" else
+                  "원칙을 모두 통과한 종목이 없어요" if phase == "up" else
+                  "아직 정찰병 전 단계예요 — 반등을 예상해 미리 사지 않아요")
+        out.append(f'<div class="tb-empty">{html.escape(reason)}.</div>')
+        if len(wait):
+            out.append('<div class="tb-sec">👀 준비 목록<small>견조주 중 신고가 근처 — 국면이 허락하고 신고가를 가면 정찰병</small></div>')
+            out.append('<div class="tb-grid">' + "".join(
+                _tb_card("watch", "대기" if r.tier == "대기" else "신고가(국면 대기)", r.code, r.name, r.group, r.price, r.chg, r.why,
+                         f"신고가까지 <b>{max(r.to_res or 0, 0):.1f}%</b> · 손절 기준 {r.stop:,.0f}")
+                for r in wait.itertuples()) + '</div>')
+
+    hold_html, urgent = _tb_holdings(df, phase)
+    out.append(f'<div class="tb-sec">💼 보유 종목 — 매도·대응<small>{"⚠️ 지금 처리할 종목 " + str(urgent) + "개" if urgent else pb["hold"]}</small></div>')
+    out.append(hold_html)
+
+    notes = scout.commentary(phase, ph_txt, market_ok, sig.get("d20"), cands, ia_secs, n_res, len(lead_groups(df)))
+    out.append('<div class="tb-sec">🧭 왜 이렇게 보나 — 해설</div><ul class="tb-why">'
+               + "".join(f"<li>{x}</li>" for x in notes) + "</ul></div>")
+    st.markdown("".join(out), unsafe_allow_html=True)
+
+    with st.expander("📖 스승님 국면별 플레이북 — 이런 장에선 이렇게"):
+        rows = [{"단계": f"{v['em']} {v['title']}", "비중": v["size"], "매수": v["buy"], "보유·매도": v["hold"], "스승님": v["mentor"],
+                 "지금": "👉" if k == phase else ""} for k, v in ((k, scout.PLAYBOOK[k]) for k in scout.PHASE_ORDER)]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                     column_config={"매수": st.column_config.TextColumn(width="large"),
+                                    "보유·매도": st.column_config.TextColumn(width="large"),
+                                    "스승님": st.column_config.TextColumn(width="medium")})
+        for n, v in phases.items():
+            if v:
+                st.caption(f"{n}: {v['em']} {v['title']} — {v['why']}")
+        st.caption(f"출처: {scout.MENTOR_SRC} · 정찰병 = 1유닛(계좌 6% 안팎)보다 작게, 약 {scout.SCOUT_WEIGHT:.0f}%. "
+                   "견조주 = 지수 조정 바닥날 52주 고점에 가장 가까웠던 상위 20%. 효석 원칙(리스크관리 우선, 60일선 아래 본매매 휴식)이 항상 먼저예요. "
+                   "매매 추천이 아니라 원칙·스승님 플레이북 확인용이에요.")
+
+
+def _ia_sig(df: pd.DataFrame, histories: dict, quotes: dict) -> dict:
+    """🔔 매수하세요 판정(인더스트리 액션 + 원칙 전부 통과) — 메인 매매 보드·알림이 같이 써요."""
     d = data.IA_DEFAULTS
     ss = st.session_state
     p = {"vol_mult": ss.get("ia_vol", d["vol_mult"]), "min_chg": ss.get("ia_chg", d["min_chg"]),
          "min_n": ss.get("ia_minn", d["min_n"]), "near_pct": ss.get("ia_near", d["near_pct"]),
          "dcr_min": ss.get("ia_dcr", d["dcr_min"]), "min_cap": ss.get("ia_cap", d["min_cap"]),
          "max_ext": ss.get("ia_ext", d["max_ext"])}
+    return tab_memo("ia_buy", (tuple(sorted(p.items())), recent_days, min_count),
+                    lambda: data.ia_buy_signals(df, histories, quotes, load_indexes(), p, recent_days, min_count))
+
+
+def render_buy_alert(df: pd.DataFrame, histories: dict, quotes: dict):
+    """🔔 매수하세요: 오늘 인더스트리 액션 섹터에서 매수 조건을 모두 통과 + 시장 60일선 위인 종목. 어느 탭에서든 보여요."""
     try:
-        sig = tab_memo("ia_buy", (tuple(sorted(p.items())), recent_days, min_count),
-                       lambda: data.ia_buy_signals(df, histories, quotes, load_indexes(), p, recent_days, min_count))
+        sig = _ia_sig(df, histories, quotes)
     except Exception as exc:  # noqa: BLE001 — 알림 계산이 실패해도 보드는 떠야 해요
         st.caption(f"매수 알림 계산 실패: {exc.__class__.__name__}")
         return
@@ -10182,13 +10403,17 @@ def render_board():
     leaders_now = {g for g, _ in lead_groups(df)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
     _TRENDS_BG["v"] = trends_all
+    try:
+        render_trade_board(df, histories, quotes)          # 🎯 이 앱의 목적: 지금 살 종목·왜·보유 대응
+    except Exception as _e:  # noqa: BLE001 — 매매 보드가 실패해도 나머지 보드는 계속
+        st.caption(f"매매 보드를 그리지 못했어요({type(_e).__name__}: {_e}).")
+        render_buy_alert(df, histories, quotes)
     render_market(df)
     try:
         render_sector_movers(df, quotes)
     except Exception as _e:  # noqa: BLE001 — 첫 화면 카드가 실패해도 나머지 보드는 계속
         st.caption(f"섹터 강세 카드를 그리지 못했어요({type(_e).__name__}).")
     render_radar(df[df["code"].map(_mkt) == market])
-    render_buy_alert(df, histories, quotes)
     jobs = {
         "📋 리스트": lambda: render_list(df, histories, quote_error, shares_store, fins_all),
         "⭐ 내 종목": lambda: render_watch_tab(df, quotes, histories),
