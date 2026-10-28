@@ -6,6 +6,7 @@ permissions:
   contents: write
 env:
   FULL: '1'
+  TABS: '0'
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -25,7 +26,7 @@ jobs:
         continue-on-error: true
         run: mkdir -p out && timeout 1800 python _audit/fact_check.py out 2>&1 | tee out/fact_log.txt
       - name: render all tabs (real data)
-        if: env.FULL == '1'
+        if: env.TABS == '1'
         continue-on-error: true
         run: timeout 3000 python _audit/run_tabs.py app.py out/tabs.json 2>&1 | grep -v "ScriptRunContext\|No runtime found\|st.iframe\|will be removed\|^$" | tee out/tabs_log.txt
       - name: push results

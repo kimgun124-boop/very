@@ -563,8 +563,8 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
         final_hi = max(float(off_hi), live_hi)      # 공식값이 늦게 바뀌는 장중 신고가는 실시간 값이 우선
         h52_diff = (high52_calc / final_hi - 1) * 100
         # (2026.10.28) 네이버 공식 52주 값은 KRX·NXT 일봉 어디에도 없는 가격일 때가 많아요(117종목, 최대 +20%:
-        # 삼성SDI 공식 820,000 vs 일봉·다음 723,000). 일봉에 그 근처(1.5% 안) 고가가 실제로 있을 때만 공식값을 써요.
-        backed_hi = live_hi >= final_hi or bool(np.any(np.abs(w_hi[np.isfinite(w_hi)] / final_hi - 1) <= 0.015))
+        # 삼성SDI 공식 820,000 vs 일봉·다음 723,000). 일봉에 같은 값(0.3% 안) 고가가 실제로 있을 때만 공식값을 써요(1.5%로 두면 삼성전자 380,000처럼 1%대 어긋난 값이 들어왔어요).
+        backed_hi = live_hi >= final_hi or bool(np.any(np.abs(w_hi[np.isfinite(w_hi)] / final_hi - 1) * 100 <= H52_TOL))
         if abs(h52_diff) > H52_TOL and not backed_hi:
             h52_src = f"일봉 계산(네이버 공식 {final_hi:,.0f}은 일봉에 없음)"
         elif abs(h52_diff) > H52_TOL:
@@ -580,7 +580,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     if off_lo:
         live_lo = min([float(x) for x in (q_low, price) if x] or [float(off_lo)])
         final_lo = min(float(off_lo), live_lo)
-        backed_lo = live_lo <= final_lo or bool(np.any(np.abs(w_lo[np.isfinite(w_lo)] / final_lo - 1) <= 0.015))
+        backed_lo = live_lo <= final_lo or bool(np.any(np.abs(w_lo[np.isfinite(w_lo)] / final_lo - 1) * 100 <= H52_TOL))
         if abs(low52_calc / final_lo - 1) * 100 > H52_TOL and backed_lo:
             low52 = final_lo
             h52_fixed = True
@@ -3781,10 +3781,10 @@ def nh_candidate(hist: pd.DataFrame, quote: dict | None, today: date | None = No
     price = float(live) if live else float(c[-1])
     krx_close = float(c[-1])
     hi_now = max(float(h[-1]), float(nxt_hi or 0), price)
-    # 네이버 공식 52주 최고가는 일봉에 그 근처 고가(1.5% 안)가 실제로 있을 때만 써요.
+    # 네이버 공식 52주 최고가는 일봉에 같은 고가(0.3% 안)가 실제로 있을 때만 써요.
     # (2026.10.17) HMM처럼 일봉 어디에도 없는 공식값(27,000 vs 일봉 최고 약 25,000)이 기준가가 되면 '신고가까지'가 엉뚱하게 멀어졌어요.
     def _backed(x):
-        return bool(len(prior[okp])) and bool(np.any(np.abs(prior[okp] / x - 1) <= 0.015))
+        return bool(len(prior[okp])) and bool(np.any(np.abs(prior[okp] / x - 1) <= 0.003))
     if official_high and official_high > ref * 1.003 and official_high > hi_now * 1.001 and _backed(official_high):
         ref, ref_src = float(official_high), "네이버 공식"
     if ref_override and ref_override > ref * 1.003 and ref_override > hi_now * 1.001 and _backed(ref_override):
