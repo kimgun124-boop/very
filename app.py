@@ -260,7 +260,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "live_volume", "sector_money", "session_frac", "fetch_chart", "chart_with_live", "CHART_TF",
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
-            "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS")
+            "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
+            "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for")
 DATA_VERSION = "2026-10-28-h52backed"   # data.py의 DATA_VERSION과 같아야 해요
 
 
@@ -275,12 +276,25 @@ if _data_stale():
 _missing = [n for n in REQUIRED if not hasattr(data, n)]
 if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
     _missing.append(f"버전 {DATA_VERSION}")
+# 새로 생긴 모듈도 서버가 예전 내용을 기억하면 새로 읽어요(GitHub에 올린 직후 '... has no attribute' 방지)
+MARKET_VERSION = "2026-10-28-lastftd"
+_MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
+            "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
+            "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
+            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "AI_VIEWS")}
+for _alias, _attrs in _MOD_REQ.items():
+    _mod = globals()[_alias]
+    if any(not hasattr(_mod, a_) for a_ in _attrs) or (_alias == "msig" and getattr(_mod, "MARKET_VERSION", None) != MARKET_VERSION):
+        globals()[_alias] = importlib.reload(_mod)
+    _mod = globals()[_alias]
+    if any(not hasattr(_mod, a_) for a_ in _attrs) or (_alias == "msig" and getattr(_mod, "MARKET_VERSION", None) != MARKET_VERSION):
+        _missing.append(f"{_mod.__name__}.py 새 파일")
 REPORTS_VERSION = "2026-10-06-autolearn"
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-10-17-monitor"
+HOLDINGS_VERSION = "2026-10-28-kq"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:

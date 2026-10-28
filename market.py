@@ -17,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+MARKET_VERSION = "2026-10-28-lastftd"    # app.py의 MARKET_VERSION과 같아야 해요(바뀐 market.py를 서버가 새로 읽게)
 MKT_DEFAULTS = {"ftd_pct": 1.25, "ftd_day": 4, "dd_pct": 0.2, "corr_pct": 10.0, "dd_window": 25, "dd_erase": 5.0}
 STATE_TXT = {"up": "상승 추세", "press": "상승 둔화", "corr": "조정 국면", "rally": "반등 시도"}
 STATE_EM = {"up": "🟢", "press": "🟡", "corr": "🔴", "rally": "🟠"}

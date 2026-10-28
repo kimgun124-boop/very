@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-HOLDINGS_VERSION = "2026-10-17-monitor"
+HOLDINGS_VERSION = "2026-10-28-kq"
 HOLDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_holdings.json")
 KST = timezone(timedelta(hours=9))
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0",
