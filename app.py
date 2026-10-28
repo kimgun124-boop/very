@@ -2417,6 +2417,209 @@ def _chip_leader(df: pd.DataFrame, group: str) -> str:
     return f'<b style="color:#F2B134">👑 대장 {html.escape(str(name))}</b><br>' if name else ""
 
 
+# ─────────────────────────── 🔥 섹터 강세 카드(첫 화면) ───────────────────────────
+SM_CSS = """<style>
+.sm-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:10px;margin:.2rem 0 .6rem}
+.sm-card{background:#fff;border:1px solid #E6E3F0;border-radius:12px;overflow:hidden;box-shadow:0 1px 2px rgba(20,20,40,.04)}
+.sm-head{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;color:#fff}
+.sm-head.r1{background:#C2185B}.sm-head.r2{background:#5E6B78}.sm-head.r3{background:#7B5CC4}.sm-head.rn{background:#46505A}
+.sm-ttl{display:flex;align-items:center;gap:6px;font-weight:800;font-size:1rem;min-width:0}
+.sm-ttl span.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-rk{background:#F5C518;color:#3A2A00;border-radius:50%;min-width:20px;height:20px;display:inline-flex;align-items:center;
+justify-content:center;font-size:.75rem;font-weight:800}
+.sm-head.r2 .sm-rk,.sm-head.rn .sm-rk{background:#fff;color:#46505A}
+.sm-sum{text-align:right;line-height:1.05}
+.sm-sum b{display:block;background:#fff;color:#D6333B;border-radius:5px;padding:1px 6px;font-size:.82rem}
+.sm-sum b.dn{color:#1F66C9}
+.sm-sum small{display:block;font-size:.75rem;font-weight:700;margin-top:2px;opacity:.95;white-space:nowrap}
+.sm-sum small.cnt{font-weight:500;font-size:.68rem;margin-top:0;opacity:.85}
+.sm-news{display:flex;gap:6px;align-items:center;padding:5px 8px;background:#F4F1FB;font-size:.74rem;color:#3B3550;
+border-bottom:1px solid #EEE;white-space:nowrap;overflow:hidden}
+.sm-news a{color:#3B3550;text-decoration:none;overflow:hidden;text-overflow:ellipsis}
+.sm-news .t{background:#E3DCF7;color:#5B3FC0;border-radius:4px;padding:0 5px;font-weight:700;flex:none}
+a.sm-row{display:block;padding:5px 9px 4px;border-bottom:1px solid #F1F1F4;text-decoration:none;color:#26343E}
+a.sm-row:hover{background:#FAF9FE}
+.sm-l1,.sm-l2{display:flex;justify-content:space-between;align-items:center;gap:6px}
+.sm-nm{font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sm-nm.nh{color:#D6333B;text-decoration:underline}
+.sm-chg{font-weight:800;font-size:.86rem;flex:none}
+.sm-l2{font-size:.74rem;color:#6B7680}
+.sm-tv.big{color:#D6333B;font-weight:800}
+.sm-dot{width:7px;height:7px;border-radius:50%;background:#2EAD5B;display:inline-block;flex:none}
+.sm-dot.off{background:#D5D9DE}
+.sm-ic{display:flex;align-items:center;gap:4px;flex:none}
+.sm-bar{position:relative;height:10px;margin-top:3px;background:#ECEEF1;border-radius:2px}
+.sm-bar i{position:absolute;top:0;bottom:0}
+.sm-bar i.z{width:2px;background:#26343E;top:-2px;bottom:-2px}
+.sm-bar i.w{top:4px;bottom:4px}
+.sm-bar i.b{top:1px;bottom:1px;border-radius:1px}
+.sm-card details summary{list-style:none;cursor:pointer;text-align:center;font-size:.76rem;color:#8A93A0;padding:5px}
+.sm-card details summary::-webkit-details-marker{display:none}
+.sm-card details[open] summary .more{display:none}.sm-card details:not([open]) summary .less{display:none}
+.sm-legend{font-size:.72rem;color:#7A8490;margin:-.2rem 0 .4rem}
+@media (max-width:640px){.sm-wrap{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+.sm-nm,.sm-chg{font-size:.8rem}.sm-head{padding:6px 7px}.sm-ttl{font-size:.84rem;line-height:1.15}
+.sm-ttl span.nm{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+a.sm-row{padding:4px 6px}.sm-l2{font-size:.7rem}}
+</style>"""
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=4)
+def _sm_news(codes: tuple[str, ...]) -> dict:
+    """섹터 대표 종목의 가장 최근 뉴스 제목(5분 기억)."""
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    def one(c):
+        try:
+            return c, (holdings.naver_news(c, 3) or [None])[0]
+        except Exception:  # noqa: BLE001
+            return c, None
+    with _TPE(max_workers=6) as ex:
+        return dict(ex.map(one, codes))
+
+
+def sector_movers(df: pd.DataFrame, by: str = "group", sort: str = "money", min_n: int = 3) -> list[dict]:
+    """섹터(세부 분류·산업)별 오늘 강세: 구성 종목 등락·거래대금, 상승 종목 거래대금 순 또는 강도 순."""
+    d = df[df["code"].map(data.is_kr) & pd.to_numeric(df["price"], errors="coerce").notna()].copy()
+    if "halted" in d:
+        d = d[d["halted"] != True]  # noqa: E712
+    d = d[~d["group"].isin(list(data.NON_SECTOR_GROUPS))]
+    d["chg"] = pd.to_numeric(d["change"], errors="coerce")
+    d["tv"] = pd.to_numeric(d.get("tv_live"), errors="coerce").fillna(0)
+    d = d.drop_duplicates("code")
+    out = []
+    for g, sub in d.groupby(by):
+        sub = sub[sub["chg"].notna()]
+        if len(sub) < min_n:
+            continue
+        w = sub["tv"].where(sub["tv"] > 0, 0)
+        wchg = float((sub["chg"] * w).sum() / w.sum()) if w.sum() > 0 else float(sub["chg"].mean())
+        up = sub[sub["chg"] > 0]
+        out.append({"name": g, "chg": wchg, "tv": float(sub["tv"].sum()), "up_tv": float(up["tv"].sum()),
+                    "n": len(sub), "n_up": len(up), "rows": sub.sort_values(["chg", "tv"], ascending=False)})
+    key = {"money": lambda x: (-x["up_tv"] * (1 if x["chg"] > 0 else 0.01), -x["chg"]),
+           "strength": lambda x: (-x["chg"], -x["tv"])}[sort]
+    return sorted(out, key=key)
+
+
+def _sm_bar(r, lo: float, hi: float) -> str:
+    """가로 미니 캔들: 전일 종가(검은 선) 기준 저가~고가(꼬리) · 시가~현재가(몸통). 축은 카드 안에서 같아요."""
+    prev = r.get("prev")
+    price = r.get("price")
+    if not prev or prev != prev or not price:
+        return '<div class="sm-bar"></div>'
+    pct = lambda v: (float(v) / float(prev) - 1) * 100  # noqa: E731
+    span = (hi - lo) or 1.0
+    x = lambda p: max(0.0, min(100.0, (p - lo) / span * 100))  # noqa: E731
+    o = r.get("day_open")
+    o = pct(o) if o and o == o else 0.0
+    c = pct(price)
+    dh, dl = r.get("day_high"), r.get("day_low")
+    h = max(pct(dh), c, o) if dh and dh == dh else max(c, o)
+    lw = min(pct(dl), c, o) if dl and dl == dl else min(c, o)
+    parts = []
+    if lw < 0:            # 전일 종가 아래로 내려간 꼬리 = 파랑
+        parts.append(f'<i class="w" style="left:{x(lw):.1f}%;width:{x(min(0, h)) - x(lw):.1f}%;background:{DOWN}"></i>')
+    if h > 0:             # 위 꼬리 = 빨강
+        parts.append(f'<i class="w" style="left:{x(max(0, lw)):.1f}%;width:{x(h) - x(max(0, lw)):.1f}%;background:{UP}"></i>')
+    b0, b1 = sorted((o, c))
+    parts.append(f'<i class="b" style="left:{x(b0):.1f}%;width:{max(1.5, x(b1) - x(b0)):.1f}%;'
+                 f'background:{UP if c >= o else DOWN}"></i>')
+    parts.append(f'<i class="z" style="left:calc({x(0):.1f}% - 1px)"></i>')
+    return f'<div class="sm-bar">{"".join(parts)}</div>'
+
+
+def _sm_eok(v) -> str:
+    if not v or v != v:
+        return "-"
+    return f"{v / 1e12:,.1f}조" if v >= 1e12 else f"{v / 1e8:,.0f}억"
+
+
+def render_sector_movers(df: pd.DataFrame, quotes: dict):
+    """첫 화면: 오늘 섹터별 강세 카드(순위 · 섹터 등락·거래대금 · 대표 뉴스 · 종목별 등락·거래대금·가로 캔들)."""
+    with st.container(key="sm_box"):
+        c1, c2, c3, c4 = st.columns([1.25, 1.25, 1, 1])
+        by_lab = c1.segmented_control("묶기", ["세부 분류", "산업"], default="세부 분류", key="sm_by",
+                                      label_visibility="collapsed") or "세부 분류"
+        sort_lab = c2.segmented_control("정렬", ["돈 몰린 순", "상승률 순"], default="돈 몰린 순", key="sm_sort",
+                                        label_visibility="collapsed",
+                                        help="돈 몰린 순 = 오늘 오른 종목들의 거래대금 합계가 큰 섹터부터 · 상승률 순 = 거래대금 가중 평균 등락") or "돈 몰린 순"
+        n_cards = c3.selectbox("카드", [4, 8, 12, 16], index=1, key="sm_n", label_visibility="collapsed",
+                               format_func=lambda n: f"섹터 {n}개")
+        n_rows = c4.selectbox("종목", [5, 8, 10], index=1, key="sm_rows", label_visibility="collapsed",
+                              format_func=lambda n: f"먼저 {n}종목")
+    by = "group" if by_lab == "세부 분류" else "sector"
+    sort = "money" if sort_lab == "돈 몰린 순" else "strength"
+    secs = tab_memo(f"sector_movers_{len(df)}", (by, sort), lambda: sector_movers(df, by, sort))[:int(n_cards)]
+    if not secs:
+        return
+    lead_codes = []
+    for s in secs:
+        up = s["rows"][s["rows"]["chg"] > 0]
+        top = (up if len(up) else s["rows"]).sort_values("tv", ascending=False).iloc[0]
+        s["lead_code"] = top["code"]
+        lead_codes.append(top["code"])
+    news = _sm_news(tuple(lead_codes))
+    status = data.market_status(quotes)
+    cards = []
+    for i, s in enumerate(secs, 1):
+        rows = s["rows"]
+        show = rows.head(15)
+        lo = float(min(-2.0, *[min(_pctv(r, "day_low"), _pctv(r, "price")) for _, r in show.iterrows()]))
+        hi = float(max(2.0, *[max(_pctv(r, "day_high"), _pctv(r, "price")) for _, r in show.iterrows()]))
+        pad = (hi - lo) * 0.06
+        lo, hi = lo - pad, hi + pad
+        items = []
+        for _, r in show.iterrows():
+            chg, tv = r["chg"], r["tv"]
+            nh = r.get("days_since_high") == 0
+            rs_ok = (r.get("rs") or 0) >= 70 and r.get("aligned") is True
+            hot = (r.get("dist_ma20") or 0) >= 30
+            col = UP if chg > 0 else (DOWN if chg < 0 else "#26343E")
+            wt = "800" if abs(chg) >= 10 else "700"
+            items.append(
+                f'<a class="sm-row" target="_self" href="?chart={html.escape(str(r["code"]))}">'
+                f'<div class="sm-l1"><span class="sm-nm{" nh" if nh else ""}">{html.escape(str(r["name"]))}</span>'
+                f'<span class="sm-ic"><span class="sm-dot{"" if rs_ok else " off"}"></span>{"⚠️" if hot else ""}'
+                f'<span class="sm-chg" style="color:{col};font-weight:{wt}">{chg:+.2f}%</span></span></div>'
+                f'<div class="sm-l2"><span>{r["price"]:,.0f}</span>'
+                f'<span class="sm-tv{" big" if tv >= 1e11 else ""}">{_sm_eok(tv)}</span></div>'
+                f'{_sm_bar(r, lo, hi)}</a>')
+        first, rest = items[:int(n_rows)], items[int(n_rows):]
+        more = (f'<details><summary><span class="more">더보기 {len(rest)}</span><span class="less">접기</span></summary>'
+                f'{"".join(rest)}</details>') if rest else ""
+        nw = news.get(s["lead_code"])
+        news_html = ""
+        if nw:
+            tm = str(nw.get("time") or "")[-5:]
+            news_html = (f'<div class="sm-news"><span class="t">{html.escape(tm)}</span>'
+                         f'<a href="{html.escape(nw["url"])}" target="_blank" title="{html.escape(nw["title"])}">'
+                         f'{html.escape(nw["title"])}</a></div>')
+        rk = "r1" if i == 1 else ("r2" if i == 2 else ("r3" if i == 3 else "rn"))
+        cards.append(
+            f'<div class="sm-card"><div class="sm-head {rk}"><div class="sm-ttl"><span class="sm-rk">{i}</span>'
+            f'<span class="nm">{html.escape(str(s["name"]))}</span></div>'
+            f'<div class="sm-sum"><b class="{"dn" if s["chg"] < 0 else ""}">{s["chg"]:+.1f}%</b>'
+            f'<small>{_sm_eok(s["tv"])}</small><small class="cnt">{s["n_up"]}/{s["n"]} 상승</small></div></div>'
+            f'{news_html}{"".join(first)}{more}</div>')
+    st.markdown(SM_CSS + f'<div class="sm-wrap">{"".join(cards)}</div>'
+                f'<div class="sm-legend">{html.escape(status)} · 섹터 등락 = 거래대금 가중 평균 · 거래대금 = 섹터 전체 합계 · '
+                f'<span style="color:{UP};text-decoration:underline">빨간 이름</span> = 오늘 52주 신고가 · '
+                f'<span class="sm-dot"></span> RS 70↑ + 정배열 · ⚠️ 20일선 +30%↑ 과열 · 빨간 거래대금 = 1,000억↑ · '
+                f'막대 = 전일 종가(검은 선) 대비 저가~고가(꼬리)와 시가~현재가(몸통) · 이름을 누르면 차트 · 뉴스 = 섹터 대표(거래대금 1위 상승 종목)</div>',
+                unsafe_allow_html=True)
+
+
+def _pctv(r, k) -> float:
+    prev, v = r.get("prev"), r.get(k)
+    try:
+        if prev and v and prev == prev and v == v:
+            return (float(v) / float(prev) - 1) * 100
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
 def render_radar(df: pd.DataFrame):
     leaders = lead_groups(df)
     if leaders:
@@ -9774,6 +9977,10 @@ def render_board():
     trends_all, fins_all = load_trends_all(), load_fins_all()
     _TRENDS_BG["v"] = trends_all
     render_market(df)
+    try:
+        render_sector_movers(df, quotes)
+    except Exception as _e:  # noqa: BLE001 — 첫 화면 카드가 실패해도 나머지 보드는 계속
+        st.caption(f"섹터 강세 카드를 그리지 못했어요({type(_e).__name__}).")
     render_radar(df[df["code"].map(_mkt) == market])
     render_buy_alert(df, histories, quotes)
     jobs = {
