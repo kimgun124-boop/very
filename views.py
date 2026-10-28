@@ -216,6 +216,59 @@ def peer_table(df: pd.DataFrame, histories: dict) -> list[dict]:
     return out
 
 
+def kr_peer_leaders(df: pd.DataFrame, rs_min: float = 70, grs_min: float = 70, min_universe: int = 4) -> pd.DataFrame:
+    """글로벌 피어 대비 강한 한국 종목.
+    글로벌 RS = 같은 분류의 국내 종목 + 해외 피어 종목을 한 무리로 놓고, 보드와 같은 오닐식 RS 원점수(rs_raw:
+    0.4×3개월 + 0.2×6·9·12개월 수익률, 각 시장 통화 기준)의 백분위(1~99). 피어 초과 = 종목 수익률 − 피어 바구니 중앙값."""
+    cols = ["code", "name", "group", "sector", "rs", "grs", "g_rank", "g_n", "ex1m", "ex3m", "ret_1m", "ret_3m",
+            "peer_1m", "peer_3m", "peer_top", "peer_top_ret3m", "price", "change", "to_high", "lead_rank", "lead_ok",
+            "cap_krw", "peer_groups", "ok"]
+    if df is None or df.empty or "rs_raw" not in df:
+        return pd.DataFrame(columns=cols)
+    kr = df[df["code"].map(_is_kr)].drop_duplicates("code")
+    os_ = df[~df["code"].map(_is_kr)].drop_duplicates("code")
+    num = lambda s: pd.to_numeric(s, errors="coerce")  # noqa: E731
+    rows = []
+    for g, sub in kr.groupby("group"):
+        mp = PEER_MAP.get(g)
+        if not mp:
+            continue
+        peers = os_[os_["group"].isin(mp["peers"])]
+        peers = peers[num(peers["rs_raw"]).notna()]
+        if len(peers) < 2:
+            continue
+        uni = pd.concat([sub[["code", "rs_raw"]], peers[["code", "rs_raw"]]])
+        uni = uni[num(uni["rs_raw"]).notna()]
+        if len(uni) < min_universe:
+            continue
+        raw = num(uni["rs_raw"])
+        pct = (raw.rank(pct=True, method="average") * 98 + 1).round()
+        grs = dict(zip(uni["code"], pct))
+        rank = dict(zip(uni["code"], raw.rank(ascending=False, method="min").astype(int)))
+        p1, p3 = float(num(peers.get("ret_1m")).median()), float(num(peers.get("ret_3m")).median())
+        top = peers.loc[num(peers["rs_raw"]).idxmax()]
+        for r in sub.itertuples():
+            if r.code not in grs:
+                continue
+            g_rs, rs = grs[r.code], getattr(r, "rs", None)
+            r1, r3 = getattr(r, "ret_1m", None), getattr(r, "ret_3m", None)
+            ex1 = None if r1 is None or r1 != r1 or p1 != p1 else float(r1) - p1
+            ex3 = None if r3 is None or r3 != r3 or p3 != p3 else float(r3) - p3
+            ok = bool(rs is not None and rs == rs and rs >= rs_min and g_rs >= grs_min and (ex3 is None or ex3 > 0))
+            rows.append({"code": r.code, "name": r.name, "group": g, "sector": getattr(r, "sector", None),
+                         "rs": rs, "grs": g_rs, "g_rank": rank[r.code], "g_n": len(uni), "ex1m": ex1, "ex3m": ex3,
+                         "ret_1m": r1, "ret_3m": r3, "peer_1m": p1, "peer_3m": p3,
+                         "peer_top": str(top.get("name")), "peer_top_ret3m": top.get("ret_3m"),
+                         "price": getattr(r, "price", None), "change": getattr(r, "change", None),
+                         "to_high": getattr(r, "to_high", None), "lead_rank": getattr(r, "lead_rank", None),
+                         "lead_ok": getattr(r, "lead_ok", None), "cap_krw": getattr(r, "cap_krw", None),
+                         "peer_groups": " · ".join(mp["peers"]), "ok": ok})
+    out = pd.DataFrame(rows, columns=cols)
+    if out.empty:
+        return out
+    return out.sort_values(["ok", "grs", "rs"], ascending=False).reset_index(drop=True)
+
+
 # ─────────────────────────── 증거 사다리(피라미딩 단계) ───────────────────────────
 def fwd_per(fin: pd.DataFrame | None, price: float | None) -> tuple[float | None, float | None]:
     """(올해 예상 PER, PEG). EPS 예상(E)이 없으면 최근 실적 EPS."""

@@ -368,6 +368,8 @@ def index_summary(df: pd.DataFrame) -> dict | None:
         "change": (last / prev - 1) * 100,
         "ma60": ma60,
         "above60": (last > ma60) if ma60 else None,
+        "ma20": float(close.tail(20).mean()) if len(close) >= 20 else None,
+        "above20": (last > float(close.tail(20).mean())) if len(close) >= 20 else None,
         "dist60": (last / ma60 - 1) * 100 if ma60 else None,
         "date": df["date"].iloc[-1],
     }
@@ -2912,13 +2914,17 @@ def position_plan(price: float, atr: float | None, equity: float | None, p: dict
     if atr is not None and atr == atr and atr >= p["stop_pct"]:
         stop_pct = float(atr)
     out = {"stop_pct": stop_pct, "stop_price": price * (1 - stop_pct / 100),
-           "target_price": price * (1 + 3 * stop_pct / 100), "shares": None, "amount": None, "weight": None}
+           "target_price": price * (1 + 3 * stop_pct / 100), "shares": None, "amount": None, "weight": None,
+           "mkt_unit": p.get("mkt_up20") is True}
     if equity and price:
         risk_won = equity * p["risk_pct"] / 100
         shares = int(risk_won // (price * stop_pct / 100))
         shares = min(shares, int(equity // price))           # 계좌보다 크게는 못 사요
         units = max(1, int(p.get("units", 3)))
         level = min(max(1, int(p.get("unit_level", units))), units)
+        # 원칙: 진입 때 지수가 20일선 위면 시장 유닛 +1(종목당 위험 1.5%는 넘지 않게 최대 유닛까지만)
+        if p.get("mkt_up20") is True:
+            level = min(units, level + 1)
         full = shares
         shares = int(full * level / units)
         out.update(shares=shares, amount=shares * price, weight=shares * price / equity * 100,
@@ -4240,7 +4246,7 @@ def potential_groups(df: pd.DataFrame, leaders: set, near: float = 10.0, min_cou
 
 
 def ia_candidates(df: pd.DataFrame, scan: pd.DataFrame, day, ia_groups: set, p: dict | None = None,
-                  idx_rs: dict | None = None) -> pd.DataFrame:
+                  idx_rs: dict | None = None, fins: dict | None = None) -> pd.DataFrame:
     """인더스트리 액션 섹터 안에서 그날 거래량이 평소보다 높게 터진 종목 + 매수 조건 점검.
     조건: 거래량 배수 · 장대양봉 · 돌파/저항 근처 · 종가 강도 · RS(70↑ & 지수 RS 위) · 시총 · 20일선 이격"""
     p = {**IA_DEFAULTS, **(p or {})}
@@ -4270,13 +4276,19 @@ def ia_candidates(df: pd.DataFrame, scan: pd.DataFrame, day, ia_groups: set, p: 
         rs = num(r.get("rs"))
         if rs is None:
             c["rs"] = (None, "RS 없음")
+        elif not known:          # 지수 RS를 모르면 매수 후보 탭처럼 '모름'(통과 아님)
+            c["rs"] = (None, f"RS {rs:.0f} · 지수 RS 모름")
         else:
-            beat = all(rs > v for v in known.values()) if known else True
+            beat = all(rs > v for v in known.values())
             c["rs"] = (rs >= p["rs_min"] and beat, f"RS {rs:.0f}" + ("" if beat else " (지수보다 약함)"))
         cap = num(r.get("cap_krw"))
         c["cap"] = (None if cap is None else cap / 1e8 >= p["min_cap"], format_krw(cap) + "원" if cap else "시총 모름")
         ext = num(r.get("dist_ma20"))
         c["ext"] = (None if ext is None else ext <= p["max_ext"], f"20일선 {ext:+.1f}%" if ext is not None else "-")
+        # 원칙: 강하게 치고 나가도 영업이익이 늘지 않으면 배제 → 영업이익·EPS 정배열(매수 후보 탭과 같은 판정)
+        if fins is not None:
+            e = earnings_trend(fins.get(r["code"]), int(p.get("earn_years", 3))).get("earn_ok")
+            c["earn"] = (e, {True: "실적 정배열", False: "영업이익·EPS 정배열 아님", None: "실적 판정 불가(전망 없음)"}[e])
         fails = [k for k, (ok, _) in c.items() if ok is not True]
         tier = "매수 가능" if not fails else ("1개 미충족" if len(fails) == 1 else "관찰")
         rows.append({"code": r["code"], "group": r["group"], "tier": tier, "fails": fails, "checks": c,
@@ -4382,9 +4394,14 @@ def ia_buy_signals(df: pd.DataFrame, histories: dict, quotes: dict, idx_hist: di
         sub = names[names["group"] == g].sort_values("vx", ascending=False)
         out["sectors"][g] = {"label": pot.get(g, ""), "names": [f"{r.name}" for r in sub.itertuples()],
                              "sec_vx": float(ia.loc[ia["group"] == g, "sec_vx"].iloc[0] or 0)}
-    cand = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs)
-    if cand.empty:
+    pre = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs)
+    if pre.empty:
         return out
+    try:          # 실적은 후보만 받아서 확인(영업이익이 안 느는 종목은 '매수하세요'에서 빼요)
+        fins = fetch_financials_many(tuple(pre["code"]))
+    except Exception:  # noqa: BLE001
+        fins = None
+    cand = ia_candidates(df, scan, day, set(ia["group"]), p, idx_rs, fins) if fins is not None else pre
     bp = dict(BUY_DEFAULTS)
     for r in cand.itertuples():
         plan = position_plan(float(r.close), r.atr_pct, None, bp)
