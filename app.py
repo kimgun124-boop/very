@@ -9956,14 +9956,14 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
                  f'<b>{esc(sv)}</b><small>{esc(("막힘: " + stop_reasons[0].split(" — ")[0]) if stop_reasons else "막힌 단계 없음")}</small></div>')
 
     # ── HTML
-    o = [DB_CSS, '<div class="db">',
+    o = [
          f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
          f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" / ".join(why_bits) or "막힌 단계 없음")}</p><p><b>할 일</b> {esc(concl_act)}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
          f'<div class="db-stats">{"".join(stats)}</div></div>',
-         _now_card(mn),
-         _db_bigpicture(df),
-         '<div class="db-grid">']
+         "§now§", _now_card(mn),
+         "§big§", _db_bigpicture(df),
+         "§main§", '<div class="db-grid">']
     # 왼쪽: TOP 6 — 종목마다 '왜'는 배지 3개, '어떻게'는 손절·3R 한 줄
     if n_buy:
         t_title, t_sub = "지금 살 종목 TOP 6", "원칙 매수 → 선매입(매물대 돌파) → 정찰병 순 · 이름을 누르면 차트"
@@ -10068,6 +10068,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
              or '<span class="ln">오늘 매물대를 거래량 실어 뚫은 액션 섹터 종목 없음</span>')]
     hold_html = ("".join(f'<div class="db-hold">{em} <b>{esc(n)}</b> {esc(v)}<small>{esc(a)}</small></div>' for em, n, v, a in hrows[:6])
                  if hrows else f'<div class="db-empty">{esc(hmsg or "")}</div>')
+    o.append("§data§")
     o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>근거 데이터</h3>'
              '<p>판단에 쓴 숫자를 그대로 — 지수 · 시장 폭 · 섹터 · 선매입</p></div><span class="db-pill g">오늘 기준</span></div>'
              + "".join(f'<div class="db-sig"><span class="n" style="background:{c}">{n}</span><b>{t}</b><span class="d">{x}</span></div>'
@@ -10097,6 +10098,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
             ("매물대", "위에 쌓인 거래량 = 본전 오면 팔려는 물량. 큰 매물대를 거래량 실어 뚫었다 = 그 물량을 소화 → 위 매물이 적을수록 오를 길이 가벼움"),
             ("손익비", "승률 30%면 2.33R가 손익분기 → 3R가 최소 목표, 그래서 손절선(1R)을 먼저 정하고 들어감"),
             ("60일선", "내 원칙: 지수가 60일선 아래면 돌파매매는 쉬는 장 — 스승님 방식의 정찰병만 허용")]
+    o.append("§how§")
     o.append('<div class="db-grid"><div class="db-card"><div class="db-hd"><div><h3>사는 방법</h3><p>신고가만 기다리지 않고 매물대 돌파로 먼저 사는 길까지</p></div>'
              '<span class="db-pill g">원칙</span></div>'
              + "".join(f'<div class="db-rule"><span style="color:{c};background:{c}14">{m}</span><div><b>{esc(t)}</b> — {esc(x)}<small>{_db_lines(y)}</small></div></div>'
@@ -10104,11 +10106,39 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
              + f'<div class="db-quote">“{esc(pb["mentor"])}”<small>— 스승님 · {esc(pb["title"])}</small></div></div>')
     o.append('<div class="db-card"><div class="db-hd"><div><h3>원칙 출처 — 왜 이 규칙인가</h3><p>판단에 쓰는 규칙의 근거(백테스트 · 연구 · 논리)</p></div></div>'
              + "".join(f'<div class="db-cmr"><b>{esc(k)}</b><div>{_db_lines(v)}</div></div>' for k, v in srcs) + '</div></div>')
-    o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div></div>')
+    o.append("§foot§")
+    o.append('<div class="db-foot"><span>밸류체인 보드 · 확인 후 진입, 위험 관리를 최우선으로 · 매매 추천이 아니라 원칙 확인용</span><b>TREND BOARD</b></div>')
     out = "".join(o)
     for ch in "→↑↓←↗":            # SUIT는 화살표를 꺾쇠(> ^)처럼 그려서, 화살표만 원래 글꼴로
         out = out.replace(ch, f'<span class="db-a">{ch}</span>')
-    st.markdown(out, unsafe_allow_html=True)
+    parts = re.split(r"§(\w+)§", out)          # [판정, 이름, 내용, 이름, 내용, ...]
+    st.markdown(DB_CSS + f'<div class="db">{parts[0]}</div>', unsafe_allow_html=True)
+
+    # 접고 여는 칸 — key를 고정해서 1분마다 새로 그려도 열어 둔 칸은 그대로 열려 있어요
+    try:
+        _bs = bigpicture.bucket_summary(tab_memo("bigpicture", ("국내", int(df["code"].map(data.is_kr).sum())),
+                                                 lambda: bigpicture.summary(df[df["code"].map(data.is_kr)], recent_days)))
+        big_lab = " · ".join(f"{b} {x['chg']:+.1f}%" for b, x in _bs.items() if x and x.get("chg") is not None)
+    except Exception:  # noqa: BLE001
+        big_lab = ""
+    now_lab = " · ".join(f"{n} {x['state']} {x['exp']}" for n, x in mn["idx"].items())
+    if _hl is not None and _hl["adr"] == _hl["adr"]:
+        now_lab += f" · ADR {_hl['adr']:.0f}"
+    labels = {
+        "now": (f"📍 지금 여긴 — {now_lab}", False),
+        "big": ("🗺️ 큰 그림 — " + (big_lab or "AI · 비AI · 그외"), False),
+        "main": (f"🛒 살 종목 · 판단 회로 — 결론: {decision}" + (f" · {action}" if action != decision else ""), True),
+        "data": ("📊 근거 데이터 · 보유 → 매도 판단" + (f" — ⚠️ 처리할 보유 {urgent}개" if urgent else ""), bool(urgent)),
+        "how": ("📘 사는 방법 · 원칙 출처", False),
+    }
+    for name, body in zip(parts[1::2], parts[2::2]):
+        html_ = f'<div class="db">{body}</div>'
+        if name == "foot":
+            st.markdown(html_, unsafe_allow_html=True)
+            continue
+        lab, opened = labels.get(name, (name, False))
+        with st.expander(lab, expanded=opened, key=f"db_sec_{name}"):
+            st.markdown(html_, unsafe_allow_html=True)
 
     with st.expander("📖 스승님 국면별 플레이북 — 이런 장에선 이렇게"):
         tb = [{"단계": f"{v['em']} {v['title']}", "비중": v["size"], "매수": v["buy"], "보유·매도": v["hold"], "스승님": v["mentor"],
