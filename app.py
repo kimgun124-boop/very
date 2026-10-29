@@ -167,6 +167,7 @@ import views
 import market as msig
 import scout
 import bigpicture
+import zongbae
 import bear_check
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
@@ -281,7 +282,8 @@ MARKET_VERSION = "2026-10-28-lastftd"
 _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
-            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "AI_VIEWS")}
+            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "AI_VIEWS"),
+            "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line")}
 _MOD_VER = {"msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-10-28-ibdexp")}
 
 
@@ -302,7 +304,7 @@ if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     reports = importlib.reload(reports)
 if getattr(reports, "REPORTS_VERSION", None) != REPORTS_VERSION:
     _missing.append("reports.py 새 파일")
-HOLDINGS_VERSION = "2026-10-28-kq"
+HOLDINGS_VERSION = "2026-10-29-zb"
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
     holdings = importlib.reload(holdings)
 if getattr(holdings, "HOLDINGS_VERSION", None) != HOLDINGS_VERSION:
@@ -7853,6 +7855,132 @@ def render_bigpicture(df: pd.DataFrame):
         st.caption("세부 분류 → 테마 지도는 bigpicture.py. 한 종목이 여러 테마에 걸치면(예: 삼성전기 = 반도체소부장·MLCC·유리기판) 모두 셉니다.")
 
 
+# ─────────────────────────── 🌙 종가배팅: 4인 관점(M · K · C · D) ───────────────────────────
+ZB_CSS = """
+<style>
+.zb-top{display:grid;grid-template-columns:1.1fr 1fr;gap:.8rem;margin:.2rem 0 .8rem}
+.zb-box{background:#fff;border:1px solid #ECEEF5;border-radius:14px;padding:.75rem .9rem}
+.zb-box b{font-size:.98rem;color:#111827}.zb-box p{margin:.25rem 0 0;font-size:.86rem;color:#374151;line-height:1.55}
+.zb-box.sum{border-color:#F3C77A;background:#FFFBF2}
+.zb-hl{color:#B45309;font-weight:800}
+.zb-g{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.6rem;margin:.2rem 0 .4rem}
+.zb-c{background:#fff;border:1px solid #ECEEF5;border-radius:14px;padding:.65rem .75rem;min-width:0}
+.zb-c .h{display:flex;justify-content:space-between;align-items:center;margin-bottom:.35rem}
+.zb-c .h b{font-size:.95rem;color:#111827;display:flex;align-items:center;gap:.35rem}
+.zb-c .h b i{font-style:normal;width:22px;height:22px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+             color:#fff;font-size:.72rem;font-weight:900}
+.zb-c .h span{font-size:.72rem;font-weight:800;border-radius:6px;padding:.1rem .45rem;background:#F3F4F6}
+.zb-c div.l{font-size:.82rem;line-height:1.55;color:#374151}
+.zb-c div.l.ok{color:#15803D}.zb-c div.l.no{color:#C0262E}.zb-c div.l.q{color:#6B7280}
+.zb-t{width:100%;border-collapse:collapse;font-size:.84rem}
+.zb-t th,.zb-t td{border-bottom:1px solid #F1F3F8;padding:.5rem .55rem;text-align:left;vertical-align:top;line-height:1.5}
+.zb-t th{background:#F7F7FB;color:#6B7280;font-weight:700}
+.zb-t td.sec{color:#B45309;font-weight:850;background:#FFFBF2}
+.zb-t td.k{color:#6B7280;font-weight:700;white-space:nowrap}
+.zb-dot{display:inline-flex;width:18px;height:18px;border-radius:50%;color:#fff;font-size:.66rem;font-weight:900;align-items:center;justify-content:center;margin-right:.25rem}
+@media (max-width:900px){.zb-top{grid-template-columns:1fr}.zb-g{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.zb-g{grid-template-columns:1fr}}
+</style>
+"""
+
+
+def _zb_cards(ck: dict) -> str:
+    out = []
+    for k, items in ck.items():
+        v = zongbae.VIEWS[k]
+        lab, col = zongbae.verdict(items)
+        rows = "".join(f'<div class="l {"ok" if s == "✓" else ("no" if s == "✕" else "q")}">{"✓" if s == "✓" else ("×" if s == "✕" else "?")} '
+                       f'{html.escape(t)}</div>' for s, t in items)
+        out.append(f'<div class="zb-c"><div class="h"><b><i style="background:{v["color"]}">{k}</i>'
+                   f'{"마스터" if k == "M" else k + " 관점"}</b><span style="color:{col}">{lab}</span></div>{rows}</div>')
+    return f'<div class="zb-g">{"".join(out)}</div>'
+
+
+def _zb_table() -> str:
+    head = "".join(f'<th><span class="zb-dot" style="background:{v["color"]}">{k}</span>{"마스터(M)" if k == "M" else k}</th>'
+                   for k, v in zongbae.VIEWS.items())
+    body = []
+    for lab, key in zongbae.ROWS:
+        if key is None:
+            body.append(f'<tr><td class="sec" colspan="5">{lab}</td></tr>')
+        else:
+            body.append(f'<tr><td class="k">{lab}</td>' + "".join(f"<td>{html.escape(v[key])}</td>" for v in zongbae.VIEWS.values()) + "</tr>")
+    return (f'<div style="overflow-x:auto"><table class="zb-t"><thead><tr><th>항목</th>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>')
+
+
+def render_zongbae(df: pd.DataFrame):
+    _sec_h("🌙 종가배팅", "4인 관점(M 마스터 · K · C · D)으로 오늘 종목을 자동 점검 — 큰 거래대금 · 신고가 자리 · 장 막판 진입 · 다음날 짧게")
+    st.markdown(ZB_CSS, unsafe_allow_html=True)
+    now = data.now_kst()
+    hm = now.hour * 60 + now.minute
+    before_cut = now.weekday() < 5 and hm < 14 * 60 + 40
+    kind, why, fit = zongbae.market_type(load_overview(), df)
+    if hm < 14 * 60 + 30 and now.weekday() < 5:
+        clock = f"지금 {now:%H:%M} — 아직 진입 시각 전(C 14:30 · M·K 14:40 · D 15:00). 지금은 후보를 고르는 시간"
+    elif hm < 15 * 60 + 30 and now.weekday() < 5:
+        clock = f"지금 {now:%H:%M} — 진입 시간대(C 14:30↑ · M·K 14:40↑ · D 15:00↑). 고가 근처에서 버티는지 확인"
+    else:
+        clock = f"지금 {now:%H:%M} — 장 마감 뒤. D는 애프터장 19:00~19:30, 나머지는 내일 아침 정리 계획 점검"
+    st.markdown(f'<div class="zb-top"><div class="zb-box"><b>📊 오늘 장세: {html.escape(kind)}</b><p>{html.escape(why)}</p>'
+                f'<p>잘 맞는 장세 — 재료·차트형(M·K) = 테마주 장세 · 수급형(C·D) = 지수 상승장</p></div>'
+                f'<div class="zb-box"><b>⏰ 시간</b><p>{html.escape(clock)}</p>'
+                '<p>종배는 <span class="zb-hl">종배 전용 계좌</span> — 추세 계좌와 섞지 않아요. 다음날 짧게 · 빠른 손절이 공통 원칙.</p></div></div>',
+                unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1, 1])
+    min_chg = c1.slider("후보: 오늘 등락 %↑", 3.0, 15.0, 5.0, 0.5, key="zb_chg")
+    min_tv = c2.slider("후보: 거래대금 억↑", 100, 1500, 300, 50, key="zb_tv")
+    cand = zongbae.candidates(df, min_chg, min_tv)
+    t1, t2 = st.tabs(["🔎 오늘 후보 자동 점검", "📋 4인 비교표 · 두 갈래 · 공통"])
+    with t1:
+        if cand.empty:
+            st.info("조건에 맞는 오늘 후보가 없어요. 등락·거래대금 기준을 낮춰 보세요.")
+        else:
+            codes = tuple(cand["code"].head(40))
+            try:
+                trends = {**(_TRENDS_BG.get("v") or {}), **load_trends(tuple(c for c in codes if (_TRENDS_BG.get("v") or {}).get(c) is None))}
+            except Exception:  # noqa: BLE001
+                trends = _TRENDS_BG.get("v") or {}
+            grp_hot = cand.groupby("group").size()
+            rows, cks = [], {}
+            for r in cand.head(40).to_dict("records"):
+                fl = data.trend_summary(trends.get(r["code"])) if trends.get(r["code"]) is not None else None
+                ck = zongbae.checks(r, fl, bool(grp_hot.get(r["group"], 0) >= 2), before_cut)
+                cks[r["code"]] = (r, ck)
+                v = {k: zongbae.verdict(x)[0] for k, x in ck.items()}
+                gp = zongbae.gap_pct(r)
+                rows.append({"종목": f"{r['name']} · {r['code']}", "차트": f"?chart={r['code']}", "분류": r["group"],
+                             "등락률": r["change"], "거래대금(억)": (r.get("tv_live") or 0) / 1e8, "시가갭": gp,
+                             "시총(억)": (r.get("cap_krw") or 0) / 1e8, "종가 위치": r.get("dcr_today"),
+                             "M": v["M"], "K": v["K"], "C": v["C"], "D": v["D"],
+                             "_n": sum(1 for x in v.values() if x == "가까움")})
+            tb = pd.DataFrame(rows).sort_values(["_n", "거래대금(억)"], ascending=False).drop(columns="_n")
+            colmap = {"가까움": "background-color:#E9F7EE;color:#15803D;font-weight:700",
+                      "수급 보면 됨": "background-color:#FFF7E8;color:#B45309;font-weight:700",
+                      "하나 부족": "color:#B45309", "멀어요": "color:#9CA3AF"}
+            st.dataframe(tb.style.format({"등락률": "{:+.2f}%", "거래대금(억)": "{:,.0f}", "시가갭": "{:+.1f}%", "시총(억)": "{:,.0f}",
+                                          "종가 위치": "{:.0f}%"}, na_rep="-")
+                         .map(lambda x: colmap.get(x, ""), subset=["M", "K", "C", "D"]).map(_won_c, subset=["등락률"]),
+                         hide_index=True, width="stretch", height=min(520, 36 * (len(tb) + 1) + 4),
+                         column_config={"차트": st.column_config.LinkColumn("차트", display_text="🕯️")})
+            st.caption("가까움 = 안 맞는 조건(×) 없음 · 수급 보면 됨 = 수급(?)만 남음 · 하나 부족 = × 1개 · "
+                       "종가 위치 = 오늘 고가~저가 중 현재가 위치(100%면 고가 마감). 프로그램 매매·분봉 조건은 보드에 없어 HTS로 확인.")
+            pick = st.selectbox("종목 자세히", list(tb["종목"]), key="zb_pick")
+            code = pick.split(" · ")[-1]
+            r, ck = cks[code]
+            st.markdown(f'<div class="zb-box sum"><b>🕒 한 줄 정리 (자동)</b><p>{html.escape(zongbae.summary_line(r, ck))}</p></div>',
+                        unsafe_allow_html=True)
+            st.markdown(_zb_cards(ck), unsafe_allow_html=True)
+            st.caption("✓ 맞음 · × 안 맞음 · ? 자료 연결 뒤 자동(수급) 또는 HTS 확인 · 공부용 비교이며 매매 판단이 아니에요.")
+    with t2:
+        st.markdown(_zb_table(), unsafe_allow_html=True)
+        st.markdown("".join(f'<div class="zb-box" style="margin-top:.6rem"><b>{html.escape(a)} — {html.escape(b)}</b><p>{html.escape(c)}</p></div>'
+                            for a, b, c in zongbae.TWO_WAYS), unsafe_allow_html=True)
+        st.markdown(f'<div class="zb-box" style="margin-top:.6rem"><b>4인 공통</b><p>{" · ".join(zongbae.COMMON)}</p></div>',
+                    unsafe_allow_html=True)
+        st.caption("2026-10-17 강의 정리 · 숫자는 강의 기준 '대략'이며 절대 조건이 아니에요.")
+
+
 def render_early(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
     _sec_h("🎯 초기 매수", "리 태너 — 표준 피벗보다 싸게 사는 자리: 하락 추세선 돌파 · 손잡이 저점(조용한 거래량) · Shakeout +3")
     d = msig.EE_DEFAULTS
@@ -11090,7 +11218,7 @@ NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
     ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
-    ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매"]),
+    ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
     ("🔭 섹터 흐름", ["🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
@@ -11101,7 +11229,7 @@ NAV_DESC = {
     "🏁 신고가 후보": "넥장까지 반영한 진짜 돌파·찍고 밀림", "🏔️ 신고가": "역사적·52주 신고가를 섹터별로",
     "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
-    "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
+    "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "🌙 종가배팅": "4인 관점(M·K·C·D) 오늘 후보 자동 점검 + 비교표", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
     "🗺️ 큰 그림": "AI · 비AI · 그외 → 테마별 등락·신고가 확산·대장주", "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
     "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
@@ -11274,6 +11402,7 @@ def render_board():
         "🚦 시장 신호": lambda: render_market_signal(df),
         "📉 하락장 점검": lambda: render_bear_check(df),
         "🎯 초기 매수": lambda: render_early(df, histories, quotes, fins_all),
+        "🌙 종가배팅": lambda: render_zongbae(df),
     }
     MAIN_TABS_LAZY["v"] = True
     cur = main_nav()
