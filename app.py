@@ -262,8 +262,9 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "market_turnover", "fetch_market_turnover_hist", "fetch_krx_universe", "classify_industry", "fetch_theme_map", "fix_bars", "fetch_industry_map", "is_halted",
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
-            "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER")
-DATA_VERSION = "2026-10-28-ibdexp"   # data.py의 DATA_VERSION과 같아야 해요
+            "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER",
+            "vol52_scan", "V52_DEFAULTS", "v52_reasons", "v52_kind")
+DATA_VERSION = "2026-11-01-v52"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -9196,6 +9197,256 @@ def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
             "- 보드에 넣은 종목(stocks.py) 안에서만 찾아요. 오늘 봉은 실시간 누적 거래량이라 장중엔 계속 커져요.")
 
 
+V52_CSS = """
+<style>
+.v52-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .6rem; margin: .2rem 0 .8rem; }
+.v52-kpis div { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: .65rem .8rem; }
+.v52-kpis span { display: block; font-size: .74rem; color: #6B7A84; }
+.v52-kpis b { font-size: 1.45rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
+.v52-kpis b small { font-size: .78rem; font-weight: 600; color: #7A8A94; margin-left: .2rem; }
+.v52-secs { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .9rem; align-items: center; }
+.v52-secs .t { font-size: .78rem; font-weight: 700; color: #51616C; margin-right: .2rem; }
+.v52-sec { font-size: .78rem; font-weight: 700; padding: .25rem .6rem; border-radius: 999px; background: #F2EEFE; color: #5B3FD0; }
+.v52-sec b { margin-left: .25rem; font-weight: 800; }
+.v52-sec.hot { background: #5B3FD0; color: #FFFFFF; }
+.v52-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; }
+.v52-card { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 14px; padding: .8rem .9rem .75rem; display: flex;
+  flex-direction: column; gap: .5rem; box-shadow: 0 1px 2px rgba(22,33,43,.04); min-width: 0; }
+.v52-card.k-brk { border-top: 3px solid #D6333B; } .v52-card.k-climax { border-top: 3px solid #F29A18; }
+.v52-card.k-dump { border-top: 3px solid #1F66C9; } .v52-card.k-wake { border-top: 3px solid #7C5CFA; }
+.v52-card.k-watch { border-top: 3px solid #B0BCC4; }
+.v52-top { display: flex; justify-content: space-between; align-items: flex-start; gap: .5rem; }
+.v52-nm { min-width: 0; }
+.v52-nm .rk { display: inline-flex; align-items: center; justify-content: center; width: 1.35rem; height: 1.35rem; border-radius: 6px;
+  background: #16212B; color: #FFFFFF; font-size: .72rem; font-weight: 800; margin-right: .35rem; vertical-align: 2px; }
+.stApp .v52-nm a { color: #16212B; font-weight: 800; font-size: 1.05rem; text-decoration: none; }
+.v52-nm small { display: block; font-size: .72rem; color: #7A8A94; margin-top: .1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.v52-kind { font-size: .72rem; font-weight: 800; padding: .18rem .55rem; border-radius: 7px; white-space: nowrap; }
+.v52-kind.brk { background: #FCE4E5; color: #C0262E; } .v52-kind.climax { background: #FFF1D6; color: #A65A00; }
+.v52-kind.dump { background: #E4EDFA; color: #1F66C9; } .v52-kind.wake { background: #EFEAFE; color: #5B3FD0; }
+.v52-kind.watch { background: #EEF1F3; color: #51616C; }
+.v52-big { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+.v52-big b { font-size: 1.7rem; font-weight: 900; color: #D6333B; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.v52-big span { font-size: .76rem; color: #51616C; }
+.v52-keys { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .3rem; }
+.v52-keys div { background: #F5F7F9; border-radius: 8px; padding: .3rem .45rem; font-size: .64rem; color: #6B7A84; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.v52-keys b { display: block; font-size: .88rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
+.v52-spark svg { width: 100%; height: 46px; display: block; }
+.v52-spark .lg { display: flex; justify-content: space-between; font-size: .64rem; color: #8A98A1; margin-top: .1rem; }
+.v52-why { background: #FAF9FF; border: 1px solid #ECE7FD; border-radius: 10px; padding: .5rem .6rem; }
+.v52-why .h { font-size: .72rem; font-weight: 800; color: #5B3FD0; margin-bottom: .25rem; }
+.v52-why .chips { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: .3rem; }
+.v52-chip { font-size: .68rem; font-weight: 700; padding: .1rem .45rem; border-radius: 6px; background: #EEF1F3; color: #3E4C55; }
+.v52-chip.earn { background: #FCE4E5; color: #C0262E; } .v52-chip.deal { background: #FFE8D6; color: #C2570E; }
+.v52-chip.mna { background: #E3F4EA; color: #1B6B3E; } .v52-chip.tech { background: #E0F2FE; color: #0369A1; }
+.v52-chip.policy { background: #FFF1C9; color: #8A5E00; } .v52-chip.report { background: #EFEAFE; color: #5B3FD0; }
+.v52-chip.share { background: #E7F7F3; color: #0F766E; } .v52-chip.bad { background: #1F66C9; color: #FFFFFF; }
+.v52-chip.fact { background: #FFFFFF; border: 1px solid #DDE3E7; color: #3E4C55; }
+.v52-why p { font-size: .76rem; color: #26343E; margin: 0 0 .3rem; line-height: 1.45; }
+.v52-news { display: flex; gap: .35rem; font-size: .74rem; line-height: 1.35; margin-top: .15rem; min-width: 0; }
+.v52-news .t { color: #8A98A1; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.stApp .v52-news a { color: #26343E; text-decoration: none; overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.stApp .v52-news a:hover { text-decoration: underline; }
+.v52-news.old .t::after { content: " (이전)"; }
+.v52-foot { display: flex; justify-content: space-between; gap: .4rem; font-size: .7rem; color: #6B7A84; flex-wrap: wrap; }
+.v52-foot b { color: #16212B; }
+@media (max-width: 1100px) { .v52-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .v52-grid { grid-template-columns: 1fr; } .v52-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .v52-big b { font-size: 1.45rem; } }
+</style>
+"""
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=6)
+def _v52_news(codes: tuple[str, ...]) -> dict:
+    """종목별 네이버 뉴스(최근 15개, 5분 기억)."""
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    def one(c):
+        try:
+            return c, holdings.naver_news(c, 15) or []
+        except Exception:  # noqa: BLE001
+            return c, []
+    with _TPE(max_workers=8) as ex:
+        return dict(ex.map(one, codes))
+
+
+def _v52_pick_news(items: list[dict], peak) -> tuple[list[dict], bool]:
+    """거래량이 터진 날(전날 오후 ~ 다음날) 뉴스만. 없으면 가장 최근 뉴스(이전 것 표시)."""
+    from datetime import timedelta as _td
+    ok_days = {(peak + _td(days=k)).strftime("%m/%d") for k in (-2, -1, 0, 1)}
+    hit = [x for x in items if str(x.get("time") or "")[:5] in ok_days]
+    return (hit, True) if hit else (items[:2], False)
+
+
+def _v52_svg(vol: list, up: list, pk: int | None, prev: int | None, w: int = 300, hgt: int = 46) -> str:
+    """최근 120거래일 거래량 막대: 터진 날 = 진한 빨강 · 직전 52주 최대 = 점선 · 양봉 연빨강/음봉 연파랑."""
+    vol = [x or 0 for x in (vol or [])]
+    n = len(vol)
+    if n < 10:
+        return ""
+    pk = int(pk) if pk is not None and pk == pk else None          # 표를 거치면 None이 NaN(float)이 돼요
+    prev = int(prev) if prev is not None and prev == prev else None
+    vmax = max(vol) or 1
+    bw = w / n
+    parts = [f'<svg viewBox="0 0 {w} {hgt}" preserveAspectRatio="none">']
+    for i, x in enumerate(vol):
+        bh = max(0.6, (hgt - 2) * x / vmax)
+        if i == pk:
+            col = "#D6333B"
+        else:
+            col = "#F3B9BC" if (up[i] if i < len(up) else True) else "#BCD0EE"
+        parts.append(f'<rect x="{i * bw:.2f}" y="{hgt - bh:.1f}" width="{max(bw - 0.5, 0.6):.2f}" height="{bh:.1f}" fill="{col}" rx="0.6"/>')
+    if prev is not None and 0 <= prev < n:
+        y = hgt - (hgt - 2) * vol[prev] / vmax
+        parts.append(f'<line x1="0" x2="{w}" y1="{y:.1f}" y2="{y:.1f}" stroke="#16212B" stroke-width="0.8" stroke-dasharray="3 2" opacity=".55"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _v52_x(x) -> str:
+    """직전 최대 대비 배수 — 2배 미만은 소수 둘째 자리까지(1.03배처럼 '살짝 넘음'도 보이게)."""
+    if x is None or x != x:
+        return "-"
+    return f"{x:.2f}배" if x < 2 else f"{x:.1f}배"
+
+
+def _v52_vol(v) -> str:
+    if v is None or v != v:
+        return "-"
+    return f"{v / 1e8:,.2f}억주" if v >= 1e8 else (f"{v / 1e4:,.0f}만주" if v >= 1e4 else f"{v:,.0f}주")
+
+
+def render_vol52(df: pd.DataFrame, histories: dict, quotes: dict):
+    """🔊 52주 최대 거래량 — 얼마나 터졌나(직전 52주 최대·20일 평균 대비) + 왜 터졌나(뉴스 키워드 · 캔들 · 섹터 동반)."""
+    st.markdown(NHC_CSS + V52_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="nh-head"><b>🔊 52주 최대 거래량</b><span>1년 중 가장 많은 거래량이 터진 종목 — 얼마나, 왜</span></div>',
+                unsafe_allow_html=True)
+    d = data.V52_DEFAULTS
+    c1, c2, c3, c4 = st.columns([1.5, 1, 1.1, 0.8])
+    recent = c1.segmented_control("언제 터졌나", [1, 3, 5, 10], default=int(d["recent"]), key="v52_recent",
+                                  format_func=lambda x: "오늘" if x == 1 else f"최근 {x}일") or int(d["recent"])
+    min_tv = c2.number_input("그날 거래대금 최소(억)", 0, 5000, int(d["min_tv"] / 1e8), 10, key="v52_mintv")
+    sort_by = c3.selectbox("정렬", ["직전 최대 대비", "평소(20일) 대비", "거래대금", "등락률", "섹터 동반"], key="v52_sort")
+    n_show = c4.selectbox("보여줄 종목", [12, 24, 36, 60], index=1, key="v52_n")
+    kinds = ["돌파형", "바닥 깨움", "클라이맥스 주의", "투매·물량", "관찰"]
+    kico = {"돌파형": "🔥 돌파형", "바닥 깨움": "🌱 바닥 깨움", "클라이맥스 주의": "⚠️ 클라이맥스 주의",
+            "투매·물량": "🔻 투매·물량", "관찰": "👀 관찰"}
+    pick = st.pills("성격", kinds, default=kinds, selection_mode="multi", key="v52_kinds", format_func=kico.get,
+                    label_visibility="collapsed")
+    p = {"recent": int(recent), "min_tv": float(min_tv) * 1e8}
+    res = tab_memo("v52", (p["recent"], p["min_tv"], len(histories)), lambda: data.vol52_scan(df, histories, quotes, p))
+    if res.empty:
+        st.info("지금 조건에 맞는 종목이 없어요. 기간을 늘리거나 거래대금 최소를 낮춰 보세요.")
+        return
+    res = res.copy()
+    kk = [data.v52_kind(r) for r in res.to_dict("records")]
+    res["k_lab"], res["k_key"], res["k_desc"] = [x[0] for x in kk], [x[1] for x in kk], [x[2] for x in kk]
+    allres = res
+    res = res[res["k_lab"].isin(pick or kinds)]
+    key = {"평소(20일) 대비": "v52_x20", "거래대금": "v52_tv", "등락률": "v52_chg", "섹터 동반": "v52_peers"}.get(sort_by, "v52_x_prev")
+    res = res.sort_values([key, "v52_x_prev"], ascending=False, na_position="last").reset_index(drop=True)
+
+    secs = (allres[~allres["group"].isin(list(data.NON_SECTOR_GROUPS))].groupby("group")["code"].count()
+            .sort_values(ascending=False))
+    secs = secs[secs >= 2]
+    st.markdown(
+        '<div class="v52-kpis">'
+        f'<div><span>52주 최대 거래량</span><b>{len(allres)}<small>종목</small></b></div>'
+        f'<div><span>오늘 터짐</span><b>{int((allres["v52_since"] == 0).sum())}<small>종목</small></b></div>'
+        f'<div><span>🔥 돌파형</span><b>{int((allres["k_key"] == "brk").sum())}<small>종목</small></b></div>'
+        f'<div><span>섹터 동반(2종목↑)</span><b>{len(secs)}<small>섹터</small></b></div></div>', unsafe_allow_html=True)
+    if len(secs):
+        chips = "".join(f'<span class="v52-sec{" hot" if n >= 3 else ""}">{html.escape(str(g))}<b>{n}</b></span>'
+                        for g, n in secs.head(14).items())
+        st.markdown(f'<div class="v52-secs"><span class="t">🏭 같이 터진 섹터</span>{chips}</div>', unsafe_allow_html=True)
+    if res.empty:
+        st.info("고른 성격에 맞는 종목이 없어요.")
+        return
+
+    show = res.head(int(n_show))
+    show = _attach_flows(show)
+    news = _v52_news(tuple(show["code"]))
+    today = data.now_kst().date()
+    cards = []
+    for i, r in enumerate(show.to_dict("records"), 1):
+        items, fresh = _v52_pick_news(news.get(r["code"]) or [], r["v52_date"])
+        reasons, bad = data.v52_reasons([x["title"] for x in items] if fresh else [])
+        chips = [f'<span class="v52-chip {k}">{html.escape(lab)}</span>' for lab, k in reasons]
+        if bad:
+            chips.append('<span class="v52-chip bad">악재성 뉴스</span>')
+        facts = []
+        if r.get("v52_upper"):
+            facts.append("상한가")
+        if r.get("v52_brk"):
+            facts.append("52주 신고가 돌파")
+        if (r.get("v52_peers") or 1) >= 2:
+            facts.append(f"섹터 동반 {int(r['v52_peers'])}종목")
+        fa, fi = r.get("flow_외국인"), r.get("flow_기관")
+        if fa is not None and fa == fa and fi is not None and fi == fi:
+            if fa > 0 and fi > 0:
+                facts.append("외국인·기관 동반 매수")
+            elif fa < 0 and fi < 0:
+                facts.append("외국인·기관 동반 매도")
+        chips += [f'<span class="v52-chip fact">{html.escape(x)}</span>' for x in facts]
+        main = reasons[0][0] if reasons else None
+        why = (f"<b>{html.escape(main)}</b> 뉴스" if main else ("뉴스 근거는 뚜렷하지 않음" if fresh else "그날 뉴스 없음"))
+        if (r.get("v52_peers") or 1) >= 2:
+            why += f" + <b>{html.escape(str(r['group']))}</b> 섹터가 같이 움직임(인더스트리 액션 가능성)"
+        elif not main:
+            why += " — 수급·테마 순환 가능성, 다음 봉으로 확인"
+        why += f". {html.escape(r['k_desc'])}."
+        nhtml = "".join(
+            f'<div class="v52-news{"" if fresh else " old"}"><span class="t">{html.escape(str(x.get("time") or "")[:11])}</span>'
+            f'<a href="{html.escape(x["url"])}" target="_blank" title="{html.escape(x["title"])}">{html.escape(x["title"])}</a></div>'
+            for x in items[:2])
+        pk = r["v52_date"]
+        when = "오늘" if pk == today else f"{pk:%m/%d}" + (f" ({int(r['v52_since'])}일 전)" if r["v52_since"] else "")
+        prev_txt = f"{r['v52_prev_date']:%y.%m.%d}" if r.get("v52_prev_date") else "-"
+        x20 = "-" if r.get("v52_x20") is None or r["v52_x20"] != r["v52_x20"] else f"{r['v52_x20']:.1f}배"
+        toh = r.get("to_high")
+        toh_txt = "-" if toh is None or toh != toh else (f"{toh:.1f}%" if toh > 0.05 else "신고가")
+        rs = r.get("rs")
+        flow_txt = ""
+        if fa is not None and fa == fa:
+            flow_txt = (f'외 <b style="color:{_sign_color(fa)}">{fa:+,.0f}</b> · '
+                        f'기 <b style="color:{_sign_color(fi)}">{(fi or 0):+,.0f}</b>억')
+        cards.append(
+            f'<div class="v52-card k-{r["k_key"]}"><div class="v52-top"><div class="v52-nm"><span class="rk">{i}</span>'
+            f'<a href="?chart={html.escape(str(r["code"]))}" target="_self">{html.escape(str(r["name"]))}</a>'
+            f'<small>{r["code"]} · {html.escape(str(r["group"]))}</small></div>'
+            f'<span class="v52-kind {r["k_key"]}">{html.escape(r["k_lab"])}</span></div>'
+            f'<div class="v52-big"><b>{_v52_x(r["v52_x_prev"])}</b><span>직전 52주 최대({prev_txt}) 대비 · {when}</span></div>'
+            f'<div class="v52-keys"><div>평소 대비<b>{x20}</b></div><div>거래량<b>{_v52_vol(r["v52_vol"])}</b></div>'
+            f'<div>거래대금<b>{_tv_eok(r["v52_tv"])}</b></div><div>그날 등락<b>{_chg_html(r["v52_chg"])}</b></div></div>'
+            f'<div class="v52-spark">{_v52_svg(r["v52_spark"], r["v52_spark_up"], r["v52_spark_pk"], r["v52_spark_prev"])}'
+            f'<div class="lg"><span>최근 120일 거래량</span><span>점선 = 직전 52주 최대</span></div></div>'
+            f'<div class="v52-why"><div class="h">💡 왜 터졌나</div>'
+            + (f'<div class="chips">{"".join(chips)}</div>' if chips else "")
+            + f'<p>{why}</p>{nhtml}</div>'
+            f'<div class="v52-foot"><span>지금 {_chg_html(r.get("change"))} · 신고가까지 <b>{toh_txt}</b> · RS <b>{_n(rs)}</b></span>'
+            f'<span>{flow_txt}</span></div></div>')
+    st.markdown(f'<div class="v52-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+    labels = {r.code: f"{r.name} ({r.code}) · {_v52_x(r.v52_x_prev)}" for r in show.itertuples()}
+    code = st.selectbox("차트로 크게 보기", list(labels), format_func=labels.get, key="v52_chart_code")
+    hist = (histories.get(code) or (None, data.empty_frame(), None))[1]
+    if hist is not None and not hist.empty:
+        _vs_chart(hist, labels[code], int(recent), 60)
+    with st.expander("ℹ️ 이 탭을 읽는 법"):
+        st.markdown(
+            "- **52주 최대 거래량** = 그날 거래량이 직전 250거래일(약 1년) 중 가장 많던 날보다 많음. 오늘 봉은 장중 누적이라 계속 커져요.\n"
+            "- **배수**: 큰 숫자 = 직전 52주 최대 대비 · 20일 평균 대비 = 평소보다 몇 배가 붙었는지.\n"
+            "- **왜 터졌나**: 그날 전후 네이버 뉴스 제목에서 실적·수주·M&A·승인·정책·리포트·주주환원·악재 키워드를 찾고, "
+            "상한가·52주 신고가 돌파·섹터 동반·외국인/기관 동반 매수 같은 **사실**을 함께 붙여요. 키워드 분류라 기사 본문은 직접 확인하세요.\n"
+            "- **성격**(효석 원칙 기준): 🔥 돌파형 = 52주 고가 부근 대량 양봉(종가 상단) · 바닥 깨움 = 고가와 멀지만 대량 양봉 · "
+            "클라이맥스 주의 = 고점 근처 기록 거래량 + 윗꼬리 또는 20일선 +30%↑ 과열(비중 축소 신호) · 투매·물량 = 대량 음봉.\n"
+            "- 거래량 자체는 매수 신호가 아니에요. **주도섹터 안(섹터 동반)** · RS 70↑ · 영업이익 증가 종목이 다음 날 고가 근처에서 "
+            "버티는지(거래량 줄며 눌림)를 🏁 신고가 후보 · 🏭 인더스트리 액션 탭과 같이 확인하세요.")
+
+
 IA_CSS = """
 <style>
 .ia-zone { border-radius: 12px; padding: 0.8rem 1rem; margin: 0.3rem 0 0.8rem; border: 1px solid #E3E8EB; background: #FFFFFF; }
@@ -11217,7 +11468,7 @@ def render_bear_check(df: pd.DataFrame):
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
-    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
+    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
     ("🔭 섹터 흐름", ["🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
@@ -11227,7 +11478,7 @@ NAV_DESC = {
     "🕯️ 차트": "종목 검색 → 일·주·월봉 차트", "📥 리포트": "리포트를 넣으면 종목이 보드에 반영",
     "💼 내 보유": "보유 종목을 내 원칙으로 점검", "👀 보유 살피기": "보유 종목 실시간 수급·뉴스 + AI 판단",
     "🏁 신고가 후보": "넥장까지 반영한 진짜 돌파·찍고 밀림", "🏔️ 신고가": "역사적·52주 신고가를 섹터별로",
-    "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
+    "🔊 52주 최대 거래량": "1년 중 최대 거래량이 터진 종목 — 얼마나·왜(뉴스·섹터 동반)", "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
     "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "🌙 종가배팅": "4인 관점(M·K·C·D) 오늘 후보 자동 점검 + 비교표", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
     "🗺️ 큰 그림": "AI · 비AI · 그외 → 테마별 등락·신고가 확산·대장주", "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
@@ -11384,6 +11635,7 @@ def render_board():
         "📥 리포트": lambda: render_reports_tab(),
         "🏔️ 신고가": lambda: render_ath(df, quotes),
         "🏁 신고가 후보": lambda: render_nh_candidates(df, histories, quotes),
+        "🔊 52주 최대 거래량": lambda: render_vol52(df, histories, quotes),
         "💥 거래량 폭발": lambda: render_volume_surge(df, histories, quotes),
         "🏭 인더스트리 액션": lambda: render_industry_action(df, histories, quotes),
         "⚖️ 1:2:6 매매": lambda: render_126(df, histories, quotes, fins_all),

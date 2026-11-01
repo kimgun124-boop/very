@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-10-28-ibdexp"
+DATA_VERSION = "2026-11-01-v52"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -4149,6 +4149,136 @@ def volume_surges(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | Non
                         "aligned", "cap_krw") if k in df.columns]
     out = out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
     return out.sort_values("vs_mult", ascending=False).reset_index(drop=True)
+
+
+# ─────────────────────────── 🔊 52주 최대 거래량 ───────────────────────────
+# 최근 recent거래일 안에 '직전 250거래일(52주) 중 가장 많은 거래량'을 넘어선 날이 있는 종목.
+# 얼마나 터졌나 = 직전 52주 최대 대비 · 직전 20일 평균 대비 배수 / 왜 터졌나 = 뉴스 키워드 + 캔들·신고가·섹터 동반 사실.
+V52_DEFAULTS = {"recent": 3, "lookback": 250, "min_tv": 30e8, "spark": 120}
+
+
+def vol52_max(hist: pd.DataFrame | None, quote: dict | None, today: date | None = None,
+              p: dict | None = None) -> dict:
+    """한 종목: 최근 recent거래일 중 52주 최대 거래량을 새로 쓴 날(여러 날이면 거래량이 가장 큰 날)의 수치."""
+    p = {**V52_DEFAULTS, **(p or {})}
+    keys = ("v52_date", "v52_since", "v52_vol", "v52_prev_max", "v52_prev_date", "v52_x_prev", "v52_x20",
+            "v52_chg", "v52_up", "v52_dcr", "v52_tv", "v52_brk", "v52_to_high", "v52_ret", "v52_hits",
+            "v52_short", "v52_upper", "v52_spark", "v52_spark_up", "v52_spark_pk", "v52_spark_prev")
+    out = {k: None for k in keys}
+    if hist is None or hist.empty or len(hist) < 80:
+        return out
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    n, rcn, lb = len(v), int(p["recent"]), int(p["lookback"])
+    hits = []
+    for i in range(max(60, n - rcn), n):
+        if not np.isfinite(v[i]) or v[i] <= 0:
+            continue
+        prior = v[max(0, i - lb):i]
+        prior = prior[np.isfinite(prior)]
+        if len(prior) < 60 or v[i] <= prior.max():
+            continue
+        hits.append(i)
+    if not hits:
+        return out
+    i = max(hits, key=lambda k: v[k])
+    s0 = max(0, i - lb)
+    prior = np.where(np.isfinite(v[s0:i]), v[s0:i], 0)
+    j = s0 + int(np.argmax(prior))
+    base20 = v[max(0, i - 20):i]
+    base20 = base20[np.isfinite(base20) & (base20 > 0)]
+    prev_c = c[i - 1]
+    chg = float((c[i] / prev_c - 1) * 100) if prev_c > 0 else None
+    rng = h[i] - l[i]
+    ph = h[s0:i]
+    ph = ph[np.isfinite(ph)]
+    prior_high = float(ph.max()) if len(ph) else None
+    sn = int(p["spark"])
+    sv = v[-sn:]
+    out.update(
+        v52_date=pd.Timestamp(d[i]).date(), v52_since=int(n - 1 - i), v52_vol=float(v[i]),
+        v52_prev_max=float(v[j]), v52_prev_date=pd.Timestamp(d[j]).date(),
+        v52_x_prev=float(v[i] / v[j]) if v[j] > 0 else None,
+        v52_x20=float(v[i] / base20.mean()) if len(base20) >= 10 else None,
+        v52_chg=chg, v52_up=bool(c[i] >= o[i]),
+        v52_dcr=float((c[i] - l[i]) / rng * 100) if rng > 0 else (100.0 if (chg or 0) > 0 else 50.0),
+        v52_tv=float(c[i] * v[i]),
+        v52_brk=bool(prior_high and h[i] > prior_high),
+        v52_to_high=float((prior_high / c[i] - 1) * 100) if prior_high and c[i] > 0 else None,
+        v52_ret=float((c[-1] / c[i] - 1) * 100) if c[i] > 0 and i < n - 1 else 0.0,
+        v52_hits=len(hits), v52_short=bool(i < lb), v52_upper=bool(chg is not None and chg >= 29.0),
+        v52_spark=[0.0 if not np.isfinite(x) else float(x) for x in sv],
+        v52_spark_up=[bool(c[k] >= o[k]) for k in range(max(0, n - sn), n)],
+        v52_spark_pk=int(len(sv) - (n - i)),
+        v52_spark_prev=int(len(sv) - (n - j)) if n - j <= len(sv) else None,
+    )
+    return out
+
+
+def vol52_scan(df: pd.DataFrame, histories: dict, quotes: dict, p: dict | None = None) -> pd.DataFrame:
+    """보드의 국내 종목 중 최근 recent거래일 안에 52주 최대 거래량을 새로 쓴 종목(그날 거래대금 ≥ min_tv)."""
+    p = {**V52_DEFAULTS, **(p or {})}
+    today = now_kst().date()
+    rows = []
+    base = df[df["code"].map(is_kr)]
+    if "halted" in base:
+        base = base[base["halted"] != True]  # noqa: E712
+    for code in base["code"].drop_duplicates():
+        hist = (histories.get(code) or (None, None, None))[1]
+        res = vol52_max(hist, quotes.get(code), today=today, p=p)
+        if res["v52_vol"] is None or (res["v52_tv"] or 0) < p["min_tv"]:
+            continue
+        rows.append({"code": code, **res})
+    out = pd.DataFrame(rows, columns=["code", *vol52_max(None, None).keys()])
+    if out.empty:
+        return out
+    keep = [k for k in ("name", "group", "sector", "price", "change", "to_high", "rs", "rs_1m", "aligned",
+                        "cap_krw", "dist_ma20", "days_since_high", "tv_live") if k in df.columns]
+    out = out.merge(df[["code", *keep]].drop_duplicates("code"), on="code", how="left")
+    if "group" in out:      # 같은 세부 분류에서 같은 기간에 52주 최대 거래량이 같이 나온 종목 수(섹터 동반)
+        g = out[~out["group"].isin(list(NON_SECTOR_GROUPS))].groupby("group")["code"].transform("count")
+        out["v52_peers"] = g.reindex(out.index).fillna(1).astype(int)
+    else:
+        out["v52_peers"] = 1
+    return out.sort_values("v52_x_prev", ascending=False).reset_index(drop=True)
+
+
+# 뉴스 제목 키워드 → 거래량이 터진 이유 분류(앞에 있을수록 우선). 악재는 따로 표시해요.
+V52_REASONS = [
+    ("실적", "earn", ("실적", "영업이익", "어닝", "서프라이즈", "흑자", "최대 매출", "사상 최대", "호실적", "분기 매출", "잠정")),
+    ("수주·계약", "deal", ("수주", "공급계약", "공급 계약", "계약 체결", "납품", "수출", "협약", "MOU", "파트너십", "단일판매")),
+    ("M&A·지분", "mna", ("인수", "합병", "지분", "최대주주", "매각", "경영권", "공개매수", "투자 유치", "블록딜")),
+    ("신기술·승인", "tech", ("개발", "승인", "허가", "FDA", "임상", "특허", "출시", "양산", "세계 최초", "국산화", "기술이전")),
+    ("정책·테마", "policy", ("정부", "정책", "법안", "규제", "관세", "대통령", "수혜", "테마", "급등주", "관련주", "특징주")),
+    ("리포트", "report", ("목표가", "목표주가", "상향", "매수 의견", "커버리지", "리포트", "증권사")),
+    ("주주환원", "share", ("자사주", "배당", "소각", "밸류업", "주주환원")),
+]
+V52_BAD = ("유상증자", "전환사채", "CB 발행", "오버행", "급락", "하락", "약세", "상장폐지", "횡령", "배임", "적자 전환",
+           "거래정지", "감자", "매도 폭탄", "보호예수 해제")
+
+
+def v52_reasons(titles: list[str]) -> tuple[list[tuple[str, str]], bool]:
+    """뉴스 제목들 → [(이유, css키)], 악재 여부."""
+    txt = " ".join(titles)
+    found = [(lab, k) for lab, k, words in V52_REASONS if any(w in txt for w in words)]
+    return found, any(w in txt for w in V52_BAD)
+
+
+def v52_kind(r) -> tuple[str, str, str]:
+    """캔들·자리로 본 거래량 성격 → (라벨, css키, 설명). 효석 원칙: 신고가에서 기록적 거래량 + 윗꼬리 = 클라이맥스 주의."""
+    up, chg, dcr = r.get("v52_up"), r.get("v52_chg") or 0, r.get("v52_dcr") or 50
+    brk, toh = r.get("v52_brk"), r.get("v52_to_high")
+    ext = r.get("dist_ma20")
+    ext = float(ext) if ext is not None and ext == ext else 0.0
+    near = brk or (toh is not None and toh <= 3)
+    if not up and chg < 0:
+        return "투매·물량", "dump", "대량 음봉 — 누군가 크게 던진 날. 바닥 확인 전까지는 매수 보류"
+    if near and (dcr < 40 or ext >= 30):
+        return "클라이맥스 주의", "climax", "고점 근처 기록적 거래량" + (" + 윗꼬리" if dcr < 40 else " + 20일선 과열") + " — 비중 줄이기 신호일 수 있음"
+    if up and dcr >= 60 and near:
+        return "돌파형", "brk", "52주 고가 부근을 대량 양봉으로 뚫음 — 다음 날 고가 근처에서 버티는지 확인"
+    if up and chg >= 3:
+        return "바닥 깨움", "wake", "신고가와 거리는 있지만 대량 양봉 — 추세 전환 초입인지 지켜보기"
+    return "관찰", "watch", "거래량은 터졌지만 캔들이 애매 — 다음 봉으로 방향 확인"
 
 
 # ─────────────────────────── 🏭 인더스트리 액션 · 시장 과매도(20 DOWN) ───────────────────────────
