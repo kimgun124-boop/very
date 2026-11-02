@@ -17,6 +17,7 @@ import sys
 from datetime import time as dtime
 from pathlib import Path
 
+import pandas as pd
 import requests
 
 import data
@@ -126,6 +127,17 @@ def main():
         ms = {name: msig.analyze((idx.get(sym) or (None, None))[0]) for name, sym in data.MARKETS.items()}
         phases = {n: scout.index_phase(m) for n, m in ms.items()}
         ph, ph_txt = scout.combine(phases)
+        # 💥 FTD 깨짐(스승님 11/02): 정찰병은 무조건 매도 — 깨진 날마다 한 번만 알려요
+        if ph == "ftd_fail":
+            fails = [f"{n} {pd.Timestamp(m['last_fail']['date']):%m/%d}" for n, m in ms.items()
+                     if m and m.get("last_fail") and (phases.get(n) or {}).get("phase") == "ftd_fail"]
+            key = "fail:" + ",".join(fails)
+            if fails and key not in st.setdefault("ftd_fail", []):
+                pb = scout.PLAYBOOK[ph]
+                send(f"💥 **FTD 깨짐 — 정찰병 회수**  ({now:%m/%d %H:%M})\n{ph_txt}\n"
+                     f"• {pb['hold']}\n• {pb['buy']}\n스승님: “{pb['mentor']}”")
+                st["ftd_fail"].append(key)
+                save_state(st)
         if scout.scout_allowed(ph) and ph != "up":
             best = max(((n, v) for n, v in phases.items() if v), key=lambda kv: kv[1]["rank"])[0]
             res = scout.resilient(df, histories, ms[best].get("low_date"), ms[best].get("peak_date"))

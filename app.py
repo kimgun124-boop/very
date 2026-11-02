@@ -287,13 +287,13 @@ _missing = [n for n in REQUIRED if not hasattr(data, n)]
 if getattr(data, "DATA_VERSION", None) != DATA_VERSION:
     _missing.append(f"버전 {DATA_VERSION}")
 # 새로 생긴 모듈도 서버가 예전 내용을 기억하면 새로 읽어요(GitHub에 올린 직후 '... has no attribute' 방지)
-MARKET_VERSION = "2026-10-28-lastftd"
+MARKET_VERSION = "2026-11-02-ftdbreak"
 _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
             "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "AI_VIEWS"),
             "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line")}
-_MOD_VER = {"msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-10-28-ibdexp")}
+_MOD_VER = {"msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
 
 
 def _old_ver(alias, mod) -> bool:
@@ -4015,6 +4015,15 @@ PRINCIPLES = [
         "의심스러운 FTD가 정석보다 좋을 때가 있다 — 주가는 의심의 벽을 타고 오른다",
         "조정 중에 견조주(하락장에서 양호한 종목)를 미리 체크 → 그중 신고가 가는 종목부터 편입",
         "그날 인더스트리 액션 섹터의 선도주(먼저 신고가)가 1순위 · 정해진 규칙대로, 수익 쿠션이 넉넉할수록 여유"]),
+    ("스승님 11/02 · FTD와 하락장 대응", [
+        "바닥은 아무도 모른다 — 저점은 지나 봐야 안다. 추세추종은 바텀 피싱 대신 FTD를 '관찰'한다",
+        "FTD는 필요조건이지 필요충분조건이 아님 — 당일엔 진짜·가짜를 구별할 수 없다(공식보다 2% 부족한 '의심의 벽'이 더 좋을 때도)",
+        "확실한 명제: 정찰병을 넣은 뒤 FTD가 깨지면(종가가 FTD일을 이탈) 무조건 매도 — 높은 확률로 추가 하락 → FTD 초기화, 다시 저점부터 기다림",
+        "3일차 강세 + 4일차 아침 강하면 FTD 가능성 — 관심종목을 미리 추려 두고 시초가에 정찰병",
+        "정찰병 후보: 약세장에서 RS 높고 인더스트리 액션·신고가(신고가까지 몇 % 남았는지) 종목을 늘 모니터링",
+        "정찰병의 목적은 수익이 아니라 시장 방향 추적 — -8% 예약 손절로 자동 대응(장중에 못 봐도 계획대로)",
+        "정찰병이 3R에 닿고 연속으로 신고가를 내면 양호한 장 → 점진적으로 비중 확대 · 다시 약세면 점진 축소·정찰병 회수",
+        "약세장에서 과대낙폭은 단기 반등만 빠르고 길게는 반납 — 약세장에 강했던 종목이 주도주가 된다. 시장이 옳다"]),
     ("깡토 Q&A · 급락장(2026.10)", [
         "추세추종은 늦은 매매 — 반등을 예상해 미리 사지 않고, 쉴 때는 쉰다. 재진입은 선 대신 FTD(바닥 반등 3~4일차 강한 상승) 뒤 점진적으로",
         "정찰병은 죽는 게 당연 — 그래도 쉬는 중에 조금씩 넣어 두고 달리기 시작하면 빠르게 비중 확대. 같은 섹터에 우르르 넣지 않기",
@@ -7515,6 +7524,10 @@ FTD_RULES = pd.DataFrame([
     {"출처": "이 보드(🚦 시장 신호 기본값)", "랠리 1일차": "바닥 뒤 처음 오른 날 또는 범위 위쪽 절반 마감",
      "리셋": "바닥(장중 저가) 이탈", "FTD 가장 빠른 날": "4일차(⚙️ 기준에서 3일차로 바꿀 수 있음)", "상승폭": "1.25% 이상(IBD)",
      "거래량": "전날보다 많음"},
+    {"출처": "스승님(깡토) 11/02 — FTD 깨짐", "랠리 1일차": "저점은 지나 봐야 앎(당일엔 모름)",
+     "리셋": "종가가 FTD일을 이탈하면 FTD 깨짐 → 초기화(이 보드: FTD일 저가 아래 종가 또는 랠리 저점 이탈)",
+     "FTD 가장 빠른 날": "4~7일차 거래량 실은 상승 · 3일차 강세면 4일차 시초가 정찰병", "상승폭": "공식에 얽매이지 않음(의심의 벽)",
+     "거래량": "터지면서 상승"},
     {"출처": "스탁이지 '지금 여긴'", "랠리 1일차": "공개 안 됨", "리셋": "공개 안 됨",
      "FTD 가장 빠른 날": "공개 안 됨 — 10/28 코스피 FTD로 표시(이 보드 기준 반등 2일차)", "상승폭": "공개 안 됨", "거래량": "공개 안 됨"},
 ])
@@ -7636,7 +7649,12 @@ def render_market_signal(df: pd.DataFrame):
         corr = c3.selectbox("조정 국면 기준(고점 대비)", [10.0, 8.0, 15.0, 20.0], format_func=lambda x: f"-{x:.0f}%"
                             + (" (하락장)" if x == 20 else ""), key="ms_corr")
         ddp = c4.selectbox("분산일 하락 폭", [0.2, 0.5, 1.0], format_func=lambda x: f"-{x}%" + (" (책)" if x == 0.2 else ""), key="ms_dd")
+        brk = st.radio("FTD 깨짐 기준", ["ftd_day", "rally_low"], horizontal=True, key="ms_brk",
+                       format_func=lambda x: {"ftd_day": "스승님: 종가가 FTD일 저가 아래 마감(또는 랠리 저점 이탈)",
+                                              "rally_low": "IBD: 랠리 저점 이탈만"}[x])
     p = {"ftd_pct": float(ftd), "ftd_day": int(day), "corr_pct": float(corr), "dd_pct": float(ddp)}
+    if brk != "ftd_day":
+        p["ftd_break"] = brk
     sig = market_signals(p)
     k = st.columns(2)
     for col, (name, m) in zip(k, sig.items()):
@@ -7698,18 +7716,21 @@ def render_market_signal(df: pd.DataFrame):
         with t2:
             fs = msig.ftd_stats(m["ftds"])
             if fs.get("n"):
-                st.markdown(f"지난 약 6년 {pick} FTD **{fs['n']}번** 중 60일 안에 랠리 저점을 안 깬 것 **{fs['ok']}번({fs['rate']:.0f}%)** · "
+                st.markdown(f"지난 약 6년 {pick} FTD **{fs['n']}번** 중 60일 안에 안 깨진 것 **{fs['ok']}번({fs['rate']:.0f}%)** · "
                             f"60일 뒤 수익률 중앙값 **{fs['r60']:+.1f}%**" if fs.get("r60") is not None else "")
             if m["ftds"]:
                 st.dataframe(pd.DataFrame([{"FTD": f"{pd.Timestamp(f['date']):%Y-%m-%d}", "바닥": f"{pd.Timestamp(f['low_date']):%m/%d}",
                                             "Day": f["day"], "당일": f["chg"], "거래량": f["vol_x"], "바닥까지 하락": f["draw"],
-                                            "결과": f["result"] + (f" ({pd.Timestamp(f['fail_date']):%m/%d})" if f["fail_date"] is not None else ""),
+                                            "결과": f["result"] + (f" ({pd.Timestamp(f['fail_date']):%m/%d} {f.get('fail_why') or ''})" if f["fail_date"] is not None else ""),
                                             "5일 뒤": f["r5"], "20일 뒤": f["r20"], "60일 뒤": f["r60"]} for f in m["ftds"]])
                              .style.format({"당일": "{:+.2f}%", "거래량": "{:.2f}배", "바닥까지 하락": "{:.1f}%", "5일 뒤": "{:+.1f}%",
                                             "20일 뒤": "{:+.1f}%", "60일 뒤": "{:+.1f}%"}, na_rep="-")
                              .map(_won_c, subset=["5일 뒤", "20일 뒤", "60일 뒤"]), hide_index=True, width="stretch", height=320)
             st.caption(f"FTD = 조정(고점 -{p['corr_pct']:.0f}%↑) 뒤 가장 낮은 저가 다음 처음 오른 날(랠리 데이) = Day 1, Day {p['ftd_day']} 이후 "
-                       f"+{p['ftd_pct']}%↑ 상승 + 거래량 전날보다 증가. 실패 = 그 뒤 랠리 저점 이탈. "
+                       f"+{p['ftd_pct']}%↑ 상승 + 거래량 전날보다 증가. 깨짐(실패) = "
+                       + ("종가가 FTD일 저가 아래 마감 또는 랠리 저점 이탈(스승님 11/02: 깨지면 정찰병 무조건 매도·초기화). "
+                          if p.get("ftd_break", "ftd_day") == "ftd_day" else "그 뒤 랠리 저점 이탈(IBD). ")
+                       + 
                        "깡토 백테스트(1990~2026): 하락장 바닥 뒤엔 항상 FTD(코스피 25/25)였지만 하락장 FTD의 절반 가까이는 실패 — FTD는 '허락'이지 '공격'이 아님.")
 
     # 하락장에서 볼 종목: 견조주 vs 과대낙폭
@@ -9940,6 +9961,7 @@ DB_CSS = """
 </style>
 """
 _DB_SHORT = {
+    "ftd_fail": "FTD가 깨졌어요 — 정찰병은 무조건 정리하고, 다시 저점·3일차 강세·FTD가 나올 때까지 기다립니다.",
     "corr": "반등을 예상해 미리 사지 않고, 하락장에서 버티는 견조주 목록만 준비합니다.",
     "rally12": "정방향 신호(3일차 강세·FTD) 전까지 기다리고, 신고가·거래량·주도 섹터를 함께 확인합니다.",
     "day3": "3일차 강세 확인 — 견조주 중 오늘 신고가 가는 선도주에 정찰병을 작게 넣습니다.",
@@ -10148,6 +10170,10 @@ def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[list, str | None,
             em, act = "🔵", f"3R {t3:,.0f} 도달 — 절반 익절, 나머지는 5일선이 50일선에 닿을 때까지"
         elif r >= 2:
             em, act = "🟣", f"+{r:.1f}R — 손절선을 본전({avg:,.0f}) 이상으로 올리기"
+        elif phase == "ftd_fail" and r < 1:
+            em, act = "🔴", "FTD 깨짐 — 쿠션 없는 정찰병은 무조건 매도(스승님: 깨지면 높은 확률로 추가 하락)"
+        elif phase == "ftd_fail":
+            em, act = "🟠", f"FTD 깨짐 · 쿠션 있음 — 비중 줄이고 손절을 본전({avg:,.0f}) 위로"
         elif phase in ("corr", "rally12") and r < 1:
             em, act = "🟠", f"쉬는 장 · 쿠션 없음 — 정찰병 크기인지 확인, 손절 {stop:,.0f} 넓히지 않기"
         else:
@@ -10209,8 +10235,9 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     hfacts.append("권장 노출 " + " · ".join(f"{n} {x['exp']}" for n, x in mn["idx"].items()))
     s1 = {"t": "시장 국면", "ok": allowed,
           "facts": [f"{n}: {scout.PLAYBOOK[v['phase']]['title'].split(' — ')[0]} — {v['why']}" for n, v in phases.items() if v] + hfacts,
-          "rule": "스승님: 조정 중엔 사지 않는다. 반등 3일차 강세 · FTD가 나와야 정찰병부터 (FTD는 '허락'이지 '공격'이 아님)",
-          "v": "정찰병 허락" if allowed else "매수 보류 — 반등 확인 전"}
+          "rule": "스승님: 바닥은 아무도 모른다 — 조정 중엔 사지 않고, 반등 3일차 강세 · FTD가 나와야 정찰병부터 "
+                  "(FTD는 필요조건이지 충분조건이 아님). FTD가 깨지면 정찰병은 무조건 매도하고 초기화",
+          "v": "정찰병 허락" if allowed else ("매수 보류 — FTD 깨짐, 정찰병 회수" if phase == "ftd_fail" else "매수 보류 — 반등 확인 전")}
     s2 = {"t": "지수 60일선", "ok": market_ok,
           "facts": [f"{n} 60일선 대비 {sm['dist60']:+.1f}% ({'위' if sm.get('above60') else '아래'})" for n, sm in idx_sm.items() if sm.get("dist60") is not None],
           "rule": "내 원칙: 코스피·코스닥 둘 다 60일선 위여야 본매매(유닛). 하나라도 아래면 정찰병 크기만",

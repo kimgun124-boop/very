@@ -8,17 +8,28 @@
   - 오늘 신고가 가는 5종목을 다 편입할 수 있었던 건, 시장이 하락할 때 양호한 종목군을 미리 체크해 놨기 때문
   - 수익 쿠션이 넉넉할수록 여유가 생김
 
+스승님 11/02 'FTD와 하락장 대응' 영상(정리):
+  - 바닥은 아무도 모른다 — 저점은 지나 봐야 안다. 추세추종은 바텀 피싱을 하지 않고 FTD를 '관찰'한다
+  - FTD는 필요조건이지 필요충분조건이 아님 — 당일엔 진짜·가짜를 구별할 방법이 없다
+  - 확실한 명제: FTD 뒤 정찰병을 넣었는데 FTD가 깨지면(종가가 FTD일을 이탈) 무조건 매도 — 높은 확률로 추가 하락
+  - FTD가 깨지면 초기화 — 다시 저점을 찍고 올라갈 때까지 기다린다. 주식은 기다림
+  - 3일차 강세 + 4일차 아침 강하면 FTD 가능성 → 관심종목을 미리 추려 두고 시초가에 정찰병
+  - 정찰병 후보: 약세장에서 RS 높고 인더스트리 액션·신고가(또는 신고가 몇 % 남음) 종목을 늘 모니터링
+  - 정찰병의 목적은 돈벌이가 아니라 시장 방향 추적·관찰 — -8% 예약 손절로 자동 대응(직장인도 계획 매매)
+  - 정찰병이 3R에 닿고 연속 신고가를 내면 시장이 양호해진 것 → 점진적으로 비중 확대, 약세로 돌면 점진 축소·회수
+  - 통계: 약세장에서 과대낙폭주는 단기 반등은 빠르지만 길게는 반납, 약세장에 강했던 종목이 주도주가 된다
+
 흐름: 지수 국면(market.analyze) → 플레이북 단계 → 조정 구간에서 버틴 종목(견조주) → 그중 오늘 신고가 가는 종목 = 정찰병 후보.
 효석 원칙이 항상 우선: 지수 60일선 아래에서는 본매매(유닛)는 쉬고 정찰병 크기만, 1R 8%, 물타기 금지.
 """
 from __future__ import annotations
 
-SCOUT_VERSION = "2026-10-28-ibdexp"   # app.py가 이 값으로 새 파일인지 확인해요
+SCOUT_VERSION = "2026-11-02-ftdbreak"   # app.py가 이 값으로 새 파일인지 확인해요
 
 import numpy as np
 import pandas as pd
 
-MENTOR_SRC = "스승님(깡토) 10/28 장중 멘트 · 깡토 급락장 Q&A"
+MENTOR_SRC = "스승님(깡토) 10/28 장중 멘트 · 깡토 급락장 Q&A · 11/02 FTD와 하락장 대응"
 
 # 정찰병 크기: 내 원칙에서 1R 포지션(1유닛)은 계좌의 약 6~8%, 그보다 작으면 정찰병 → 절반 정도
 SCOUT_WEIGHT = 3.0          # 계좌 대비 % (1유닛 ≈ 6%의 절반)
@@ -33,6 +44,14 @@ PLAYBOOK: dict[str, dict] = {
         "hold": "손절선 그대로 지키기(변동성이 커도 넓히지 않음) · 쿠션 없는 포지션은 정리 · 존버는 추세추종 사전에 없음",
         "mentor": "쉴 때는 쉬는 게 최선. 추세추종은 늦은 매매 — 추세가 나온 뒤 들어가도 늦지 않다",
     },
+    "ftd_fail": {
+        "rank": 0, "em": "💥", "color": "#9F1239", "bg": "#FDECEC", "title": "FTD 깨짐 — 정찰병 회수 · 초기화",
+        "size": "정찰병 모두 정리 · 현금",
+        "buy": "FTD는 초기화. 다시 저점을 찍고 랠리 데이 → 3일차 강세 → FTD가 나올 때까지 기다림. "
+               "그동안 지수가 빠져도 신고가를 가는 견조주(RS 높음·인더스트리 액션·신고가 몇 % 남음)는 관심 목록에 그대로",
+        "hold": "FTD가 깨지면 정찰병은 무조건 매도 — 높은 확률로 추가 하락이 나옴. -8% 예약 손절이 먼저 나갔으면 그대로 끝",
+        "mentor": "FTD가 깨지면 다 초기화 — 다시 저점을 찍고 올라갈 때까지 기다리는 게 가장 좋다. 주식은 기다림",
+    },
     "rally12": {
         "rank": 1, "em": "🟠", "color": "#C2410C", "bg": "#FFF1E6", "title": "반등 시도 초반 — 3일차 강세 기다림",
         "size": "현금 대부분 · 아직 정찰병 전",
@@ -44,21 +63,24 @@ PLAYBOOK: dict[str, dict] = {
         "rank": 2, "em": "🟣", "color": "#5B47F5", "bg": "#EFEDFF", "title": "3일차 강세 — 정찰병 투입 허락",
         "size": f"정찰병만 · 종목당 계좌 약 {SCOUT_WEIGHT:.0f}% (1유닛보다 작게)",
         "buy": "3일차가 강세로 끝났으면 다음 날 시초가부터 정찰병 투입 — 견조주 중 신고가 가는 선도주부터. 같은 섹터에 우르르 넣지 않기",
-        "hold": "정찰병은 죽는 게 당연 — 1R(-8%) 손절 그대로. 살아남아 쿠션이 생긴 종목만 다음 단계 후보",
+        "hold": "정찰병은 죽는 게 당연 — 1R(-8%) 손절은 예약 매도로 걸어 두기. 정찰병의 목적은 수익이 아니라 시장 방향 관찰. "
+                "살아남아 쿠션이 생긴 종목만 다음 단계 후보",
         "mentor": "어제 3일차 강세로 끝나서 오늘 시초가부터 정찰병 투입 시작. 앞으로 어떻게 될지는 모른다 — 규칙대로 대응",
     },
     "susp_ftd": {
         "rank": 3, "em": "🟣", "color": "#4532D9", "bg": "#EFEDFF", "title": "의심스러운 FTD — 의심의 벽",
         "size": f"정찰병 · 종목당 약 {SCOUT_WEIGHT:.0f}% → 쿠션 생긴 종목만 1유닛",
         "buy": "정석 FTD(4일차 이후 +1.25%·거래량 증가)는 아니어도 반등 4일차 이후 강한 상승. 오늘 인더스트리 액션 섹터의 선도주(먼저 신고가) 위주로 정찰병",
-        "hold": "랠리 저점을 깨면 모든 판단을 되돌리기. 쿠션이 넉넉한 종목일수록 흔들려도 여유",
+        "hold": "종가가 FTD일 저가 아래로 마감하거나 랠리 저점을 깨면 FTD 깨짐 → 정찰병 무조건 매도. 쿠션이 넉넉한 종목일수록 흔들려도 여유",
         "mentor": "정석적인 FTD보다 의심스러운 FTD가 때로는 더 좋을 수 있다 — 주가는 의심의 벽을 타고 오른다",
     },
     "ftd": {
         "rank": 4, "em": "🟢", "color": "#15803D", "bg": "#E9F7EE", "title": "FTD 확인 — 점진적으로 비중 확대",
         "size": "정찰병 → 성공한 종목에 1유닛씩 (지수 60일선 위로 올라와야 본매매)",
-        "buy": "FTD는 '공격'이 아니라 '다시 볼 허락'. 인더스트리 액션 섹터·선도주에 정찰병, 살아서 오르는 종목에 피라미딩",
-        "hold": "랠리 저점 이탈 = FTD 실패 → 되돌림. 3R에서 절반 익절, 나머지는 추세가 꺾일 때까지",
+        "buy": "FTD는 필요조건이지 충분조건이 아님 — '공격'이 아니라 '다시 볼 허락'. 인더스트리 액션 섹터·선도주에 정찰병, "
+               "정찰병이 3R에 닿고 연속으로 신고가를 내면 시장이 양호해진 것 → 그 종목부터 점진적으로 비중 확대",
+        "hold": "종가가 FTD일 저가 아래로 마감하거나 랠리 저점을 깨면 FTD 깨짐 → 정찰병 무조건 매도·초기화. "
+                "시장이 다시 약해지면 점진적으로 비중 축소. 3R에서 절반 익절, 나머지는 추세가 꺾일 때까지",
         "mentor": "늦게 사더라도 추세가 강력하면 피라미딩으로 강한 종목에 비중을 싣는 게 핵심 — 슈퍼루키 1~2종목이 계좌를 끈다",
     },
     "press": {
@@ -76,22 +98,27 @@ PLAYBOOK: dict[str, dict] = {
         "mentor": "수익 쿠션이 넉넉할수록 여유가 생긴다",
     },
 }
-PHASE_ORDER = ["corr", "rally12", "day3", "susp_ftd", "ftd", "press", "up"]
+PHASE_ORDER = ["ftd_fail", "corr", "rally12", "day3", "susp_ftd", "ftd", "press", "up"]
 
 
-def index_phase(m: dict | None, susp_pct: float = 0.8, ftd_fresh: int = 15) -> dict | None:
+def index_phase(m: dict | None, susp_pct: float = 0.8, ftd_fresh: int = 15, ftd_fail_days: int = 10) -> dict | None:
     """지수 하나의 market.analyze 결과 → 플레이북 단계 + 이유."""
     if not m:
         return None
     s, day, chg = m["state"], int(m.get("day") or 0), m.get("chg")
     sr = m.get("series")
     why = ""
-    if s == "corr":
+    lfail = m.get("last_fail")
+    if s == "corr" and lfail and lfail.get("ago", 99) <= ftd_fail_days:
+        ph = "ftd_fail"
+        fd = lfail.get("ftd_date")
+        why = (f"{pd.Timestamp(lfail['date']):%m/%d} FTD" + (f"({pd.Timestamp(fd):%m/%d})" if fd is not None else "")
+               + f" 깨짐 — {lfail.get('why', '')} · {'오늘' if not lfail['ago'] else str(lfail['ago']) + '거래일 전'} · 고점 대비 {m['draw']:+.1f}%")
+    elif s == "corr":
         ph = "corr"
         why = f"고점 대비 {m['draw']:+.1f}% · 아직 랠리 데이 전"
-        ev = (m.get("events") or [{}])[0]
-        if ev.get("kind") == "fail":
-            why = "FTD 실패(랠리 저점 이탈) — " + why
+        if lfail:
+            why = f"FTD 깨짐({pd.Timestamp(lfail['date']):%m/%d}) 뒤 새 저점 기다리는 중 — " + why
     elif s == "rally":
         day3_up = False
         if sr is not None and len(sr) and "day" in sr:
@@ -118,7 +145,9 @@ def index_phase(m: dict | None, susp_pct: float = 0.8, ftd_fresh: int = 15) -> d
             n_after = int((pd.to_datetime(sr["date"]) > pd.Timestamp(lf["date"])).sum())
             fresh = n_after <= ftd_fresh
             if fresh:
-                why = f"FTD {pd.Timestamp(lf['date']):%m/%d}(Day {lf['day']}, {lf['chg']:+.2f}%) 뒤 {n_after}거래일 · 랠리 저점 {lf['low']:,.2f}"
+                why = (f"FTD {pd.Timestamp(lf['date']):%m/%d}(Day {lf['day']}, {lf['chg']:+.2f}%) 뒤 {n_after}거래일 · "
+                       + (f"지킬 선: FTD일 저가 {lf['day_low']:,.2f}(종가) · " if m.get("ftd_break") == "ftd_day" and lf.get("day_low") else "")
+                       + f"랠리 저점 {lf['low']:,.2f}")
         ph = "ftd" if fresh else "up"
         if not fresh:
             why = f"52주 고점 대비 {m['draw']:+.1f}% · 분산일 {m['dd']}개"
@@ -132,6 +161,10 @@ def combine(phases: dict) -> tuple[str | None, str]:
     if not ok:
         return None, ""
     best = max(ok.items(), key=lambda kv: kv[1]["rank"])
+    # 스승님: FTD가 깨지면 '무조건' 정찰병 매도 — 한 지수라도 FTD가 깨졌으면 더 나아간 지수보다 먼저 봐요
+    broke = [kv for kv in ok.items() if kv[1]["phase"] == "ftd_fail"]
+    if broke and best[1]["phase"] not in ("press", "up"):
+        best = broke[0]
     others = [f"{k} {v['em']} {PLAYBOOK[v['phase']]['title'].split(' — ')[0]}" for k, v in ok.items()]
     return best[1]["phase"], " · ".join(others)
 
@@ -262,6 +295,10 @@ def commentary(phase: str | None, ph_txt: str, market_ok: bool | None, d20: floa
         else:
             out.append("<b>매수</b>: 정찰병은 허락됐지만 견조주 중 오늘 신고가 가는 종목이 아직 없음 — 억지로 사지 않기"
                        + (f" · 신고가 3% 안 대기 {n_wait}개" if n_wait else ""))
+    elif phase == "ftd_fail":
+        out.append("<b>매수</b>: FTD 깨짐 → 초기화. 넣었던 정찰병은 정리하고 다시 저점·랠리 데이·3일차 강세·FTD를 기다림. "
+                   + (f"견조주 {n_res}개는 관심 목록에 그대로 — 지수가 빠질 때도 신고가를 가는 종목이 다음 주도주 후보" if n_res
+                      else "지수가 빠질 때도 신고가를 가는 종목(RS·인더스트리 액션)을 관심 목록으로"))
     elif phase in ("corr", "rally12"):
         out.append("<b>매수</b>: 아직 정찰병 전 — 반등을 예상해 미리 사지 않음. "
                    + (f"지금 견조주 {n_res}개를 목록으로 들고 있다가 3일차 강세·FTD가 나오면 그중 신고가 가는 종목부터" if n_res

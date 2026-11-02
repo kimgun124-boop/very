@@ -4,6 +4,9 @@
   상승 추세 → (분산일이 평소보다 많이 쌓이면) 상승 둔화 → (고점에서 corr_pct% 넘게 빠지면) 조정 국면
   → (바닥 뒤 처음 오른 날 = 랠리 데이, Day 1) 반등 시도 → (Day 4 이후 +ftd_pct%·거래량 증가) FTD → 상승 추세
   FTD 뒤 랠리 저점을 깨면 FTD 실패 → 다시 조정 국면.
+  (11/02 깡토 'FTD 깨짐' 기준, 기본값) 종가가 FTD 당일 저가 아래로 마감해도 FTD 깨짐 → FTD 초기화, 다시 조정 국면.
+    "FTD가 깨지면 거의 높은 확률로 추가 하락 — 정찰병은 무조건 매도. 다시 저점을 찍고 올라갈 때까지 기다린다."
+    ftd_break="ftd_day"(깡토: FTD일 종가 이탈 또는 랠리 저점) · "rally_low"(IBD: 랠리 저점만)
 
 분산일(책 기준): 전날보다 거래량이 늘며 0.2% 넘게 내린 날 + 정체일(거래량은 늘었는데 거의 못 오르고 아래쪽 마감).
   IBD 운용 규칙: 25거래일 지나거나 그 뒤 지수가 그날 종가보다 5% 넘게 오르면 지움, FTD가 나오면 0으로.
@@ -17,8 +20,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-MARKET_VERSION = "2026-10-28-lastftd"    # app.py의 MARKET_VERSION과 같아야 해요(바뀐 market.py를 서버가 새로 읽게)
-MKT_DEFAULTS = {"ftd_pct": 1.25, "ftd_day": 4, "dd_pct": 0.2, "corr_pct": 10.0, "dd_window": 25, "dd_erase": 5.0}
+MARKET_VERSION = "2026-11-02-ftdbreak"    # app.py의 MARKET_VERSION과 같아야 해요(바뀐 market.py를 서버가 새로 읽게)
+MKT_DEFAULTS = {"ftd_pct": 1.25, "ftd_day": 4, "dd_pct": 0.2, "corr_pct": 10.0, "dd_window": 25, "dd_erase": 5.0,
+                "ftd_break": "ftd_day"}
 STATE_TXT = {"up": "상승 추세", "press": "상승 둔화", "corr": "조정 국면", "rally": "반등 시도"}
 STATE_EM = {"up": "🟢", "press": "🟡", "corr": "🔴", "rally": "🟠"}
 
@@ -57,7 +61,9 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
     low_i = None                     # 조정 바닥(가장 낮은 저가) 위치
     rally_i = None                   # 랠리 데이(Day 1)
     ftd_low = None                   # FTD가 지켜야 할 랠리 저점
+    ftd_day_low = None               # (깡토) FTD 당일 저가 — 종가가 이 아래로 마감하면 FTD 깨짐
     ftd_ev = None
+    by_day = p.get("ftd_break", "ftd_day") == "ftd_day"
     for i in range(n):
         # 분산일 갱신(상승 쪽 국면에서만 셈)
         active = [j for j in active if i - j < p["dd_window"] and c[i] <= c[j] * (1 + p["dd_erase"] / 100)]
@@ -65,17 +71,23 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
             active.append(i)
         dd_cnt[i] = len(active)
         # FTD 실패 감시
-        if ftd_low is not None and l[i] < ftd_low:
+        hit_low = ftd_low is not None and l[i] < ftd_low
+        hit_day = (by_day and ftd_day_low is not None and ftd_ev is not None and i > ftd_ev["i"]
+                   and c[i] < ftd_day_low)
+        if hit_low or hit_day:
+            why_f = "랠리 저점 이탈" if hit_low else "종가가 FTD일 저가 아래로 마감"
             if ftd_ev is not None:
                 ftd_ev["failed"] = d[i]
-            events.append({"kind": "fail", "i": i, "date": d[i], "txt": "FTD 실패 — 랠리 저점 이탈"})
-            ftd_low, ftd_ev = None, None
+            events.append({"kind": "fail", "i": i, "date": d[i], "why": why_f,
+                           "ftd_date": ftd_ev["date"] if ftd_ev is not None else None,
+                           "txt": f"FTD 깨짐 — {why_f}"})
+            ftd_low, ftd_day_low, ftd_ev = None, None, None
             st, low_i, rally_i, peak = "corr", i, None, max(peak, c[i])
         if st in ("up", "press"):
             peak = max(peak, c[i])
             if c[i] <= peak * (1 - p["corr_pct"] / 100):
                 st, low_i, rally_i = "corr", i, None
-                ftd_low, ftd_ev = None, None
+                ftd_low, ftd_day_low, ftd_ev = None, None, None
                 active = []
         if st in ("corr", "rally"):
             if low_i is None or l[i] < l[low_i]:
@@ -92,9 +104,11 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
                     ftd_ev = {"kind": "ftd", "i": i, "date": d[i], "day": k, "chg": float(chg[i]),
                               "vol_x": float(v[i] / v[i - 1]) if has_vol and v[i - 1] > 0 else None,
                               "low_date": d[low_i], "low": float(l[low_i]), "draw": float(dd0), "failed": None,
+                              "day_low": float(l[i]),
                               "txt": f"FTD — Day {k}, {chg[i]:+.2f}%"}
                     events.append(ftd_ev)
                     ftd_low = float(l[low_i])
+                    ftd_day_low = float(l[i])
                     st, peak, active = "up", c[i], []
         if st == "up" and dd_cnt[i] >= 1:
             pass
@@ -108,16 +122,19 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
     for i in range(n):
         if state[i] == "up" and dd_cnt[i] >= max(q80, 1) and dd_cnt[i] > q50:
             state[i] = "press"
-    # FTD 성적(5·20·60일 뒤, 60일 안 랠리 저점 이탈 = 실패)
+    # FTD 성적(5·20·60일 뒤, 60일 안 랠리 저점 이탈 = 실패 · 깡토 기준이면 종가가 FTD일 저가 아래 마감도 실패)
     ftds = []
     for e in events:
         if e["kind"] != "ftd":
             continue
         i = e["i"]
         r = {k: ((c[i + k] / c[i] - 1) * 100 if i + k < n else None) for k in (5, 20, 60)}
-        fail_i = next((j for j in range(i + 1, min(n, i + 61)) if l[j] < e["low"]), None)
+        fail_i = next((j for j in range(i + 1, min(n, i + 61))
+                       if l[j] < e["low"] or (by_day and c[j] < e["day_low"])), None)
+        fail_why = (None if fail_i is None else ("랠리 저점 이탈" if l[fail_i] < e["low"] else "FTD일 저가 아래 마감"))
         done = i + 60 < n or fail_i is not None
-        ftds.append({**{k: e[k] for k in ("date", "day", "chg", "vol_x", "low_date", "low", "draw")},
+        ftds.append({**{k: e[k] for k in ("date", "day", "chg", "vol_x", "low_date", "low", "draw", "day_low")},
+                     "fail_why": fail_why,
                      "r5": r[5], "r20": r[20], "r60": r[60],
                      "result": ("❌ 실패" if fail_i is not None else ("✅ 유지" if done else "⏳ 진행 중")),
                      "fail_date": d[fail_i] if fail_i is not None else None})
@@ -132,7 +149,10 @@ def analyze(df: pd.DataFrame | None, p: dict | None = None) -> dict | None:
            "draw": (c[last] / peak_all - 1) * 100, "close": float(c[last]), "date": d[last],
            "low": float(l[low_i]) if low_i is not None and state[last] in ("corr", "rally") else None,
            "rally_date": d[rally_i] if rally_i is not None and state[last] == "rally" else None,
-           "ftd_low": ftd_low, "last_ftd": ftds[-1] if ftds else None, "has_vol": bool(has_vol),   # last_ftd = 가장 최근(ftds는 오래된 순)
+           "ftd_low": ftd_low, "ftd_day_low": ftd_day_low, "ftd_break": "ftd_day" if by_day else "rally_low",
+           # 가장 최근 FTD 깨짐(며칠 전인지 · 이유) — 정찰병 회수 신호용
+           "last_fail": next(({**e, "ago": int(last - e["i"])} for e in events[::-1] if e["kind"] == "fail"), None),
+           "last_ftd": ftds[-1] if ftds else None, "has_vol": bool(has_vol),   # last_ftd = 가장 최근(ftds는 오래된 순)
            # 정찰병 신호(scout.py)용: 조정 바닥·그 전 고점 날짜, 오늘 등락·거래량 증가·종가 위치
            "low_date": d[low_i] if low_i is not None else None,
            "peak_date": d[max(0, low_i - 250) + int(np.nanargmax(c[max(0, low_i - 250):low_i + 1]))] if low_i is not None else None,
@@ -155,6 +175,11 @@ def ftd_stats(ftds: list[dict]) -> dict:
 def action_text(m: dict) -> tuple[str, str]:
     """국면별 대응(깡토 글 + 오닐): (요약, 설명)."""
     s = m["state"]
+    lfail = m.get("last_fail")
+    if s == "corr" and lfail and lfail.get("ago", 99) <= 10:
+        return (f"🔴 FTD 깨짐({pd.Timestamp(lfail['date']):%m/%d}) — 정찰병 회수 · FTD 초기화",
+                f"{lfail.get('why', '')}. 스승님: FTD가 깨지면 높은 확률로 추가 하락 — 정찰병은 무조건 매도. "
+                "다시 저점을 찍고 랠리 데이 → 3일차 강세 → FTD가 나올 때까지 기다리기. 그동안 하락장에도 신고가 가는 견조주는 목록 유지.")
     if s == "corr":
         return ("🔴 조정 국면 — 반등에 성급히 올라타지 않기",
                 "아직 바닥 확인 전. 하락장 중간 반등은 FTD 전까지 지켜보기 · 무너진 종목보다 버티는 종목(견조주) 목록 만들기 · "
@@ -169,7 +194,9 @@ def action_text(m: dict) -> tuple[str, str]:
     lf = m.get("last_ftd")
     tail = ""
     if lf and lf["result"] == "⏳ 진행 중":
-        tail = f" FTD({pd.Timestamp(lf['date']):%m/%d}) 뒤 진행 중 — 랠리 저점 {lf['low']:,.2f}를 깨면 모든 판단을 되돌리기."
+        tail = (f" FTD({pd.Timestamp(lf['date']):%m/%d}) 뒤 진행 중 — "
+                + (f"종가가 FTD일 저가 {lf['day_low']:,.2f} 아래로 마감하거나 " if m.get("ftd_break") == "ftd_day" and lf.get("day_low") else "")
+                + f"랠리 저점 {lf['low']:,.2f}를 깨면 FTD 깨짐 → 정찰병 정리·모든 판단 되돌리기.")
     return ("🟢 상승 추세 — 원칙대로 매매",
             "FTD는 '공격' 신호가 아니라 '다시 볼 허락'. 주도주가 실제로 좋은 베이스·신고가를 만드는지 같이 확인하며 점진적으로 비중 확대." + tail)
 
