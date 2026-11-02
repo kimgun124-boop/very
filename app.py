@@ -6,6 +6,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import warnings
+
+# (11/02) Streamlit 서버가 Python 3.14 · pandas 3.1로 올라가면서 yfinance 안쪽 코드가
+# 'inplace 곧 없어져요(Pandas4Warning)' 경고를 종목마다 수백 줄씩 로그에 찍어요 — 앱 동작과는 상관없는
+# 경고라 끄고, 로그에서 진짜 에러·[MEM] 줄이 묻히지 않게 해요.
+warnings.filterwarnings("ignore", message=r".*inplace keyword.*deprecated.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"yfinance(\..*)?")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"yfinance(\..*)?")
 import html
 from urllib.parse import quote_plus
 import re
