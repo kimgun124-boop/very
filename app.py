@@ -10338,25 +10338,25 @@ GQ_CSS = """
          box-shadow:0 1px 2px rgba(16,24,40,.04),0 6px 22px rgba(43,127,240,.06);position:relative;overflow:hidden}
 .gq-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:#2B7FF0}
 .gq-top{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.95rem}
-.gq-k{font-size:1.05rem;font-weight:850;color:#2B7FF0;letter-spacing:-.01em}
-.gq-chip{font-size:.88rem;font-weight:800;border-radius:999px;padding:.15rem .7rem}
+.gq-k{font-size:1.15rem!important;font-weight:850;color:#2B7FF0;letter-spacing:-.01em}
+.gq-chip{font-size:.95rem!important;font-weight:800;border-radius:999px;padding:.15rem .7rem}
 .gq-no{margin-left:auto;font-size:.88rem;color:#9CA3AF;font-weight:700}
-.gq-q{font-size:1.62rem;font-weight:800;color:#111827;line-height:1.65;letter-spacing:-.025em;margin:0 0 .9rem;
+.gq-q{font-size:2.05rem!important;font-weight:850!important;color:#111827;line-height:1.65;letter-spacing:-.025em;margin:0 0 .9rem;
       word-break:keep-all;overflow-wrap:break-word}
 .gq-q .l{display:block}
 .gq-q .l + .l{margin-top:.25rem}
 .gq-mark{color:#2B7FF0;font-weight:900;font-size:1.15em;line-height:0;margin:0 .12rem;vertical-align:-.08em}
-.gq-by{font-size:1.08rem;color:#6B7280;margin-bottom:.8rem;padding-top:.75rem;border-top:1px dashed #E5E7EB;line-height:1.6}
+.gq-by{font-size:1.2rem!important;color:#6B7280;margin-bottom:.8rem;padding-top:.75rem;border-top:1px dashed #E5E7EB;line-height:1.6}
 .gq-by b{color:#374151;font-weight:850}
-.gq-card details summary{cursor:pointer;font-size:1.02rem;font-weight:800;color:#2B7FF0;list-style:none;
+.gq-card details summary{cursor:pointer;font-size:1.1rem!important;font-weight:800;color:#2B7FF0;list-style:none;
      display:inline-flex;align-items:center;gap:.35rem;padding:.35rem .85rem;border-radius:999px;background:#EAF2FE}
 .gq-card details summary::-webkit-details-marker{display:none}
 .gq-ar{display:inline-block;width:14px;height:14px;transition:transform .15s}
 .gq-card details[open] summary .gq-ar{transform:rotate(180deg)}
 .gq-m{margin-top:.7rem;background:#F5F8FF;border:1px solid #E1EBFD;border-radius:14px;padding:.9rem 1.05rem;
-      font-size:1.12rem;color:#1F2937;line-height:1.8;word-break:keep-all}
+      font-size:1.25rem!important;color:#1F2937;line-height:1.85!important;word-break:keep-all}
 .gq-m .l{display:block}
-@media (max-width:520px){.gq-card{padding:1.05rem 1rem .95rem 1.25rem}.gq-q{font-size:1.32rem}.gq-by{font-size:.98rem}.gq-m{font-size:1.02rem}}
+@media (max-width:520px){.gq-card{padding:1.05rem 1rem .95rem 1.25rem}.gq-q{font-size:1.55rem!important}.gq-by{font-size:1.05rem!important}.gq-m{font-size:1.1rem!important}}
 </style>
 """
 
@@ -10369,6 +10369,14 @@ def _gq_lines(t: str, pre: str = "", post: str = "") -> str:
     n = len(parts)
     return "".join(f'<span class="l">{pre if i == 0 else ""}{html.escape(p)}{post if i == n - 1 else ""}</span>'
                    for i, p in enumerate(parts))
+
+
+def _gq_meaning(r: dict) -> str:
+    """해석(x) + 내 매매 적용(m)을 한 문단으로 이어 붙여요."""
+    x, m = (r.get("x") or "").strip(), (r.get("m") or "").strip()
+    if x and m:
+        return f"{x} 내 매매에선 — {m}"
+    return x or m
 
 
 def render_guru_quote():
@@ -10387,11 +10395,11 @@ def render_guru_quote():
         f'<div class="gq-top"><span class="gq-k">오늘의 투자 명언</span>'
         f'<span class="gq-chip" style="color:{col};background:{col}1A">{e(r.get("c", ""))}</span>'
         f'<span class="gq-no">{today:%m/%d} · {r["no"]}/{r["total"]}</span></div>'
-        f'<p class="gq-q">{_gq_lines(r["q"], '<span class="gq-mark">“</span>', '<span class="gq-mark">”</span>')}</p>'
+        f'<p class="gq-q"><span class="gq-mark">“</span>{e(r["q"])}<span class="gq-mark">”</span></p>'
         f'<div class="gq-by">— <b>{e(r["a"])}</b> · {e(r.get("s", ""))}</div>'
         f'<details><summary>의미 보기 <svg class="gq-ar" viewBox="0 0 16 16" fill="none" stroke="#2B7FF0" stroke-width="2.4" '
         'stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6l4.5 4.5L12.5 6"/></svg></summary>'
-        f'<div class="gq-m">{_gq_lines(r.get("m", ""))}</div></details>'
+        f'<div class="gq-m">{e(_gq_meaning(r))}</div></details>'
         '</div></div>', unsafe_allow_html=True)
 
 
