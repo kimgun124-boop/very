@@ -271,8 +271,8 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "pullback_screen", "pullback_setup", "PB_DEFAULTS",
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
             "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER",
-            "vol52_scan", "V52_DEFAULTS", "v52_reasons", "v52_kind")
-DATA_VERSION = "2026-11-01-v52"   # data.py의 DATA_VERSION과 같아야 해요
+            "vol52_scan", "V52_DEFAULTS", "v52_reasons", "v52_kind", "leading_report", "LEAD_RULES", "fetch_ktb10")
+DATA_VERSION = "2026-11-03-lead"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -1612,9 +1612,30 @@ def tab_memo(name: str, key, fn):
     return val
 
 
+def lead_report(df: pd.DataFrame) -> dict:
+    """섹터별 주도섹터 판정 근거(data.leading_report)를 데이터 버전마다 한 번만."""
+    return tab_memo(f"leading_report_{len(df)}", (recent_days, min_count), lambda: data.leading_report(df, recent_days, min_count))
+
+
 def lead_groups(df: pd.DataFrame):
-    """data.leading_groups를 데이터 버전마다 한 번만."""
-    return tab_memo(f"leading_groups_{len(df)}", (recent_days, min_count), lambda: data.leading_groups(df, recent_days, min_count))
+    """주도섹터 [(섹터, 신고가 종목 표)] — lead_report에서 통과한 섹터만, 종목 많은 순."""
+    def build():
+        rep = lead_report(df)
+        out = [(g, x["sub"].sort_values("gap", ascending=False) if "gap" in x["sub"] else x["sub"])
+               for g, x in rep.items() if x["ok"]]
+        return sorted(out, key=lambda x: (-len(x[1]), x[0]))
+    return tab_memo(f"leading_groups_{len(df)}", (recent_days, min_count), build)
+
+
+def lead_tip(rep: dict, g) -> str:
+    """주도섹터 배지에 올릴 근거 한 줄."""
+    x = rep.get(g)
+    if not x:
+        return ""
+    s = (f"살아 있는 신고가 {x['n']}개 / 섹터 {x['n_sec']}종목({x['ratio'] * 100:.0f}%)"
+         + (f" · RS 중앙값 {x['med_rs']:.0f}" if x["med_rs"] is not None else "")
+         + (f" · 대장 {x['leader']}" if x["leader"] else ""))
+    return s + ("" if x["ok"] else " · 탈락: " + " / ".join(x["why"]))
 
 
 def mark_sector_first(df: pd.DataFrame, histories: dict) -> pd.DataFrame:
@@ -2560,7 +2581,7 @@ def render_market(board: pd.DataFrame | None = None):
     hist_sm = {idx["name"]: data.index_summary(hist.get(idx["symbol"], (data.empty_frame(), None))[0])
                for idx in data.INDEXES}
     try:
-        b60 = _breadth60(board)
+        b60 = tab_memo("breadth60", len(board) if board is not None else 0, lambda: _breadth60(board))   # (속도) 데이터 버전마다 1번
     except Exception:
         b60 = {}
     cards = "".join(_hero_card(name, overview.get(name), hist.get(sym, (data.empty_frame(), None))[0], board, b60.get(name))
@@ -2597,19 +2618,130 @@ def render_market(board: pd.DataFrame | None = None):
         )
     with st.expander("🌐 해외 지수 · 환율 · 유가 · 차트"):
         st.markdown('<div class="idx-row">' + "".join(chips) + "</div>", unsafe_allow_html=True)
-        tabs = st.tabs([i["name"] for i in data.INDEXES])
-        for tab, idx in zip(tabs, data.INDEXES):
-            with tab:
-                df, _err = hist.get(idx["symbol"], (data.empty_frame(), None))
-                if df.empty:
-                    st.caption("지수 데이터를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
-                    continue
-                h = df.set_index("date")["close"].astype(float)
-                chart = pd.DataFrame({idx["name"]: h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
-                price_chart(chart, ["#111827", "#5B47F5", "#F2B134"], height=240)
+        # (속도) 예전엔 탭 8개에 차트 8개를 매번(1분마다) 다 그렸어요 → 고른 1개만 그려요
+        names = [i["name"] for i in data.INDEXES]
+        pick = st.segmented_control("지표 차트", names, default=names[0], key="mk_idx_pick",
+                                    label_visibility="collapsed") or names[0]
+        idx = data.INDEXES[names.index(pick)]
+        df, _err = hist.get(idx["symbol"], (data.empty_frame(), None))
+        if df.empty:
+            st.caption("지수 데이터를 불러오지 못했어요. 잠시 뒤 다시 열어 보세요.")
+        else:
+            h = df.set_index("date")["close"].astype(float)
+            chart = pd.DataFrame({idx["name"]: h, "20일선": h.rolling(20).mean(), "60일선": h.rolling(60).mean()}).tail(180)
+            price_chart(chart, ["#111827", "#5B47F5", "#F2B134"], height=240)
         st.caption("시장신호: 단기 20일선 · 장기 60일선 — 🟢 선 위 + 선 상승 · 🟡 하나만 · 🔴 선 아래 + 선 하락. "
                    "지수 RS = 보드 종목과 같은 잣대의 1~99. 해외는 야후(15분 지연), 유가는 근월물.")
     render_flows()
+
+
+ECON_CSS = """<style>
+.ec-hd{display:flex;align-items:center;justify-content:space-between;gap:.5rem;flex-wrap:wrap;margin:.9rem 0 .4rem}
+.ec-hd b{font-size:1.12rem;font-weight:800;color:#16212B}
+.ec-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.5rem;margin-bottom:.3rem}
+.ec-kpi{background:#FFFFFF;border:1px solid #E3E8EB;border-radius:12px;padding:.5rem .7rem;border-left:4px solid var(--c)}
+.ec-kpi span{display:block;font-size:.72rem;color:#6B7A84}
+.ec-kpi b{font-size:1.15rem;font-weight:800;color:#16212B;font-variant-numeric:tabular-nums}
+.ec-kpi em{font-style:normal;font-size:.74rem;font-weight:700;margin-left:.3rem}
+.ec-kpi small{display:block;font-size:.68rem;color:#7A8A94;margin-top:.05rem}
+.ec-note{font-size:.74rem;color:#6B7A84;margin-top:-.2rem}
+@media(max-width:700px){.ec-kpis{gap:.3rem}.ec-kpi{padding:.4rem .45rem}.ec-kpi b{font-size:.95rem}.ec-kpi em{display:block;margin:0}}
+</style>"""
+ECON_SERIES = [("KOSPI", "#D6333B", "{:,.2f}", ""), ("원/달러", "#1E3A8A", "{:,.1f}", "원"), ("국고채(10년)", "#15803D", "{:.3f}", "%")]
+
+
+def load_ktb10():
+    return swr(("ktb10",), 1800, data.fetch_ktb10, first_wait=False, empty=(pd.DataFrame(columns=["date", "close"]), None))
+
+
+def _econ_frame() -> pd.DataFrame:
+    """KOSPI 날짜 기준으로 원/달러·국고채 10년을 맞춰 붙인 표(date, KOSPI, 원/달러, 국고채(10년))."""
+    hist = load_indexes()
+    kos = hist.get("KOSPI", (data.empty_frame(), None))[0]
+    fx = hist.get("USDKRW=X", (data.empty_frame(), None))[0]
+    ktb = (load_ktb10() or (None, None))[0]
+
+    def ser(d, name):
+        if d is None or len(d) == 0:
+            return pd.Series(dtype=float, name=name)
+        s = pd.Series(pd.to_numeric(d["close"], errors="coerce").to_numpy(dtype=float),
+                      index=pd.to_datetime(d["date"]).dt.normalize(), name=name)
+        return s[~s.index.duplicated(keep="last")].dropna()
+    k = ser(kos, "KOSPI")
+    if k.empty:
+        return pd.DataFrame()
+    out = pd.concat([k, ser(fx, "원/달러"), ser(ktb, "국고채(10년)")], axis=1, sort=False).sort_index()
+    out[["원/달러", "국고채(10년)"]] = out[["원/달러", "국고채(10년)"]].ffill()   # 휴일이 달라도 이어지게
+    out = out[out["KOSPI"].notna()]
+    return out.reset_index(names="date")
+
+
+def _econ_chart(w: pd.DataFrame):
+    """세 지표를 각자 축으로(KOSPI 왼쪽, 원/달러 오른쪽, 국고채 오른쪽 바깥) + 마우스/손가락을 대면 그날 세 값."""
+    names = [n for n, *_ in ECON_SERIES]
+    w = w.rename(columns={n: f"s{i}" for i, n in enumerate(names)})       # 한글·괄호 열 이름을 차트용 이름으로
+    x = alt.X("date:T", title=None, axis=alt.Axis(format="%y.%m", labelAngle=0, grid=False, tickCount=6))
+    base = alt.Chart(w).encode(x=x)
+    color = alt.Color("k:N", scale=alt.Scale(domain=names, range=[c for _, c, *_ in ECON_SERIES]),
+                      legend=alt.Legend(orient="top", title=None))
+    layers = []
+    for i, (name, col, _fmt, _u) in enumerate(ECON_SERIES):
+        if w[f"s{i}"].notna().sum() < 2:
+            continue
+        orient, offset = ("left", 0) if i == 0 else ("right", 0 if i == 1 else 44)
+        layers.append(base.transform_calculate(k=f"'{name}'").mark_line(strokeWidth=1.7).encode(
+            y=alt.Y(f"s{i}:Q", title=None, scale=alt.Scale(zero=False),
+                    axis=alt.Axis(orient=orient, offset=offset, labelColor=col, tickCount=6, grid=i == 0,
+                                  format=",.0f" if i < 2 else ".2f")),
+            color=color))
+    if not layers:
+        return None
+    hover = alt.selection_point(fields=["date"], nearest=True, on="pointerover", empty=False, clear="pointerout")
+    tips = [alt.Tooltip("date:T", format="%Y.%m.%d", title="날짜")] + [
+        alt.Tooltip(f"s{i}:Q", title=n, format=".3f" if i == 2 else ",.2f")
+        for i, n in enumerate(names) if w[f"s{i}"].notna().any()]
+    rule = base.mark_rule(color="#9AA9B3", strokeWidth=1).encode(
+        opacity=alt.condition(hover, alt.value(0.9), alt.value(0)), tooltip=tips).add_params(hover)
+    return (alt.layer(*layers, rule).resolve_scale(y="independent")
+            .properties(height=300, width="container", padding={"left": 4, "right": 48, "top": 4, "bottom": 4}))
+
+
+def render_econ():
+    """첫 화면: 일일 경제지표 — KOSPI · 원/달러 · 국고채 10년을 한 차트에(각자 축)."""
+    st.markdown(ECON_CSS + '<div class="ec-hd"><b>📈 일일 경제지표</b></div>', unsafe_allow_html=True)
+    period = st.segmented_control("기간", ["3개월", "6개월", "1년"], default="1년", key="ec_period",
+                                  label_visibility="collapsed") or "1년"
+    w0 = tab_memo("econ_frame", (len(load_indexes()), id((load_ktb10() or (None,))[0])), _econ_frame)
+    if w0 is None or w0.empty:
+        st.caption("코스피 일봉을 아직 못 받았어요. 잠시 뒤 다시 보여줄게요.")
+        return
+    start = w0["date"].max() - pd.DateOffset(months={"3개월": 3, "6개월": 6, "1년": 12}[period])
+    w = w0[w0["date"] >= start].reset_index(drop=True)
+    kp = []
+    for name, col, fmt, unit in ECON_SERIES:
+        s = w[name].dropna()
+        if s.empty:
+            kp.append(f'<div class="ec-kpi" style="--c:{col}"><span>{name}</span><b>-</b><small>불러오는 중</small></div>')
+            continue
+        last, first = float(s.iloc[-1]), float(s.iloc[0])
+        prev = float(s.iloc[-2]) if len(s) >= 2 else last
+        if name == "국고채(10년)":
+            d1, dp = (last - prev) * 100, (last - first) * 100
+            d1t, dpt = f"{d1:+.1f}bp", f"{period} {dp:+.0f}bp"
+        else:
+            d1, dp = (last / prev - 1) * 100 if prev else 0, (last / first - 1) * 100 if first else 0
+            d1t, dpt = f"{d1:+.2f}%", f"{period} {dp:+.1f}%"
+        c1 = UP if d1 > 0 else (DOWN if d1 < 0 else "#51616C")
+        kp.append(f'<div class="ec-kpi" style="--c:{col}"><span>{name}</span><b>{fmt.format(last)}{unit}</b>'
+                  f'<em style="color:{c1}">{d1t}</em><small>{dpt}</small></div>')
+    st.markdown(f'<div class="ec-kpis">{"".join(kp)}</div>', unsafe_allow_html=True)
+    ch = _econ_chart(w)
+    if ch is not None:
+        st.altair_chart(ch)
+    ktb_err = (load_ktb10() or (None, None))[1]
+    st.markdown('<div class="ec-note">원/달러↑(원화 약세)·국고채 금리↑는 보통 외국인 수급과 성장주 밸류에 부담, 반대면 우호적 — 참고 지표예요. '
+                '코스피·국고채는 네이버, 원/달러는 야후(15분 지연).'
+                + (f' ⚠️ {html.escape(ktb_err)}' if ktb_err else "") + '</div>', unsafe_allow_html=True)
 
 
 def _chip_leader(df: pd.DataFrame, group: str) -> str:
@@ -2844,14 +2976,26 @@ def render_radar(df: pd.DataFrame):
             for g, sub in leaders
         )
     else:
-        body = ('<div class="radar-empty">지금은 조건에 맞는 분류가 없어요. '
-                '왼쪽에서 신고가 인정 기간을 늘리거나 종목 수 기준을 낮춰 보세요.</div>')
+        body = ('<div class="radar-empty">지금은 깐깐한 기준을 모두 통과한 주도섹터가 없어요 — 원칙상 신고가 돌파매매는 쉬는 구간. '
+                '아래 \'아깝게 빠진 섹터\'에서 무엇이 모자란지 볼 수 있어요.</div>')
+    rep = lead_report(df)
+    miss = sorted(((g, x) for g, x in rep.items() if not x["ok"] and x["n"] >= 1), key=lambda t: (-t[1]["n"], -t[1]["n_raw"]))[:8]
+    miss_html = ""
+    if miss:
+        miss_html = ('<details class="radar-miss"><summary>아깝게 빠진 섹터 ' + str(len(miss)) + '</summary>'
+                     + "".join(f'<div><b>{html.escape(str(g))}</b> — {html.escape(" / ".join(x["why"]))}</div>' for g, x in miss)
+                     + '</details>')
+    r_ = data.LEAD_RULES
     st.markdown(
         f'<div class="radar"><div class="radar-title">주도섹터 레이더</div>'
-        f'<div class="radar-rule">최근 {recent_days}거래일 52주 신고가 {min_count}종목 이상</div>'
-        f'<div class="chips">{body}</div></div>',
+        f'<div class="radar-rule">최근 {recent_days}거래일 52주 신고가 + 지금도 고가 {r_["hold_pct"]:.0f}% 안 · 시총 3,000억↑ · '
+        f'거래대금 30억↑ 종목 {min_count}개↑ · 섹터 안 신고가 비율 {r_["min_ratio"] * 100:.0f}%↑(4개↑면 면제) · '
+        f'섹터 RS 중앙값 {r_["min_med_rs"]}↑ · 대장주(거래대금 100억↑ 또는 시총 1조↑)</div>'
+        f'<div class="chips">{body}</div>{miss_html}</div>',
         unsafe_allow_html=True,
     )
+    st.markdown('<style>.radar-miss{margin-top:.5rem;font-size:.78rem;color:#51616C}.radar-miss summary{cursor:pointer;font-weight:700}'
+                '.radar-miss div{margin:.15rem 0 0 .4rem}</style>', unsafe_allow_html=True)
 
 
 def fmt_vol(v) -> str:
@@ -8970,8 +9114,8 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
     def _nh_calc():
         cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
         bar_fixed = _nh_fix_bars(cand, histories) if not cand.empty else {}
-        if bar_fixed:                          # 깨진 봉을 고쳤으면 그 종목은 다시 계산
-            cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=codes)
+        if bar_fixed:                          # 깨진 봉을 고쳤으면 후보만 다시 계산(속도: 전 종목 재계산 X)
+            cand = data.nh_candidates(df, histories, quotes, p, nxt=nxt, official=official, codes=list(cand["code"]))
         if not cand.empty:                     # 후보만 월봉을 받아 역사적/52주 신고가를 가려요
             mcodes = tuple(sorted(cand["code"].head(250)))
             with st.spinner("후보 종목의 상장 이후 월봉을 확인하는 중이에요(역사적 신고가 구분)."):
@@ -9678,9 +9822,11 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
         acts = {g: " · ".join(f"{r.name}({r.chg:+.1f}%, {r.vx:.1f}배)" for r in sub.sort_values("vx", ascending=False).head(5).itertuples())
                 for g, sub in names.groupby("group")}
         rows = []
+        rep = lead_report(df)
         for r in secs.head(40).itertuples():
             lab = pot.get(r.group, "")
-            tag = f'<span class="ia-sec{" lead" if lab == "주도섹터" else ""}">{html.escape(lab)}</span>' if lab else ""
+            tag = (f'<span class="ia-sec{" lead" if lab == "주도섹터" else ""}" title="{html.escape(lead_tip(rep, r.group))}">'
+                   f'{html.escape(lab)}</span>') if lab else ""
             mark = '<b style="color:#C0262E">🏭 액션</b>' if r.ia else '<span style="color:#9AA9B3">-</span>'
             rows.append(
                 f'<tr><td class="c">{mark}</td><td class="l nm"><b>{html.escape(str(r.group))}</b>{tag}'
@@ -9693,7 +9839,7 @@ def render_industry_action(df: pd.DataFrame, histories: dict, quotes: dict):
                 '<th>거래량 증가</th><th>섹터 배수</th><th>등락</th></tr>')
         st.markdown(f'<div class="nh-tbl-wrap"><table class="nh-tbl">{head}{"".join(rows)}</table></div>', unsafe_allow_html=True)
         st.caption(f"🏭 액션 = 같은 날 '거래량 평소 {p['vol_mult']:.1f}배↑ + 양봉 {p['min_chg']:.0f}%↑' 종목이 {p['min_n']}개↑ · "
-                   "섹터 배수 = 섹터 거래대금 합 ÷ 평소(20일 평균) 합 · 주도섹터 가능성 = 주도섹터(최근 신고가 2개↑) + 52주 고가 10% 이내 2개↑")
+                   "섹터 배수 = 섹터 거래대금 합 ÷ 평소(20일 평균) 합 · 주도섹터 가능성 = 주도섹터(깐깐한 기준 — 위 레이더 참고, 배지에 손가락/마우스를 올리면 근거) + 시총 3,000억↑ 종목 중 52주 고가 10% 이내 2개↑")
 
     # 매수 후보
     _sec_h("🎯 액션 섹터 안 매수 후보", "거래량이 평소보다 높게 터진 종목 → 돌파·저항 근처·종가 강도·RS·시총·이격")
@@ -11656,6 +11802,10 @@ def render_board():
         st.caption(f"매매 보드를 그리지 못했어요({type(_e).__name__}: {_e}).")
         render_buy_alert(df, histories, quotes)
     render_market(df)
+    try:
+        render_econ()                                   # 📈 일일 경제지표(KOSPI · 원/달러 · 국고채 10년)
+    except Exception as _e:  # noqa: BLE001
+        st.caption(f"경제지표 차트를 그리지 못했어요({type(_e).__name__}).")
     try:
         render_sector_movers(df, quotes)
     except Exception as _e:  # noqa: BLE001 — 첫 화면 카드가 실패해도 나머지 보드는 계속

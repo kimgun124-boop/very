@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-11-01-v52"
+DATA_VERSION = "2026-11-03-lead"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -334,6 +334,86 @@ INDEXES = [
     {"name": "WTI 유가", "symbol": "CL=F", "source": "yahoo", "kind": "commodity", "unit": "$"},
     {"name": "브렌트 유가", "symbol": "BZ=F", "source": "yahoo", "kind": "commodity", "unit": "$"},
 ]
+
+
+def _date_val_rows(node) -> list[tuple]:
+    """JSON 어디에 있든 {날짜, 종가} 모양 항목을 모아요(네이버 응답 모양이 바뀌어도 버티게)."""
+    out = []
+
+    def walk(n):
+        if isinstance(n, dict):
+            dk = next((k for k in ("localTradedAt", "localDate", "bizdate", "tradeDate", "date", "dt") if n.get(k)), None)
+            vk = next((k for k in ("closePrice", "close", "closeValue", "value", "nv", "rate") if n.get(k) not in (None, "")), None)
+            if dk and vk:
+                try:
+                    d = pd.Timestamp(str(n[dk])[:10].replace(".", "-") if len(str(n[dk])) != 8 else str(n[dk])).normalize()
+                    v = float(str(n[vk]).replace(",", ""))
+                    out.append((d, v))
+                except (ValueError, TypeError):
+                    pass
+            for x in n.values():
+                walk(x)
+        elif isinstance(n, list):
+            for x in n:
+                walk(x)
+    walk(node)
+    return out
+
+
+def fetch_ktb10(days: int = 400) -> tuple[pd.DataFrame, str | None]:
+    """국고채 10년 금리 일별(%) → (date, close). 네이버 모바일 API 두 곳 → 예전 네이버 금리 일별 시세 순서로 시도."""
+    if MOCK:
+        rng = random.Random(10)
+        dates = pd.bdate_range(end=now_kst().date(), periods=days)
+        v, rows = 3.0, []
+        for d in dates:
+            v = max(1.5, v + rng.gauss(0.002, 0.03))
+            rows.append((d, round(v, 3)))
+        return pd.DataFrame(rows, columns=["date", "close"]), None
+    hdr = {**HEADERS, **JSON_HEADERS}
+    urls = [
+        lambda p: ("https://m.stock.naver.com/front-api/marketIndex/prices",
+                   {"category": "bond", "reutersCode": "KR10YT=RR", "page": p, "pageSize": 60}),
+        lambda p: ("https://api.stock.naver.com/marketindex/bond/KR10YT=RR/prices", {"page": p, "pageSize": 60}),
+    ]
+    errs = []
+    for mk in urls:
+        rows = []
+        try:
+            for p in range(1, 9):
+                url, params = mk(p)
+                r = requests.get(url, params=params, headers=hdr, timeout=8)
+                r.raise_for_status()
+                got = _date_val_rows(r.json())
+                if not got:
+                    break
+                rows += got
+                if len({d for d, _ in rows}) >= days * 0.7 or len(got) < 30:
+                    break
+        except (requests.RequestException, ValueError) as e:
+            errs.append(type(e).__name__)
+        if len(rows) >= 20:
+            break
+        rows = []
+    if not rows:                     # 예전 네이버 금융 HTML(금리 일별 시세)
+        try:
+            for p in range(1, 30):
+                r = requests.get("https://finance.naver.com/marketindex/interestDailyQuote.naver",
+                                 params={"marketindexCd": "IRR_GOVT10Y", "page": p}, headers=HEADERS, timeout=8)
+                got = re.findall(r"(\d{4}\.\d{2}\.\d{2})\s*</td>\s*<td[^>]*>\s*([\d.]+)", r.text)
+                if not got:
+                    break
+                rows += [(pd.Timestamp(d.replace(".", "-")), float(v)) for d, v in got]
+                if len(rows) >= days * 0.7:
+                    break
+        except (requests.RequestException, ValueError) as e:
+            errs.append(type(e).__name__)
+    if not rows:
+        return pd.DataFrame(columns=["date", "close"]), "국고채 10년 금리를 받지 못했어요" + (f"({', '.join(errs)})" if errs else "")
+    df = (pd.DataFrame(rows, columns=["date", "close"]).drop_duplicates("date").sort_values("date")
+          .reset_index(drop=True))
+    df = df[(df["close"] > 0) & (df["close"] < 20)]          # 금리(%)가 아닌 값이 섞이면 빼요
+    return df.tail(days).reset_index(drop=True), None
 
 
 def fetch_index_histories() -> dict[str, tuple[pd.DataFrame, str | None]]:
@@ -2390,13 +2470,75 @@ def sector_leaders(df: pd.DataFrame, groups) -> pd.DataFrame:
     return d.sort_values("lead_score", ascending=False)
 
 
-def leading_groups(df: pd.DataFrame, recent_days: int, min_count: int = 2):
-    """최근 recent_days 거래일 안에 52주 신고가를 쓴 종목이 min_count개 이상인 분류."""
-    hot = df[df["days_since_high"].notna() & (df["days_since_high"] <= recent_days)]
-    out = []
-    for group, sub in hot.groupby("group", sort=False):
-        if len(sub) >= min_count:
-            out.append((group, sub.sort_values("gap", ascending=False)))
+# 주도섹터 판정 기준(효석 원칙: 주도섹터 = 52주 신고가 종목 2개↑ — 여기에 '진짜' 조건을 깐깐하게 더해요)
+LEAD_RULES = {
+    "hold_pct": 8.0,       # 신고가를 찍은 뒤 지금도 고가에서 8%(1R) 안에 있어야 '살아 있는' 신고가
+    "min_cap": 3000e8,     # 시총 3,000억↑ (아주 작은 종목은 섹터를 대표 못 함)
+    "min_tv20": 30e8,      # 20일 평균 거래대금 30억↑ (거래 안 되는 종목 제외)
+    "min_ratio": 0.15,     # 섹터(시총 3,000억↑ 종목) 중 신고가 비율 15%↑ …
+    "ratio_free_n": 4,     # … 단, 신고가 종목이 4개↑면 비율은 안 봐요(큰 섹터)
+    "min_med_rs": 60,      # 섹터 RS 중앙값 60↑ (섹터 전체가 시장보다 강해야)
+    "leader_tv20": 100e8,  # 대장주: 신고가 종목 중 1개↑가 20일 평균 거래대금 100억↑ 또는 시총 1조↑
+    "leader_cap": 1e12,
+}
+_FAKE_GROUP_WORDS = ("확인 중", "기타", "스팩", "리포트")
+
+
+def _real_group(g) -> bool:
+    g = str(g or "")
+    return bool(g) and g not in NON_SECTOR_GROUPS and not any(w in g for w in _FAKE_GROUP_WORDS)
+
+
+def leading_report(df: pd.DataFrame, recent_days: int, min_count: int = 2, rules: dict | None = None) -> dict:
+    """섹터별 주도섹터 판정 근거. {섹터: {ok, n, n_sec, ratio, med_rs, leader, why[], sub}} — 신고가 1개↑ 섹터만."""
+    r_ = {**LEAD_RULES, **(rules or {})}
+    if df is None or df.empty or "days_since_high" not in df:
+        return {}
+    d = df[df["code"].map(is_kr)].drop_duplicates("code")
+    if "halted" in d:
+        d = d[d["halted"] != True]  # noqa: E712
+    d = d[d["group"].map(_real_group)]
+    num = lambda c: pd.to_numeric(d[c], errors="coerce") if c in d else pd.Series(np.nan, index=d.index)  # noqa: E731
+    cap, tv20, rs, toh, dsh = num("cap_krw"), num("tv20"), num("rs"), num("to_high"), num("days_since_high")
+    tv20 = tv20.fillna(num("tv_live"))          # 20일 평균이 없으면 오늘 거래대금으로
+    big = cap >= r_["min_cap"]
+    hit = (dsh <= recent_days) & big & (tv20.fillna(0) >= r_["min_tv20"]) & (toh.fillna(99) <= r_["hold_pct"])
+    out = {}
+    for g in d.loc[dsh <= recent_days, "group"].unique():
+        in_g = d["group"] == g
+        sub = d[in_g & hit]
+        n, n_sec = len(sub), int((in_g & big).sum())
+        ratio = n / n_sec if n_sec else 0.0
+        mrs = rs[in_g & big].median()
+        med_rs = None if mrs != mrs else float(mrs)
+        lead = None
+        if n:
+            t = sub.assign(_k=tv20[sub.index].fillna(0)).sort_values("_k", ascending=False)
+            top = t.iloc[0]
+            if t["_k"].iloc[0] >= r_["leader_tv20"] or (cap[top.name] or 0) >= r_["leader_cap"]:
+                lead = str(top["name"])
+        why = []
+        n_raw = int((in_g & (dsh <= recent_days)).sum())
+        if n < min_count:
+            why.append(f"살아 있는 신고가 {n}개(기준 {min_count}개↑)" + (f" · 소형·거래 적음·밀림 제외 {n_raw - n}개" if n_raw > n else ""))
+        if n < r_["ratio_free_n"] and ratio < r_["min_ratio"]:
+            why.append(f"섹터 {n_sec}종목 중 {ratio * 100:.0f}%만 신고가(기준 {r_['min_ratio'] * 100:.0f}%↑)")
+        if med_rs is not None and med_rs < r_["min_med_rs"]:
+            why.append(f"섹터 RS 중앙값 {med_rs:.0f}(기준 {r_['min_med_rs']}↑)")
+        if n and lead is None:
+            why.append("거래대금 100억↑·시총 1조↑ 대장주 없음")
+        out[g] = {"ok": not why, "n": n, "n_raw": n_raw, "n_sec": n_sec, "ratio": ratio, "med_rs": med_rs,
+                  "leader": lead, "why": why, "sub": sub}
+    return out
+
+
+def leading_groups(df: pd.DataFrame, recent_days: int, min_count: int = 2, rules: dict | None = None):
+    """주도섹터: 최근 recent_days 거래일 안 52주 신고가를 쓰고 지금도 고가 8% 안에서 버티는 시총 3,000억↑·
+    거래대금 30억↑ 종목이 min_count개↑ + 섹터 안 신고가 비율 15%↑(4개↑면 면제) + 섹터 RS 중앙값 60↑ + 대장주(거래대금 100억↑ 또는 시총 1조↑).
+    반환: [(섹터, 신고가 종목 표)] — 종목 수 많은 순."""
+    rep = leading_report(df, recent_days, min_count, rules)
+    out = [(g, x["sub"].sort_values("gap", ascending=False) if "gap" in x["sub"] else x["sub"])
+           for g, x in rep.items() if x["ok"]]
     out.sort(key=lambda x: (-len(x[1]), x[0]))
     return out
 
@@ -4379,12 +4521,13 @@ def industry_action_sectors(scan: pd.DataFrame, day, p: dict | None = None) -> p
 
 
 def potential_groups(df: pd.DataFrame, leaders: set, near: float = 10.0, min_count: int = 2) -> dict:
-    """주도섹터 가능성: 주도섹터(최근 신고가 2개↑) + 52주 고가 near% 이내 종목이 min_count개↑인 섹터.
+    """주도섹터 가능성: 주도섹터(leading_groups 깐깐한 기준) + 시총 3,000억↑ 중 52주 고가 near% 이내 종목이 min_count개↑인 섹터.
     {섹터: '주도섹터' | '신고가 근접 N'}"""
     out = {g: "주도섹터" for g in leaders}
-    d = df[df["code"].map(is_kr) & (pd.to_numeric(df["to_high"], errors="coerce") <= near)]
+    d = df[df["code"].map(is_kr) & (pd.to_numeric(df["to_high"], errors="coerce") <= near)
+           & (pd.to_numeric(df.get("cap_krw"), errors="coerce") >= LEAD_RULES["min_cap"])].drop_duplicates("code")
     for g, n in d.groupby("group").size().items():
-        if g not in out and n >= min_count and g not in NON_SECTOR_GROUPS:
+        if g not in out and n >= min_count and _real_group(g):
             out[g] = f"신고가 근접 {n}"
     return out
 
