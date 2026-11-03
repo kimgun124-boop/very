@@ -175,6 +175,7 @@ import views
 import market as msig
 import scout
 import bigpicture
+import quotes as gq
 import zongbae
 import bear_check
 
@@ -292,8 +293,9 @@ _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
             "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "AI_VIEWS"),
-            "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line")}
-_MOD_VER = {"msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
+            "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line"),
+            "gq": ("QUOTES_VERSION", "today_quote", "load", "CAT_COLOR")}
+_MOD_VER = {"gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
 
 
 def _old_ver(alias, mod) -> bool:
@@ -10330,6 +10332,53 @@ def _tb_holdings(df: pd.DataFrame, phase: str | None) -> tuple[list, str | None,
     return rows, None, urgent
 
 
+GQ_CSS = """
+<style>
+.gq-card{background:#fff;border:1px solid #ECEEF5;border-radius:18px;padding:1rem 1.15rem .85rem;margin:0 0 .9rem;
+         box-shadow:0 1px 2px rgba(16,24,40,.04),0 6px 22px rgba(43,127,240,.05);position:relative;overflow:hidden}
+.gq-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:#2B7FF0}
+.gq-top{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem}
+.gq-k{font-size:.9rem;font-weight:800;color:#2B7FF0;letter-spacing:.01em}
+.gq-chip{font-size:.78rem;font-weight:800;border-radius:999px;padding:.1rem .55rem}
+.gq-no{margin-left:auto;font-size:.78rem;color:#9CA3AF;font-weight:700}
+.gq-q{font-size:1.22rem;font-weight:750;color:#111827;line-height:1.6;letter-spacing:-.02em;margin:0 0 .45rem;word-break:keep-all}
+.gq-q:before{content:"“";color:#2B7FF0;font-weight:900;margin-right:.15rem}
+.gq-q:after{content:"”";color:#2B7FF0;font-weight:900;margin-left:.1rem}
+.gq-by{font-size:.92rem;color:#6B7280;margin-bottom:.35rem}
+.gq-by b{color:#374151;font-weight:800}
+.gq-card details summary{cursor:pointer;font-size:.88rem;font-weight:800;color:#2B7FF0;list-style:none;padding:.2rem 0}
+.gq-card details summary::-webkit-details-marker{display:none}
+.gq-card details[open] summary .gq-ar{transform:rotate(180deg)}
+.gq-ar{display:inline-block;transition:transform .15s;font-family:Pretendard,'Malgun Gothic',sans-serif!important}
+.gq-m{margin-top:.35rem;background:#EAF2FE;border-radius:12px;padding:.6rem .8rem;font-size:.96rem;color:#1F2937;line-height:1.6;word-break:keep-all}
+@media (max-width:520px){.gq-q{font-size:1.08rem}}
+</style>
+"""
+
+
+def render_guru_quote():
+    """🕯 오늘의 투자 명언 — 검증된 대가의 말 하루 하나 + 내 원칙으로 본 의미(접어 두기)."""
+    try:
+        today = data.now_kst().date()
+    except Exception:  # noqa: BLE001
+        today = date.today()
+    r = gq.today_quote(today)
+    if not r:
+        return
+    e = html.escape
+    col = gq.CAT_COLOR.get(r.get("c", ""), "#6B7280")
+    st.markdown(
+        GQ_CSS + '<div class="db"><div class="gq-card">'
+        f'<div class="gq-top"><span class="gq-k">오늘의 투자 명언</span>'
+        f'<span class="gq-chip" style="color:{col};background:{col}1A">{e(r.get("c", ""))}</span>'
+        f'<span class="gq-no">{today:%m/%d} · {r["no"]}/{r["total"]}</span></div>'
+        f'<p class="gq-q">{e(r["q"])}</p>'
+        f'<div class="gq-by">— <b>{e(r["a"])}</b> · {e(r.get("s", ""))}</div>'
+        f'<details><summary>의미 보기 <span class="gq-ar">▾</span></summary>'
+        f'<div class="gq-m">{e(r.get("m", ""))}</div></details>'
+        '</div></div>', unsafe_allow_html=True)
+
+
 def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     """🎯 대시보드: 오늘 판정 + 지수·진입 신호 → 준비/살 종목 TOP 6 · 오늘의 매매 판단 → 시장 흐름 · 보유·리스크."""
     try:
@@ -11796,6 +11845,10 @@ def render_board():
     leaders_now = {g for g, _ in lead_groups(df)}
     trends_all, fins_all = load_trends_all(), load_fins_all()
     _TRENDS_BG["v"] = trends_all
+    try:
+        render_guru_quote()                                 # 🕯 오늘의 투자 명언(하루 하나)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         render_trade_board(df, histories, quotes)          # 🎯 이 앱의 목적: 지금 살 종목·왜·보유 대응
     except Exception as _e:  # noqa: BLE001 — 매매 보드가 실패해도 나머지 보드는 계속
