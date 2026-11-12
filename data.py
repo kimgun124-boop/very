@@ -42,7 +42,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-11-03-lead"
+DATA_VERSION = "2026-11-12-ipo"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -890,8 +890,23 @@ def add_rs_ranks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _rolling_prior_max(high: np.ndarray, lookback: int, minp: int) -> np.ndarray:
-    """prior[t] = t 이전 lookback거래일 고가의 최고값(값이 minp개 미만이면 NaN). pandas rolling과 같은 결과."""
-    return pd.Series(high).shift(1).rolling(lookback, min_periods=minp).max().to_numpy()
+    """prior[t] = t 이전 lookback거래일 고가의 최고값(값이 minp개 미만이면 NaN). pandas rolling과 같은 결과.
+
+    (속도 2026.11.12) 시세가 바뀔 때마다 보드 전 종목 × 2번 불려서 pandas Series를 만들지 않고 numpy 창(window)으로
+    계산해요 — 결과는 pandas shift(1).rolling(lookback, min_periods=minp).max()와 똑같고 2~3배 빨라요."""
+    high = np.asarray(high, dtype=float)
+    n = len(high)
+    if n == 0:
+        return np.full(0, np.nan)
+    x = np.empty(n)
+    x[0] = np.nan
+    x[1:] = high[:-1]
+    ok = ~np.isnan(x)
+    pad = np.concatenate([np.full(lookback - 1, -np.inf), np.where(ok, x, -np.inf)])
+    m = np.lib.stride_tricks.sliding_window_view(pad, lookback).max(axis=1)
+    c = np.concatenate([[0], np.cumsum(ok)])
+    cnt = c[1:] - c[np.maximum(0, np.arange(1, n + 1) - lookback)]
+    return np.where(cnt >= max(int(minp), 1), m, np.nan)
 
 
 def _breakout_np(dts: np.ndarray, high: np.ndarray, close: np.ndarray, mode: str = "line",
@@ -3127,7 +3142,7 @@ def buy_screen(df: pd.DataFrame, market_ok: bool | None, market_text: str, leade
 
 
 # ─────────────────────────── 섹터 안 급상승 엔진 · 차기 주도섹터 ───────────────────────────
-NON_SECTOR_GROUPS = {"스팩", "기타(동전주·정리매매 등)"}   # 업종이 아니라서 섹터 비교에서 빼요
+NON_SECTOR_GROUPS = {"스팩", "기타(동전주·정리매매 등)", "신규상장"}   # 업종이 아니라서 섹터 비교에서 빼요(신규상장 = 상장 시기로 묶은 칸)
 _flow_memo: dict = {}
 
 
@@ -4902,7 +4917,9 @@ def scan_frame(arrs: dict, quotes: dict, uni: dict, board: pd.DataFrame | None =
     binfo = board.drop_duplicates("code").set_index("code") if board is not None and len(board) else None
     rows = []
     for code, arr in arrs.items():
-        if arr is None or len(arr[0]) < 60 or not str(code).isdigit():     # 0120X0 같은 펀드형 코드 빼기
+        # (2026.11.12) 예전엔 숫자 코드만 남겨 0153R0·0011T0 같은 새 형식 코드(2024년 이후 신규상장 대부분)가 통째로 빠졌어요.
+        # uni(전 종목 목록)가 이미 주식만(ETF·ETN·스팩·우선주 제외) 담고 있어서 코드 모양으로 거르지 않아요.
+        if arr is None or len(arr[0]) < 60 or (uni and code not in uni):
             continue
         q = quotes.get(code) or {}
         vv = arr[5][-5:]
@@ -5649,3 +5666,81 @@ def apply_bar_fix(code: str, df: pd.DataFrame | None) -> pd.DataFrame | None:
         if "open" in df and f.get("high"):
             df.loc[i, "open"] = min(float(df.loc[i, "open"]), f["high"])
     return df
+
+
+# ─────────────────────────── 🆕 신규상장(최근 1년) ───────────────────────────
+IPO_BASE_MIN_DAYS = 15     # 상장 후 이만큼(약 3주) 지나야 '상장 후 고점 돌파'를 베이스 돌파로 봐요(오닐 IPO 베이스)
+IPO_NEAR_PCT = 15          # 상장 후 고점에서 이 % 안이면 '고점 근처'
+
+
+def ipo_row(info: dict, hist: pd.DataFrame | None, quote: dict | None, today: date | None = None) -> dict:
+    """신규상장 종목 하나의 사실 지표. 일봉은 상장일부터라 '상장 후 최고가' = 일봉 전체 최고가예요.
+
+    공모가·시초가(상장일 시가)는 한국거래소 KIND 값, 현재가·고가는 네이버 실시간(오늘 봉에 반영)."""
+    today = today or now_kst().date()
+    o = info.get("offer")
+    out = {"code": info.get("code"), "name": info.get("name"), "market": info.get("market"),
+           "list_date": info.get("list_date"), "offer": o, "open1": info.get("open1"),
+           "industry": info.get("industry"), "product": info.get("product"), "broker": info.get("broker"),
+           "days": None, "price": None, "change": None, "vs_offer": None, "open1_vs_offer": None,
+           "ipo_high": None, "ipo_high_date": None, "from_high": None, "ipo_low": None, "from_low": None,
+           "prior_high": None, "tv20": None, "vol_x20": None, "state": "일봉 없음", "state_key": "none"}
+    if o and info.get("open1"):
+        out["open1_vs_offer"] = (info["open1"] / o - 1) * 100
+    if hist is None or hist.empty:
+        q = quote or {}
+        if q.get("price"):
+            out.update(price=float(q["price"]), vs_offer=(q["price"] / o - 1) * 100 if o else None)
+        return out
+    try:
+        ld = np.datetime64(info.get("list_date"), "D")
+        hist = hist[hist["date"].values.astype("datetime64[D]") >= ld]       # 상장 전(재상장 등) 봉은 빼요
+    except (TypeError, ValueError):
+        pass
+    if hist.empty:
+        return out
+    d = hist["date"].values.astype("datetime64[D]")
+    arr = [hist[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close", "volume")]
+    d, op, hi, lo, cl, vo = _session_arrays(d, *arr, quote, today)
+    n = len(cl)
+    price = float(cl[-1])
+    q = quote or {}
+    prev = q.get("prev") or (float(cl[-2]) if n >= 2 else (o or None))
+    i_hi = int(np.nanargmax(hi))
+    ipo_high = float(hi[i_hi])
+    prior = hi[:-1]
+    prior_high = float(np.nanmax(prior)) if len(prior) else None
+    tv = (cl * vo)[:-1][-20:]
+    tv = tv[np.isfinite(tv)]
+    v20 = vo[:-1][-20:]
+    v20 = v20[np.isfinite(v20) & (v20 > 0)]
+    out.update(
+        days=n, price=price, change=(price / prev - 1) * 100 if prev else None,
+        vs_offer=(price / o - 1) * 100 if o else None,
+        ipo_high=ipo_high, ipo_high_date=d[i_hi].astype(object), from_high=(price / ipo_high - 1) * 100,
+        ipo_low=float(np.nanmin(lo)), prior_high=prior_high,
+        tv20=float(tv.mean()) if len(tv) else None,
+        vol_x20=float(vo[-1] / v20.mean()) if len(v20) and vo[-1] == vo[-1] else None,
+    )
+    out["from_low"] = (price / out["ipo_low"] - 1) * 100 if out["ipo_low"] else None
+    # 상태(사실 조건만): 상장 초기 → 상장 후 고점 돌파 → 고점 근처(베이스) → 조정 중 / 공모가 아래
+    if n < IPO_BASE_MIN_DAYS:
+        st_, key = f"상장 초기({n}일째) — 베이스 전", "early"
+    elif prior_high and price > prior_high:
+        st_, key = "상장 후 고점 돌파(종가 기준 확인 필요)", "brk"
+    elif out["from_high"] >= -IPO_NEAR_PCT:
+        st_, key = f"상장 후 고점 {IPO_NEAR_PCT}% 안 — 베이스 관찰", "near"
+    elif o and price < o:
+        st_, key = "공모가 아래", "below"
+    else:
+        st_, key = "고점 대비 조정 중", "pull"
+    out.update(state=st_, state_key=key)
+    return out
+
+
+def ipo_scan(items: list[dict], histories: dict, quotes: dict, today: date | None = None) -> pd.DataFrame:
+    """ipo_list.json 항목 → 신규상장 표(상장일 최신순)."""
+    rows = [ipo_row(x, (histories.get(x["code"]) or (None, None, None))[1], quotes.get(x["code"]), today)
+            for x in items or [] if x.get("code")]
+    out = pd.DataFrame(rows, columns=list(ipo_row({}, None, None).keys()))
+    return out.sort_values("list_date", ascending=False).reset_index(drop=True) if len(out) else out

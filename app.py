@@ -27,7 +27,7 @@ import streamlit as st
 import importlib
 import threading
 import time
-from datetime import date, time as dtime
+from datetime import date, time as dtime, timedelta
 
 # (메모리) 리눅스 메모리 할당기 설정 — 무거운 import 전에.
 # 여러 스레드가 동시에 시세·일봉을 받으면 스레드마다 따로 메모리 칸(arena)을 만들어 쓰고 난 뒤에도 쥐고 있어요.
@@ -178,6 +178,7 @@ import bigpicture
 import quotes as gq
 import zongbae
 import bear_check
+import ipo as ipo_mod
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -257,7 +258,7 @@ if re.fullmatch(r"\d{6}", _qp_diag):
         st.markdown(f"연속성 점검 실패 {type(_e).__name__}: {_e}")
     st.stop()
 
-REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
+REQUIRED = ("is_kr", "ipo_scan", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
             "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
             "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
@@ -273,7 +274,7 @@ REQUIRED = ("is_kr", "market_of", "quote_url", "INDEXES", "fetch_index_histories
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
             "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER",
             "vol52_scan", "V52_DEFAULTS", "v52_reasons", "v52_kind", "leading_report", "LEAD_RULES", "fetch_ktb10")
-DATA_VERSION = "2026-11-03-lead"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-11-12-ipo"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -326,6 +327,12 @@ if _missing:
              f"(없는 기능: {', '.join(_missing)})")
     st.stop()
 
+# 🆕 신규상장 목록(ipo_list.json)은 GitHub Actions가 평일 저녁 새로 커밋해요. 서버가 예전 목록을 기억하면 다시 읽어요.
+try:
+    if (ipo_mod.load().get("updated") or "") != ((getattr(stock_list, "IPO", None) or {}).get("updated") or ""):
+        stock_list = importlib.reload(stock_list)
+except Exception:  # noqa: BLE001
+    pass
 STOCKS = stock_list.STOCKS
 GROUP_ORDER = stock_list.GROUP_ORDER
 SECTOR_ORDER = stock_list.SECTOR_ORDER
@@ -1576,7 +1583,7 @@ def _first_high_ago(hist, lookback: int = 20) -> int | None:
     if hist is None or len(hist) < 260:
         return None
     h = pd.to_numeric(hist["high"], errors="coerce").to_numpy(dtype=float)
-    prior = pd.Series(h).shift(1).rolling(250, min_periods=200).max().to_numpy()
+    prior = data._rolling_prior_max(h, 250, 200)
     tail = np.arange(len(h) - lookback, len(h))
     hits = [i for i in tail if prior[i] == prior[i] and h[i] > prior[i]]
     return (len(h) - 1 - hits[0]) if hits else None
@@ -1903,6 +1910,7 @@ SECTOR_CATS = [
                       "기계", "건설", "산업재", "자동차", "화학", "철강·금속", "종이·포장", "전략광물", "운송·물류", "상업서비스"]),
     ("소비 · 바이오 · 금융", ["화장품", "음식료", "소비재", "소비자 서비스", "유통·무역", "바이오·헬스케어", "금융·지주",
                            "부동산"]),
+    ("🆕 신규상장", ["신규상장"]),
     ("기타", ["기타", "기타(리포트 스크린)", "해외 기타", "기타 업종"]),
 ]
 SECTOR_SHORT = {"소프트웨어·인터넷": "SW·인터넷", "미디어·엔터·게임": "엔터·게임", "에너지·유틸리티": "에너지·유틸",
@@ -9494,6 +9502,123 @@ def _v52_vol(v) -> str:
     return f"{v / 1e8:,.2f}억주" if v >= 1e8 else (f"{v / 1e4:,.0f}만주" if v >= 1e4 else f"{v:,.0f}주")
 
 
+IPO_CSS = """
+<style>
+.ipo-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin: 0.2rem 0 0.8rem; }
+.ipo-kpis div { background: #FFFFFF; border: 1px solid #E3E8EB; border-radius: 12px; padding: 0.6rem 0.8rem; }
+.ipo-kpis span { display: block; font-size: 0.76rem; color: #6B7A84; }
+.ipo-kpis b { font-size: 1.35rem; font-weight: 800; color: #16212B; font-variant-numeric: tabular-nums; }
+.ipo-kpis small { font-size: 0.75rem; color: #7A8A94; margin-left: 0.15rem; font-weight: 600; }
+.ipo-src { font-size: 0.76rem; color: #7A8A94; margin: -0.3rem 0 0.6rem; }
+@media (max-width: 640px) { .ipo-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>
+"""
+IPO_STATE_ICON = {"brk": "🚀", "near": "📦", "early": "🌱", "pull": "↘️", "below": "📉", "none": "·"}
+
+
+def render_ipo(df: pd.DataFrame, histories: dict, quotes: dict):
+    """🆕 신규상장 — 최근 1년 코스피·코스닥 신규상장(스팩·코넥스 제외). 공모가·시초가는 KIND, 시세는 네이버 실시간."""
+    st.markdown(NHC_CSS + IPO_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="nh-head"><b>🆕 신규상장</b><span>최근 1년 상장 종목 — 공모가 대비 · 상장 후 고점 돌파(IPO 베이스)</span></div>',
+                unsafe_allow_html=True)
+    info = ipo_mod.load()
+    items = info.get("items") or []
+    if not items:
+        st.info("신규상장 목록(ipo_list.json)이 아직 없어요. GitHub Actions '🆕 신규상장 갱신'이 평일 저녁에 만들어요.")
+        return
+    codes = tuple(x["code"] for x in items)
+    hist = {c: histories[c] for c in codes if c in histories}
+    need = [c for c in codes if c not in hist]
+    if need:
+        hist.update(get_histories(need, label=f"신규상장 {len(need)}종목 일봉을 불러오는 중이에요."))
+    qs = {c: quotes[c] for c in codes if c in quotes}
+    if len(qs) < len(codes):
+        got, _err = load_quotes(tuple(c for c in codes if c not in qs))
+        qs.update(got or {})
+    t = tab_memo("ipo", (info.get("updated"), len(hist), sum(int((q or {}).get("price") or 0) for q in qs.values())),
+                 lambda: data.ipo_scan(items, hist, qs))
+    if t.empty:
+        st.info("신규상장 종목 시세를 아직 못 받았어요.")
+        return
+    c1, c2, c3 = st.columns([1.4, 1.4, 1])
+    period = c1.segmented_control("상장 시기", [30, 90, 180, 365], default=365, key="ipo_period",
+                                  format_func=lambda x: f"최근 {x}일" if x < 365 else "1년 전체") or 365
+    mk = c2.segmented_control("시장", ["전체", "코스피", "코스닥"], default="전체", key="ipo_mk") or "전체"
+    sort_by = c3.selectbox("정렬", ["상장일(최신)", "공모가 대비", "상장 후 고점 대비", "오늘 등락", "20일 거래대금"], key="ipo_sort")
+    today = data.now_kst().date()
+    v = t[pd.to_datetime(t["list_date"]).dt.date >= today - timedelta(days=int(period))]
+    if mk != "전체":
+        v = v[v["market"] == mk]
+    key = {"공모가 대비": "vs_offer", "상장 후 고점 대비": "from_high", "오늘 등락": "change", "20일 거래대금": "tv20"}.get(sort_by)
+    v = v.sort_values(key, ascending=False, na_position="last") if key else v.sort_values("list_date", ascending=False)
+    up = v["vs_offer"].dropna()
+    st.markdown(
+        '<div class="ipo-kpis">'
+        f'<div><span>신규상장(조건 안)</span><b>{len(v)}<small>종목</small></b></div>'
+        f'<div><span>공모가 위</span><b>{int((up > 0).sum())}<small>/ {len(up)}</small></b></div>'
+        f'<div><span>공모가 대비 중앙값</span><b>{(f"{up.median():+.1f}%" if len(up) else "-")}</b></div>'
+        f'<div><span>🚀 상장 후 고점 돌파</span><b>{int((v["state_key"] == "brk").sum())}<small>종목</small></b></div></div>'
+        f'<div class="ipo-src">출처: 한국거래소 KIND(상장일·공모가·상장일 시가·업종·주요제품, {html.escape(str(info.get("updated") or ""))} 갱신) · '
+        '현재가·고가·거래량은 네이버 실시간. 스팩·코넥스는 뺐어요.</div>', unsafe_allow_html=True)
+    show = v.assign(
+        상태=[f"{IPO_STATE_ICON.get(k, '·')} {s_}" for k, s_ in zip(v["state_key"], v["state"])],
+        상장후고점일=[f"{x:%m/%d}" if x is not None and x == x else "-" for x in v["ipo_high_date"]],
+        거래대금20=v["tv20"] / 1e8,
+        차트=["?chart=" + c for c in v["code"]],
+    )
+    st.dataframe(
+        show[["name", "차트", "market", "list_date", "days", "offer", "open1_vs_offer", "price", "change", "vs_offer",
+              "ipo_high", "상장후고점일", "from_high", "거래대금20", "상태", "product"]],
+        hide_index=True, width="stretch", height=min(38 * (len(show) + 1) + 3, 640),
+        column_config={
+            "name": st.column_config.TextColumn("종목", pinned=True),
+            "차트": st.column_config.LinkColumn("차트", display_text="🕯️", width="small"),
+            "market": st.column_config.TextColumn("시장", width="small"),
+            "list_date": st.column_config.TextColumn("상장일"),
+            "days": st.column_config.NumberColumn("거래일", format="%d일", help="상장일부터 오늘까지 거래일 수"),
+            "offer": st.column_config.NumberColumn("공모가", format="localized", help="KIND (수정)공모가"),
+            "open1_vs_offer": st.column_config.NumberColumn("시초가 vs 공모가", format="%+.1f%%",
+                                                            help="상장일 시가가 공모가보다 몇 % 높았는지(KIND)"),
+            "price": st.column_config.NumberColumn("현재가", format="localized"),
+            "change": st.column_config.NumberColumn("오늘", format="%+.2f%%"),
+            "vs_offer": st.column_config.NumberColumn("공모가 대비", format="%+.1f%%"),
+            "ipo_high": st.column_config.NumberColumn("상장 후 최고가", format="localized", help="상장일부터 일봉 고가 최고값(오늘 장중 포함)"),
+            "상장후고점일": st.column_config.TextColumn("고점일", width="small"),
+            "from_high": st.column_config.NumberColumn("고점 대비", format="%+.1f%%"),
+            "거래대금20": st.column_config.NumberColumn("20일 평균 거래대금(억)", format="%.0f"),
+            "상태": st.column_config.TextColumn("상태", width="medium"),
+            "product": st.column_config.TextColumn("주요제품(KIND)", width="large"),
+        })
+    up_list = info.get("upcoming") or []
+    if up_list:
+        with st.expander(f"📅 상장 예정 {len(up_list)}종목 (KIND 공모기업 현황)", expanded=False):
+            st.dataframe(pd.DataFrame([{
+                "종목": u["name"], "상장 예정일": u.get("list_date"), "청약": u.get("sub"),
+                "공모가(확정)": f"{u['offer']:,.0f}원" if u.get("offer") else "미정",
+                "공모금액(억)": round(u["amount_mil"] / 100) if u.get("amount_mil") else None, "주관사": u.get("broker")}
+                for u in up_list]), hide_index=True, width="stretch")
+    labels = {r.code: f"{r.name} ({r.code}) · {r.list_date} 상장" for r in v.itertuples()}
+    if labels:
+        code = st.selectbox("차트로 크게 보기", list(labels), format_func=labels.get, key="ipo_chart_code")
+        h = (hist.get(code) or (None, data.empty_frame(), None))[1]
+        if h is not None and len(h) >= 2:
+            _vs_chart(h, labels[code], min(20, len(h)), 0)
+        else:
+            st.caption("상장 첫날이라 차트로 볼 봉이 아직 부족해요.")
+    with st.expander("ℹ️ 이 탭을 읽는 법"):
+        st.markdown(
+            "- **목록**: 한국거래소 KIND '신규상장 기업'(상장유형 = 신규상장)에서 최근 1년 코스피·코스닥 종목. "
+            "스팩·리츠·코넥스는 뺐어요. 평일 저녁 GitHub Actions가 새로 받아 커밋해요.\n"
+            "- **공모가**는 KIND (수정)공모가(무상증자 등 반영), **시초가 vs 공모가**는 상장일 시가 기준이에요.\n"
+            "- **상장 후 최고가**: 일봉이 상장일부터라 52주 최고가 = 상장 후 최고가예요(상장 첫날 장중 고가 포함).\n"
+            f"- **상태**(사실 조건만): 🌱 상장 {data.IPO_BASE_MIN_DAYS}거래일 전 = 베이스 전 · "
+            "🚀 현재가가 어제까지의 상장 후 최고가 위(종가로 확인 필요) · "
+            f"📦 고점 {data.IPO_NEAR_PCT}% 안 = 베이스 관찰 · ↘️ 고점 대비 조정 · 📉 공모가 아래.\n"
+            "- 오닐의 IPO 베이스: 상장 후 몇 주~몇 달 다지며 만든 고점을 거래량 실어 뚫을 때가 첫 타점이에요. "
+            "매수 판단은 늘 내 원칙(지수 60일선 → 주도섹터 → 종목 조건 → 손절)이 먼저예요. "
+            "이 칸은 업종이 아니라 '상장 시기' 묶음이라 주도섹터 판정에는 들어가지 않아요.")
+
+
 def render_vol52(df: pd.DataFrame, histories: dict, quotes: dict):
     """🔊 52주 최대 거래량 — 얼마나 터졌나(직전 52주 최대·20일 평균 대비) + 왜 터졌나(뉴스 키워드 · 캔들 · 섹터 동반)."""
     st.markdown(NHC_CSS + V52_CSS, unsafe_allow_html=True)
@@ -11722,7 +11847,7 @@ def render_bear_check(df: pd.DataFrame):
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
-    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
+    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🆕 신규상장", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
     ("🔭 섹터 흐름", ["🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
@@ -11732,6 +11857,7 @@ NAV_DESC = {
     "🕯️ 차트": "종목 검색 → 일·주·월봉 차트", "📥 리포트": "리포트를 넣으면 종목이 보드에 반영",
     "💼 내 보유": "보유 종목을 내 원칙으로 점검", "👀 보유 살피기": "보유 종목 실시간 수급·뉴스 + AI 판단",
     "🏁 신고가 후보": "넥장까지 반영한 진짜 돌파·찍고 밀림", "🏔️ 신고가": "역사적·52주 신고가를 섹터별로",
+    "🆕 신규상장": "최근 1년 신규상장(KIND 공식) — 공모가·상장 후 고점 돌파",
     "🔊 52주 최대 거래량": "1년 중 최대 거래량이 터진 종목 — 얼마나·왜(뉴스·섹터 동반)", "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
     "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "🌙 종가배팅": "4인 관점(M·K·C·D) 오늘 후보 자동 점검 + 비교표", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
@@ -11897,6 +12023,7 @@ def render_board():
         "📥 리포트": lambda: render_reports_tab(),
         "🏔️ 신고가": lambda: render_ath(df, quotes),
         "🏁 신고가 후보": lambda: render_nh_candidates(df, histories, quotes),
+        "🆕 신규상장": lambda: render_ipo(df, histories, quotes),
         "🔊 52주 최대 거래량": lambda: render_vol52(df, histories, quotes),
         "💥 거래량 폭발": lambda: render_volume_surge(df, histories, quotes),
         "🏭 인더스트리 액션": lambda: render_industry_action(df, histories, quotes),
