@@ -137,7 +137,7 @@ def unpack(raw: bytes) -> dict:
         a, b = int(offs[i]), int(offs[i + 1])
         df = pd.DataFrame({"date": dates[a:b], **{k: cols[k][a:b].copy() for k in _COLS}})
         hist[c] = (names[i] or None, df, None)
-    frames = {name: _frames_from(z, name) for name in ("trends", "fins", "monthly")}
+    frames = {name: _frames_from(z, name) for name in ("trends", "fins", "monthly", "misc")}
     return {"hist": hist, "shares": json.loads(str(z["shares"])), "h52": json.loads(str(z["h52"])), "meta": meta, **frames}
 
 
@@ -187,6 +187,10 @@ def build(out_path: str):
                    pd.DataFrame({"date": pd.to_datetime(m["date"]).values,
                                  "high": pd.to_numeric(m["high"], errors="coerce").astype("float32").values}))
                for c, m in monthly.items()}
+    try:
+        deposits = data.fetch_deposits()                     # 증시 자금(예탁금·신용잔고)
+    except Exception:  # noqa: BLE001
+        deposits = None
     t4 = time.time()
     ok = sum(1 for r in hist.values() if r and r[1] is not None and not r[1].empty)
     meta = {"built": time.time(), "built_kst": data.now_kst().strftime("%Y-%m-%d %H:%M"),
@@ -198,7 +202,8 @@ def build(out_path: str):
             "shares_diag": {"kr": kr_diag, "os": os_diag}}
     if ok < 0.8 * len(codes) or len(kr_sh) < 0.8 * len(kr):
         raise SystemExit(f"받은 게 너무 적어서 저장 안 해요: {meta}")
-    raw = pack(hist, {**kr_sh, **os_sh}, h52, meta, frames={"trends": trends, "fins": fins, "monthly": monthly})
+    raw = pack(hist, {**kr_sh, **os_sh}, h52, meta, frames={"trends": trends, "fins": fins, "monthly": monthly,
+                                                                "misc": {"deposits": deposits}})
     with open(out_path, "wb") as f:
         f.write(raw)
     print(_js({**meta, "bytes": len(raw)}))

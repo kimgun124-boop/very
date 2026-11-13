@@ -1180,6 +1180,7 @@ def _warm_pack() -> dict:
                 t = float(got["meta"].get("built") or 0)
                 box.update(hist=got["hist"], shares=got.get("shares") or {}, h52=got.get("h52") or {},
                            trends=got.get("trends") or {}, fins=got.get("fins") or {}, monthly=got.get("monthly") or {},
+                           misc=got.get("misc") or {},
                            meta=got.get("meta") or {}, t=t)
                 for c, v in box["trends"].items():          # 종목 수급 기억(오래된 값 → 볼 때 뒤에서 새로)
                     if v is not None:
@@ -1427,7 +1428,7 @@ def _swr_seed(key, make):
         value = make(box)
     except Exception:  # noqa: BLE001
         return
-    if value:
+    if value is not None and len(value):
         with store["lock"]:
             store["items"].setdefault(key, {"value": value, "t": box["t"], "busy": False})
 
@@ -10380,6 +10381,7 @@ def load_health(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_deposits() -> pd.DataFrame:
+    _swr_seed(("deposits", DATA_VERSION), lambda box: (box.get("misc") or {}).get("deposits"))
     t = swr(("deposits", DATA_VERSION), 3600, lambda: data.fetch_deposits(), "증시 자금(예탁금·신용잔고)을 불러오는 중이에요.")
     if t is None or len(t) == 0:            # 실패는 오래 기억하지 않고 10분 뒤 다시 시도
         t = swr(("deposits_retry", DATA_VERSION, data.now_kst().strftime("%H%M")[:3]), 600, lambda: data.fetch_deposits(),
