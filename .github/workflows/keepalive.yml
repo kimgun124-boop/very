@@ -1,0 +1,49 @@
+name: ☕ 앱 깨워 두기
+
+# Streamlit Community Cloud는 12시간 동안 아무도 안 들어오면 앱을 재워요. 깨우는 데 1~2분, 그 뒤 첫 화면도 오래 걸려요.
+# 그래서 5시간마다 진짜 브라우저(크롬, 화면 없이)로 한 번 들어가 둬요. 자고 있으면 '깨우기' 버튼도 눌러요.
+on:
+  schedule:
+    # 한국 시간 08:17 · 12:17 · 17:17 · 22:17 · 03:17
+    - cron: "17 23,3,8,13,18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright && python -m playwright install --with-deps chromium
+      - name: 앱 방문
+        env:
+          APP_URL: https://hyoseok.streamlit.app/
+        run: |
+          python - <<'PY'
+          import os, time
+          from playwright.sync_api import sync_playwright
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              pg = b.new_page(user_agent="Mozilla/5.0 (keepalive; valuechain-board)")
+              pg.goto(url, timeout=90000, wait_until="domcontentloaded")
+              time.sleep(8)
+              for frame in [pg] + list(pg.frames):
+                  try:
+                      btn = frame.get_by_role("button", name="Yes, get this app back up!")
+                      if btn.count():
+                          btn.first.click()
+                          print("잠들어 있어서 깨웠어요")
+                          break
+                  except Exception as e:
+                      print("버튼 확인 실패", e)
+              time.sleep(90)          # 첫 실행(빠른 시작 묶음 받기)까지 기다려요
+              print("제목:", pg.title())
+              b.close()
+          PY

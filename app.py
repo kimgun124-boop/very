@@ -179,6 +179,7 @@ import quotes as gq
 import zongbae
 import bear_check
 import ipo as ipo_mod
+import warm as warm_mod
 
 _TRIM_T = data.__dict__.setdefault("_TRIM_T", [0.0, {}, 0.0])   # [마지막 정리 시각, 정리 통계, 마지막 전체 훑기 시각]
 while len(_TRIM_T) < 3:                                            # 예전 코드가 만든 [시각]만 있는 경우
@@ -1159,6 +1160,45 @@ st.markdown(
 )
 
 theme.apply()    # 🎨 디자인(색·카드·글꼴)만 덮어써요. 지우면 예전 모습
+
+
+@st.cache_resource(show_spinner=False)
+def _warm_pack() -> dict:
+    """⚡ 빠른 시작 묶음(warm.py): 서버가 켜질 때 딱 한 번, 뒤에서 받아요(비밀번호 화면도 막지 않게).
+    GitHub Actions가 매일 아침 미리 받아 둔 보드 종목 일봉·상장주식수·공식 52주 값이에요.
+    예전엔 서버가 새로 켜지면 이걸 네이버·야후에서 종목마다 받느라 첫 화면이 1~2분 걸렸어요."""
+    box = {"ready": threading.Event(), "hist": {}, "shares": {}, "h52": {}, "meta": {}, "error": None, "t": 0.0}
+    if data.MOCK or os.environ.get("WARM_OFF"):
+        box["error"] = "꺼짐"
+        box["ready"].set()
+        return box
+
+    def run():
+        try:
+            got = warm_mod.load()
+            if got.get("hist"):
+                box.update(hist=got["hist"], shares=got.get("shares") or {}, h52=got.get("h52") or {},
+                           meta=got.get("meta") or {}, t=float(got["meta"].get("built") or 0))
+            else:
+                box["error"] = got.get("error") or "비어 있음"
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = repr(exc)[:200]
+        finally:
+            box["ready"].set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return box
+
+
+def warm_get(wait: float = 20.0) -> dict | None:
+    """받아 둔 빠른 시작 묶음(아직 받는 중이면 wait초까지 기다려요). 못 쓰면 None."""
+    box = _warm_pack()
+    if not box["ready"].wait(max(0.0, wait)) or box["error"] or not box["t"]:
+        return None
+    return box
+
+
+_warm_pack()     # ⚡ 비밀번호 화면을 띄우는 동안에도 뒤에서 미리 받아요
 _app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
 
 
@@ -1357,6 +1397,23 @@ def mem_guard(keep: set | None = None):
     return rss_mb()
 
 
+def _swr_seed(key, make):
+    """⚡ swr 창고가 비어 있으면 빠른 시작 묶음 값으로 먼저 채워요(오래된 값 → swr이 뒤에서 새로 받아요)."""
+    store = _bg_store()
+    if key in store["items"]:
+        return
+    box = warm_get()
+    if not box:
+        return
+    try:
+        value = make(box)
+    except Exception:  # noqa: BLE001
+        return
+    if value:
+        with store["lock"]:
+            store["items"].setdefault(key, {"value": value, "t": box["t"], "busy": False})
+
+
 def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = True, empty=None):
     """key의 데이터를 돌려줘요. ttl초가 지났으면 지난 값을 먼저 주고 뒤에서 loader()로 새로 받아요.
     first_wait=False면 처음에도 기다리지 않고 empty를 준 뒤 뒤에서 받아요(없어도 화면이 되는 데이터용)."""
@@ -1553,6 +1610,18 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
     S = _hist_store()
     now = time.time()
     missing = [c for c in codes if c not in S["data"]]
+    if missing:
+        # ⚡ 서버가 막 켜졌으면 아침에 받아 둔 묶음에서 먼저 꺼내요(오래된 값으로 표시 → 뒤에서 새로 받아 바꿔 끼움)
+        box = warm_get(20.0 if wait else 0.0)
+        if box:
+            got = {c: box["hist"].pop(c) for c in missing if c in box["hist"]}
+            if got:
+                with S["lock"]:
+                    for c, res in got.items():
+                        if c not in S["data"]:
+                            S["data"][c] = res
+                            S["t"][c] = box["t"]
+                missing = [c for c in missing if c not in S["data"]]
     stale = [c for c in codes if c in S["data"] and now - S["t"].get(c, 0) > HIST_TTL]
     if missing and wait:
         with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
@@ -1746,6 +1815,7 @@ def load_histories_overseas(codes: tuple[str, ...]):
 
 def load_official_52w(codes: tuple[str, ...]) -> dict:
     """네이버 공식 52주 최고·최저(10분마다). 일봉으로 계산한 값과 대조해서 다르면 공식값으로 고쳐요."""
+    _swr_seed(("h52", codes), lambda box: {c: box["h52"][c] for c in codes if c in box["h52"]})
     return swr(("h52", codes), 600, lambda: data.fetch_official_52w(codes),
                "네이버 공식 52주 최고·최저가와 대조하는 중이에요. 처음 한 번만 몇 초 걸려요.")
 
@@ -1809,24 +1879,9 @@ def _shares_store():
     return {"t": 0.0, "t_retry": 0.0, "data": {}, "kr": {}, "os": {}, "fails": {}}
 
 
-def load_shares() -> dict:
-    """상장주식수: 12시간마다 전체를 다시 받고, 빠진 종목은 10분마다 그것만 다시 시도해요(종목당 3번까지)."""
-    store = _shares_store()
-    store.setdefault("fails", {})
-    store.setdefault("t_retry", 0.0)
-    now = time.time()
-    full = now - store["t"] >= 43200
-    missing = [c for c in ALL_CODES + EXTRA_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
-    big_new = len(missing) > 200 and now - store.get("t_big", 0.0) >= 120     # 전체 종목을 막 켰을 때는 바로 받기
-    if not full and not (missing and (now - store["t_retry"] >= 600 or big_new)):
-        return store
-    if big_new:
-        store["t_big"] = now
-    kr_t = KR_CODES + EXTRA_CODES if full else tuple(c for c in missing if data.is_kr(c))
-    os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
-    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요."):
-        kr, kr_diag = data.fetch_kr_shares(kr_t) if kr_t else ({}, {})
-        os_, os_diag = data.fetch_overseas_shares(os_t) if os_t else ({}, {})
+def _shares_fetch(store: dict, kr_t: tuple, os_t: tuple, full: bool, now: float):
+    kr, kr_diag = data.fetch_kr_shares(kr_t) if kr_t else ({}, {})
+    os_, os_diag = data.fetch_overseas_shares(os_t) if os_t else ({}, {})
     got = {**kr, **os_}
     if full:
         store["fails"] = {}
@@ -1841,6 +1896,51 @@ def load_shares() -> dict:
     store["t_retry"] = now
     if full:
         store["t"] = now if len(kr) >= 0.8 * max(1, len(kr_t)) else now - 43200 + 600
+
+
+def load_shares() -> dict:
+    """상장주식수: 12시간마다 전체를 다시 받고, 빠진 종목은 10분마다 그것만 다시 시도해요(종목당 3번까지).
+    (속도 2026.11.13) 이미 가진 값이 있으면(빠른 시작 묶음 포함) 화면을 막지 않고 뒤에서 새로 받아요.
+    상장주식수는 증자·감자 때만 바뀌어서 몇 시간 묵은 값으로 먼저 그려도 시가총액이 거의 같아요."""
+    store = _shares_store()
+    store.setdefault("fails", {})
+    store.setdefault("t_retry", 0.0)
+    store.setdefault("busy", False)
+    if not store["data"]:
+        box = warm_get()
+        if box and box["shares"]:
+            store["data"] = dict(box["shares"])
+            store["t"] = box["t"]
+            store["t_retry"] = time.time()          # 묶음에 없는 종목은 뒤에서 곧 따로 받아요
+    now = time.time()
+    full = now - store["t"] >= 43200
+    missing = [c for c in ALL_CODES + EXTRA_CODES if c not in store["data"] and store["fails"].get(c, 0) < 3]
+    big_new = len(missing) > 200 and now - store.get("t_big", 0.0) >= 120     # 전체 종목을 막 켰을 때는 바로 받기
+    if not full and not (missing and (now - store["t_retry"] >= 600 or big_new)):
+        return store
+    if store["busy"]:
+        return store
+    if big_new:
+        store["t_big"] = now
+    kr_t = KR_CODES + EXTRA_CODES if full else tuple(c for c in missing if data.is_kr(c))
+    os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
+    have = len(store["data"]) >= 0.5 * max(1, len(ALL_CODES))
+    if have:
+        if rss_mb() >= MEM_SOFT:          # 메모리가 빠듯하면 가진 값으로 그리고 다음에
+            return store
+        store["busy"] = True
+
+        def work():
+            try:
+                _shares_fetch(store, kr_t, os_t, full, now)
+            except Exception:  # noqa: BLE001
+                store["t_retry"] = time.time()
+            finally:
+                store["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+        return store
+    with st.spinner("시가총액 계산용 상장주식수를 불러오는 중이에요."):
+        _shares_fetch(store, kr_t, os_t, full, now)
     return store
 
 
