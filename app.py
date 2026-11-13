@@ -1168,7 +1168,7 @@ def _warm_pack() -> dict:
     GitHub Actions가 매일 아침 미리 받아 둔 보드 종목 일봉·상장주식수·공식 52주 값이에요.
     예전엔 서버가 새로 켜지면 이걸 네이버·야후에서 종목마다 받느라 첫 화면이 1~2분 걸렸어요."""
     box = {"ready": threading.Event(), "hist": {}, "shares": {}, "h52": {}, "meta": {}, "error": None, "t": 0.0}
-    if data.MOCK or os.environ.get("WARM_OFF"):
+    if (data.MOCK and not os.environ.get("WARM_FORCE")) or os.environ.get("WARM_OFF"):
         box["error"] = "꺼짐"
         box["ready"].set()
         return box
@@ -1177,8 +1177,15 @@ def _warm_pack() -> dict:
         try:
             got = warm_mod.load()
             if got.get("hist"):
+                t = float(got["meta"].get("built") or 0)
                 box.update(hist=got["hist"], shares=got.get("shares") or {}, h52=got.get("h52") or {},
-                           meta=got.get("meta") or {}, t=float(got["meta"].get("built") or 0))
+                           trends=got.get("trends") or {}, fins=got.get("fins") or {}, monthly=got.get("monthly") or {},
+                           meta=got.get("meta") or {}, t=t)
+                for c, v in box["trends"].items():          # 종목 수급 기억(오래된 값 → 볼 때 뒤에서 새로)
+                    if v is not None:
+                        data._trend_cache.setdefault(c, (t, v))
+                for c, v in box["fins"].items():            # 연간 실적(12시간 기억)
+                    data._fin_cache.setdefault(c, (t, v))
             else:
                 box["error"] = got.get("error") or "비어 있음"
         except Exception as exc:  # noqa: BLE001
@@ -1190,6 +1197,16 @@ def _warm_pack() -> dict:
     return box
 
 
+@st.cache_resource(show_spinner=False)
+def _boot_t() -> float:
+    return time.time()
+
+
+def booting(sec: float = 45.0) -> bool:
+    """서버가 막 켜진 뒤 sec초 동안은 True — 첫 화면 계산과 CPU를 다투지 않게 뒤쪽 새로 받기를 잠깐 미뤄요."""
+    return time.time() - _boot_t() < sec
+
+
 def warm_get(wait: float = 20.0) -> dict | None:
     """받아 둔 빠른 시작 묶음(아직 받는 중이면 wait초까지 기다려요). 못 쓰면 None."""
     box = _warm_pack()
@@ -1198,6 +1215,7 @@ def warm_get(wait: float = 20.0) -> dict | None:
     return box
 
 
+_boot_t()
 _warm_pack()     # ⚡ 비밀번호 화면을 띄우는 동안에도 뒤에서 미리 받아요
 _app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
 
@@ -1428,7 +1446,7 @@ def swr(key, ttl: int, loader, spinner: str | None = None, first_wait: bool = Tr
         has_value = item["value"] is not None
         need = (not has_value) or time.time() - item["t"] >= ttl
         start_bg = need and not item["busy"] and (has_value or not first_wait)
-        if start_bg and rss_mb() > MEM_SOFT:           # 메모리가 빠듯하면 새로 받기는 다음으로
+        if start_bg and (rss_mb() > MEM_SOFT or booting()):   # 메모리가 빠듯하거나 막 켜졌으면 새로 받기는 다음으로
             start_bg = False
         if start_bg:
             item["busy"] = True
@@ -1627,7 +1645,7 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
         with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
             _hist_put(data.fetch_histories(missing, workers=8))
         missing = []
-    if (stale or missing) and rss_mb() < MEM_SOFT:
+    if (stale or missing) and rss_mb() < MEM_SOFT and (missing or not booting()):
         _hist_bg(stale + missing)
     d = S["data"]
     return {c: d[c] for c in codes if c in d}
@@ -1839,11 +1857,17 @@ def load_monthlies(codes: tuple[str, ...], trim: bool = True):
     그동안 '역사적 신고가'가 비고 서버도 바빴어요 → 이제 없는 종목·오래된 종목만 뒤에서 더 받아요."""
     ms = _monthly_store()
     now = time.time()
+    box = warm_get(0.0) if any(c not in ms["items"] for c in codes) else None
     with ms["lock"]:
         items = ms["items"]
+        if box and box.get("monthly"):                     # ⚡ 아침에 받아 둔 월봉으로 먼저 채워요
+            for c in codes:
+                if c not in items and c in box["monthly"]:
+                    m = box["monthly"].pop(c)
+                    items[c] = (box["t"], m) if m is not None else (box["t"] - 21600 + 1800, None)
         have = {c: items[c][1] for c in codes if c in items}
         need = tuple(c for c in codes if c not in items or now - items[c][0] > 21600)
-        start = bool(need) and not ms["busy"] and rss_mb() <= MEM_SOFT
+        start = bool(need) and not ms["busy"] and rss_mb() <= MEM_SOFT and not booting()
         if start:
             ms["busy"] = True
         if trim and len(items) > max(1500, len(codes) * 2):  # (메모리) 오래 안 본 종목은 정리(후보 탭처럼 일부만 볼 땐 안 지워요)
@@ -1926,7 +1950,7 @@ def load_shares() -> dict:
     os_t = OS_CODES if full else tuple(c for c in missing if not data.is_kr(c))
     have = len(store["data"]) >= 0.5 * max(1, len(ALL_CODES))
     if have:
-        if rss_mb() >= MEM_SOFT:          # 메모리가 빠듯하면 가진 값으로 그리고 다음에
+        if rss_mb() >= MEM_SOFT or booting():   # 메모리가 빠듯하거나 막 켜졌으면 가진 값으로 그리고 다음에
             return store
         store["busy"] = True
 
@@ -6110,12 +6134,14 @@ def _buy_params() -> dict:
 def load_trends_all():
     """화면에 보이는 국내 종목의 외국인·기관 수급(최근 20거래일). 처음엔 기다리지 않고 뒤에서 받아요."""
     codes = VIEW_CODES.get("heavy") or KR_CODES
+    _swr_seed(("trends_all", codes), lambda box: {c: box["trends"][c] for c in codes if c in box["trends"]})
     return swr(("trends_all", codes), 1800, lambda: data.fetch_stock_trends(codes, workers=6), first_wait=False)
 
 
 def load_fins_all():
     """화면에 보이는 국내 종목의 연간 영업이익(실적+전망). 12시간 기억, 처음엔 뒤에서 받아요."""
     codes = VIEW_CODES.get("heavy") or KR_CODES
+    _swr_seed(("fins_all", codes), lambda box: {c: box["fins"][c] for c in codes if c in box["fins"]})
     return swr(("fins_all", codes), 43200, lambda: data.fetch_financials_many(codes, workers=12), first_wait=False)
 
 

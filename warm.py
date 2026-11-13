@@ -28,7 +28,80 @@ def _js(x) -> str:
     return json.dumps(x, ensure_ascii=False, default=lambda v: v.item() if hasattr(v, "item") else str(v))
 
 
-def pack(histories: dict, shares: dict, h52: dict, meta: dict) -> bytes:
+def _frames_arrays(prefix: str, frames: dict) -> dict:
+    """{코드: 표 또는 None} → npz에 넣을 배열들(pickle 없이 열 단위로). 열 종류(dtype)는 그대로 되살려요."""
+    codes = sorted(c for c, v in frames.items() if v is not None and hasattr(v, "columns") and len(v))
+    nones = sorted(c for c, v in frames.items() if v is None or not hasattr(v, "columns") or not len(v))
+    out = {f"{prefix}__codes": np.array(codes, dtype="U12"), f"{prefix}__none": np.array(nones, dtype="U12")}
+    if not codes:
+        out[f"{prefix}__schema"] = np.array("[]")
+        return out
+    cols = list(frames[codes[0]].columns)
+    for c in codes:                                   # 열 구성이 다른 표가 섞이면 첫 표 기준(없는 열은 빈 값)
+        frames[c] = frames[c].reindex(columns=cols)
+    offs = np.cumsum([0] + [len(frames[c]) for c in codes]).astype("int64")
+    out[f"{prefix}__offs"] = offs
+    schema = []
+    for i, col in enumerate(cols):
+        parts = [frames[c][col] for c in codes]
+        ser = pd.concat(parts, ignore_index=True)
+        kind = str(ser.dtype)
+        if kind.startswith("datetime64"):
+            arr, k = pd.to_datetime(ser).values, "dt"
+        elif kind == "bool":
+            arr, k = ser.to_numpy(dtype=bool), "bool"
+        elif kind.startswith(("int", "uint", "float", "Int", "Float")):
+            arr, k = pd.to_numeric(ser, errors="coerce").to_numpy(dtype="float64"), kind
+        else:
+            null = ser.isna().to_numpy()
+            out[f"{prefix}__{i}__null"] = null
+            arr, k = ser.astype(str).to_numpy(dtype="U"), "obj"
+        out[f"{prefix}__{i}"] = arr
+        schema.append([str(col), k])
+    out[f"{prefix}__schema"] = np.array(json.dumps(schema, ensure_ascii=False))
+    # 표마다 원래 열 종류(정수 열에 빈 값이 있던 표만 float 등)를 그대로 되살리려고 따로 적어 둬요
+    out[f"{prefix}__dtypes"] = np.array(json.dumps([[str(t) for t in frames[c].dtypes] for c in codes]))
+    return out
+
+
+def _frames_from(z, prefix: str) -> dict:
+    if f"{prefix}__codes" not in z.files:
+        return {}
+    codes = z[f"{prefix}__codes"].tolist()
+    res = {c: None for c in z[f"{prefix}__none"].tolist()}
+    schema = json.loads(str(z[f"{prefix}__schema"]))
+    if not codes or not schema:
+        return res
+    offs = z[f"{prefix}__offs"]
+    cols = {}
+    for i, (name, k) in enumerate(schema):
+        a = z[f"{prefix}__{i}"]
+        if k == "obj":
+            a = a.astype(object)
+            a[z[f"{prefix}__{i}__null"]] = None
+        elif k not in ("dt", "bool"):
+            try:
+                a = a.astype(k) if not k.startswith(("Int", "Float")) else pd.array(a).astype(k)
+            except (TypeError, ValueError):
+                pass                                   # 정수 열에 빈 값이 섞였으면 float 그대로
+        cols[name] = a
+    per = json.loads(str(z[f"{prefix}__dtypes"])) if f"{prefix}__dtypes" in z.files else None
+    names = [n for n, _ in schema]
+    for j, c in enumerate(codes):
+        a, b = int(offs[j]), int(offs[j + 1])
+        df = pd.DataFrame({n: (v[a:b].copy() if hasattr(v, "copy") else v[a:b]) for n, v in cols.items()})
+        if per:
+            for n, t in zip(names, per[j]):
+                if str(df[n].dtype) != t:
+                    try:
+                        df[n] = df[n].astype(t)
+                    except (TypeError, ValueError):
+                        pass
+        res[c] = df
+    return res
+
+
+def pack(histories: dict, shares: dict, h52: dict, meta: dict, frames: dict | None = None) -> bytes:
     codes, names, offs = [], [], [0]
     dates, cols = [], {k: [] for k in _COLS}
     for c, res in sorted(histories.items()):
@@ -46,7 +119,8 @@ def pack(histories: dict, shares: dict, h52: dict, meta: dict) -> bytes:
         buf, codes=np.array(codes, dtype="U12"), names=np.array(names, dtype="U64"),
         offs=np.array(offs, dtype="int64"), dates=np.concatenate(dates) if dates else np.zeros(0, "int32"),
         **{k: (np.concatenate(v) if v else np.zeros(0, "float32")) for k, v in cols.items()},
-        shares=np.array(_js(shares)), h52=np.array(_js(h52)), meta=np.array(_js({**meta, "format": FORMAT})))
+        shares=np.array(_js(shares)), h52=np.array(_js(h52)), meta=np.array(_js({**meta, "format": FORMAT})),
+        **{k: v for name, fr in (frames or {}).items() for k, v in _frames_arrays(name, dict(fr)).items()})
     return buf.getvalue()
 
 
@@ -63,7 +137,8 @@ def unpack(raw: bytes) -> dict:
         a, b = int(offs[i]), int(offs[i + 1])
         df = pd.DataFrame({"date": dates[a:b], **{k: cols[k][a:b].copy() for k in _COLS}})
         hist[c] = (names[i] or None, df, None)
-    return {"hist": hist, "shares": json.loads(str(z["shares"])), "h52": json.loads(str(z["h52"])), "meta": meta}
+    frames = {name: _frames_from(z, name) for name in ("trends", "fins", "monthly")}
+    return {"hist": hist, "shares": json.loads(str(z["shares"])), "h52": json.loads(str(z["h52"])), "meta": meta, **frames}
 
 
 def load(data_version: str | None = None, timeout: float = 12.0) -> dict:
@@ -105,15 +180,25 @@ def build(out_path: str):
     t2 = time.time()
     h52 = data.fetch_official_52w(kr)
     t3 = time.time()
+    trends = data.fetch_stock_trends(kr, workers=8)          # 외국인·기관 수급(최근 20거래일)
+    fins = data.fetch_financials_many(kr, workers=8)         # 연간 영업이익(실적+전망)
+    monthly = data.fetch_monthlies(codes)                    # 역대 최고가용 월봉
+    monthly = {c: (None if m is None or m.empty or "high" not in m else
+                   pd.DataFrame({"date": pd.to_datetime(m["date"]).values,
+                                 "high": pd.to_numeric(m["high"], errors="coerce").astype("float32").values}))
+               for c, m in monthly.items()}
+    t4 = time.time()
     ok = sum(1 for r in hist.values() if r and r[1] is not None and not r[1].empty)
     meta = {"built": time.time(), "built_kst": data.now_kst().strftime("%Y-%m-%d %H:%M"),
             "data_version": data.DATA_VERSION, "n_codes": len(codes), "n_hist": ok,
             "n_shares": len(kr_sh) + len(os_sh), "n_h52": len(h52),
-            "secs": {"hist": round(t1 - t0), "shares": round(t2 - t1), "h52": round(t3 - t2)},
+            "secs": {"hist": round(t1 - t0), "shares": round(t2 - t1), "h52": round(t3 - t2), "extra": round(t4 - t3)},
+            "n_trends": sum(v is not None for v in trends.values()), "n_fins": sum(v is not None for v in fins.values()),
+            "n_monthly": sum(v is not None for v in monthly.values()),
             "shares_diag": {"kr": kr_diag, "os": os_diag}}
     if ok < 0.8 * len(codes) or len(kr_sh) < 0.8 * len(kr):
         raise SystemExit(f"받은 게 너무 적어서 저장 안 해요: {meta}")
-    raw = pack(hist, {**kr_sh, **os_sh}, h52, meta)
+    raw = pack(hist, {**kr_sh, **os_sh}, h52, meta, frames={"trends": trends, "fins": fins, "monthly": monthly})
     with open(out_path, "wb") as f:
         f.write(raw)
     print(_js({**meta, "bytes": len(raw)}))
