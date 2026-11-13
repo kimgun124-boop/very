@@ -1641,6 +1641,11 @@ def get_histories(codes, wait: bool = True, label: str = "") -> dict:
                             S["data"][c] = res
                             S["t"][c] = box["t"]
                 missing = [c for c in missing if c not in S["data"]]
+    elif not booting(180):
+        _wb = _warm_pack()
+        if _wb["hist"] or _wb.get("monthly"):           # (메모리) 켜지고 3분 지나도 안 쓴 묶음 일봉·월봉은 비워요
+            _wb["hist"] = {}
+            _wb["monthly"] = {}
     stale = [c for c in codes if c in S["data"] and now - S["t"].get(c, 0) > HIST_TTL]
     if missing and wait:
         with st.spinner(label or f"일봉 {len(missing):,}종목을 불러오는 중이에요(처음 한 번만)."):
@@ -10382,11 +10387,12 @@ def load_health(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_deposits() -> pd.DataFrame:
     _swr_seed(("deposits", DATA_VERSION), lambda box: (box.get("misc") or {}).get("deposits"))
-    t = swr(("deposits", DATA_VERSION), 3600, lambda: data.fetch_deposits(), "증시 자금(예탁금·신용잔고)을 불러오는 중이에요.")
+    # (속도 2026.11.13) 네이버 증시자금 페이지가 느리거나 막히면 첫 화면이 7~10초 멈췄어요 → 기다리지 않고 뒤에서 받아요(그동안 '-')
+    t = swr(("deposits", DATA_VERSION), 3600, lambda: data.fetch_deposits(), first_wait=False)
     if t is None or len(t) == 0:            # 실패는 오래 기억하지 않고 10분 뒤 다시 시도
         t = swr(("deposits_retry", DATA_VERSION, data.now_kst().strftime("%H%M")[:3]), 600, lambda: data.fetch_deposits(),
-                "증시 자금을 다시 불러오는 중이에요.")
-    return t
+                first_wait=False)
+    return t if t is not None else pd.DataFrame(columns=["date", "deposit", "credit", "credit_ratio", "credit_osc"])
 
 
 def _hl_tone(kind: str, v) -> tuple[str, str]:
