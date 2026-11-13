@@ -1,0 +1,37 @@
+name: _audit (temporary)
+on:
+  push:
+    branches: [audit-tmp]
+permissions:
+  contents: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: build warm pack
+        continue-on-error: true
+        run: mkdir -p out && (time python -W ignore warm.py build /tmp/warm.npz) 2>&1 | tail -5 | tee out/warm_build.txt; ls -la /tmp/warm.npz | tee -a out/warm_build.txt
+      - name: cold start with warm pack
+        continue-on-error: true
+        env:
+          WARM_URL: file:///tmp/warm.npz
+        run: timeout 1800 python _audit/cold.py app.py out 2>&1 | grep -v "ScriptRunContext\|No runtime found\|st.iframe\|will be removed\|Warning\|^$" | tee out/cold_log.txt
+      - name: render all tabs with warm pack
+        continue-on-error: true
+        env:
+          WARM_URL: file:///tmp/warm.npz
+        run: timeout 3000 python _audit/run_tabs.py app.py out/tabs.json 2>&1 | grep -v "ScriptRunContext\|No runtime found\|st.iframe\|will be removed\|Warning\|^$\|HTTP Error\|Failed down" | tee out/tabs_log.txt
+      - name: push results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -f out
+          git commit -m "audit results" || true
+          git push origin HEAD:refs/heads/audit-res -f
