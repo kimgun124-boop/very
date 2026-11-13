@@ -1,0 +1,48 @@
+[MEM] 11/13 02:14:10 rss=349MB sessions=-1 hist=766 light=0 swr=2 rows=766 threads=2
+first run 21.0s exc=0
+📋 리스트           2.6s exc=0 err=0 warn=0 dfs=5 elems=183
+⭐ 내 종목          1.7s exc=0 err=1 warn=0 dfs=1 elems=76
+   ERR: 계정 저장소의 열쇠가 맞지 않아요. 앱 주인에게 알려 주세요(GitHub 토큰을 바꿨다면 Secrets에 USERS_KEY_OLD = "gh:예전토큰").
+🕯️ 차트           1.9s exc=0 err=0 warn=0 dfs=1 elems=89
+📥 리포트           1.5s exc=0 err=0 warn=0 dfs=1 elems=88
+💼 내 보유          1.7s exc=0 err=0 warn=0 dfs=1 elems=85
+👀 보유 살피기        1.5s exc=0 err=0 warn=0 dfs=1 elems=84
+🏁 신고가 후보       19.6s exc=0 err=0 warn=0 dfs=1 elems=113
+🏔️ 신고가          3.3s exc=0 err=0 warn=0 dfs=1 elems=80
+🆕 신규상장          2.2s exc=0 err=0 warn=0 dfs=3 elems=87
+🔊 52주 최대 거래량    9.0s exc=0 err=0 warn=0 dfs=1 elems=88
+💥 거래량 폭발        4.0s exc=0 err=0 warn=0 dfs=1 elems=107
+🏭 인더스트리 액션      2.7s exc=0 err=1 warn=1 dfs=1 elems=131
+   ERR: 코스피·코스닥이 60일선 아래 — 원칙상 돌파매매 쉬는 구간이에요. 아래는 참고용.
+🎯 매수 후보         1.9s exc=0 err=1 warn=0 dfs=1 elems=92
+   ERR: 매수 쉬는 구간 — 코스피·코스닥 둘 다 60일선 위일 때만. 아래는 참고용이에요.
+🎯 초기 매수         2.1s exc=0 err=0 warn=1 dfs=2 elems=96
+🪃 눌림 타점         2.9s exc=0 err=1 warn=0 dfs=1 elems=93
+   ERR: 코스피·코스닥 중 60일선 아래가 있어요. 원칙상 신규 매수는 쉬는 구간 — 아래는 공부·대기용이에요.
+⚖️ 1:2:6 매매    12.3s exc=0 err=0 warn=0 dfs=1 elems=101
+🌙 종가배팅          3.7s exc=0 err=0 warn=0 dfs=2 elems=90
+🗺️ 큰 그림         1.9s exc=0 err=0 warn=0 dfs=2 elems=85
+💰 거래대금          2.2s exc=0 err=0 warn=0 dfs=3 elems=91
+🚀 급상승           3.4s exc=0 err=0 warn=0 dfs=2 elems=76
+🔭 차기 주도         3.3s exc=0 err=0 warn=0 dfs=3 elems=92
+🌱 회복 리더         4.4s exc=0 err=0 warn=0 dfs=3 elems=126
+🪜 증거 쌓기         3.0s exc=0 err=0 warn=0 dfs=2 elems=105
+🌏 글로벌 피어        3.4s exc=0 err=0 warn=0 dfs=2 elems=82
+🚦 시장 신호         6.4s exc=0 err=0 warn=0 dfs=7 elems=143
+📉 하락장 점검        3.0s exc=0 err=0 warn=0 dfs=4 elems=134
+🧭 시나리오          3.8s exc=0 err=0 warn=0 dfs=2 elems=120
+📣 실적·지분        10.6s exc=0 err=0 warn=0 dfs=2 elems=84
+💵 현금창출          3.3s exc=0 err=0 warn=0 dfs=2 elems=99
+💵 현금창출          2.2s exc=0 err=0 warn=0 dfs=2 elems=99
+📣 실적·지분         2.5s exc=0 err=0 warn=0 dfs=2 elems=84
+🧭 시나리오          2.5s exc=0 err=0 warn=0 dfs=2 elems=120
+📉 하락장 점검        3.1s exc=0 err=0 warn=0 dfs=4 elems=134
+🚦 시장 신호         2.9s exc=0 err=0 warn=0 dfs=7 elems=143
+🌏 글로벌 피어        2.8s exc=0 err=0 warn=0 dfs=2 elems=82
+Exception in thread Thread-20 (work):
+Traceback (most recent call last):
+  File "/opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/runner/work/very/very/app.py", line 9033, in work

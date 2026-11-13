@@ -1,0 +1,6 @@
+{"built": 1794535931.9311502, "built_kst": "2026-11-13 11:12", "data_version": "2026-11-12-ipo", "n_codes": 766, "n_hist": 766, "n_shares": 766, "n_h52": 580, "secs": {"hist": 28, "shares": 33, "h52": 15, "extra": 73}, "n_trends": 580, "n_fins": 578, "n_monthly": 766, "shares_diag": {"kr": {"total": 580, "상세API": 580, "순위표": 0, "종목페이지": 0, "모바일": 0}, "os": {"total": 186, "SEC": 149, "네이버": 17, "야후": 20, "미국 외": 30}}, "bytes": 4351669}
+
+real	2m31.930s
+user	0m35.400s
+sys	0m1.585s
+-rw-r--r-- 1 runner runner 4351669 Nov 13 02:12 /tmp/warm.npz

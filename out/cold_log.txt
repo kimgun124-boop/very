@@ -1,0 +1,4 @@
+[MEM] 11/13 02:12:28 rss=353MB sessions=-1 hist=766 light=0 swr=2 rows=766 threads=2
+COLD first run 30.4s exc=[]
+NEW VISITOR after 5s: 3.4s exc=0
+NEW VISITOR after 60s: 6.4s exc=0
