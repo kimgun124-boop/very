@@ -1138,9 +1138,298 @@
    "urls": [
     "https://t.me/maddingStock/18888"
    ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "KX하이텍",
+   "code": "052900",
+   "op": 96.0,
+   "sales": null,
+   "cons": null,
+   "beat": 50.5,
+   "yoy": 287.6,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "후성",
+   "code": "093370",
+   "op": 360.0,
+   "sales": null,
+   "cons": null,
+   "beat": 48.5,
+   "yoy": 517.9,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "SK",
+   "code": "034730",
+   "op": 50278.0,
+   "sales": null,
+   "cons": null,
+   "beat": 45.6,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "유니셈",
+   "code": "036200",
+   "op": 127.0,
+   "sales": null,
+   "cons": null,
+   "beat": 26.7,
+   "yoy": 631.0,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "오로라",
+   "code": "039830",
+   "op": 194.0,
+   "sales": null,
+   "cons": null,
+   "beat": 23.8,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "네오셈",
+   "code": "253590",
+   "op": 192.0,
+   "sales": null,
+   "cons": null,
+   "beat": 21.4,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "GST",
+   "code": "083450",
+   "op": 269.0,
+   "sales": null,
+   "cons": null,
+   "beat": 18.8,
+   "yoy": 61.6,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "모나용평",
+   "code": "070960",
+   "op": 73.0,
+   "sales": null,
+   "cons": null,
+   "beat": 18.7,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "파인엠텍",
+   "code": "441270",
+   "op": 215.0,
+   "sales": null,
+   "cons": null,
+   "beat": 17.0,
+   "yoy": 1298.4,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "티에스이",
+   "code": "131290",
+   "op": 527.0,
+   "sales": null,
+   "cons": null,
+   "beat": 16.1,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "KX",
+   "code": "122450",
+   "op": 216.0,
+   "sales": null,
+   "cons": null,
+   "beat": 14.3,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "삼진제약",
+   "code": "005500",
+   "op": 119.0,
+   "sales": null,
+   "cons": null,
+   "beat": 13.6,
+   "yoy": 22.0,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "KCC건설",
+   "code": "021320",
+   "op": 532.0,
+   "sales": null,
+   "cons": null,
+   "beat": 13.4,
+   "yoy": 73.6,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "HPSP",
+   "code": "403870",
+   "op": 278.0,
+   "sales": null,
+   "cons": null,
+   "beat": 12.3,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "네패스",
+   "code": "033640",
+   "op": 167.0,
+   "sales": null,
+   "cons": null,
+   "beat": 11.1,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "퓨릿",
+   "code": "445180",
+   "op": 60.0,
+   "sales": null,
+   "cons": null,
+   "beat": 10.2,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
+  },
+  {
+   "date": "2026-11-16",
+   "name": "쿠콘",
+   "code": "294570",
+   "op": 51.0,
+   "sales": null,
+   "cons": null,
+   "beat": 10.1,
+   "yoy": null,
+   "quarter": "3Q26",
+   "src": "스탁이지",
+   "url": "https://t.me/maddingStock/19541",
+   "post_id": 19541,
+   "urls": [
+    "https://t.me/maddingStock/19541"
+   ]
   }
  ],
- "updated": "2026-11-14T18:27+09:00",
+ "updated": "2026-11-17T08:56+09:00",
  "stakes": [
   {
    "date": "2026-10-22",
