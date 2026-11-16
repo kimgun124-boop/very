@@ -1441,6 +1441,25 @@ def mem_guard(keep: set | None = None):
     return rss_mb()
 
 
+_UI = {"n": 0}       # 지금 화면을 그리는 중인 실행 수(모든 접속자)
+
+
+class ui_busy:
+    """화면을 그리는 동안 표시해 두면, 뒤에서 전 종목을 받는 일꾼들이 잠깐 비켜 줘요(파이썬은 한 번에 한 일만 해서
+    뒤 작업이 바쁘면 탭 화면이 몇 초씩 늦게 떴어요)."""
+    def __enter__(self):
+        _UI["n"] += 1
+    def __exit__(self, *a):
+        _UI["n"] = max(0, _UI["n"] - 1)
+
+
+def ui_yield(max_wait: float = 6.0) -> None:
+    """뒤 작업용: 누군가 화면을 그리는 중이면 끝날 때까지(최대 max_wait초) 잠깐 쉬어요."""
+    t = time.time()
+    while _UI["n"] > 0 and time.time() - t < max_wait:
+        time.sleep(0.05)
+
+
 def _swr_seed(key, make):
     """⚡ swr 창고가 비어 있으면 빠른 시작 묶음 값으로 먼저 채워요(오래된 값 → swr이 뒤에서 새로 받아요)."""
     store = _bg_store()
@@ -1910,6 +1929,7 @@ def load_monthlies(codes: tuple[str, ...], trim: bool = True):
         try:
             for i in range(0, len(need), 120):                   # 120종목씩 나눠 받아서 받은 만큼 바로 쓰게
                 part = need[i:i + 120]
+                ui_yield()
                 got = data.fetch_monthlies(part)
                 t = time.time()
                 with ms["lock"]:
@@ -9053,6 +9073,7 @@ def _scan_bg(codes: tuple[str, ...]):
                 cnt = data.SCAN_BARS if kind == "full" else 10
                 for i in range(0, len(todo), SCAN_CHUNK):
                     part = todo[i:i + SCAN_CHUNK]
+                    ui_yield()                                   # ⚡ 화면을 그리는 중이면 잠깐 비켜요
                     from concurrent.futures import ThreadPoolExecutor
                     with ThreadPoolExecutor(max_workers=6) as pool:
                         got = list(pool.map(lambda c: (c, data.fetch_history(c, cnt)[1]), part))
@@ -9060,6 +9081,7 @@ def _scan_bg(codes: tuple[str, ...]):
                     if miss and len(miss) < len(part):          # 네이버가 잠깐 막으면 천천히 한 번 더
                         time.sleep(2)
                         got += [(c, data.fetch_history(c, cnt)[1]) for c in miss]
+                    ui_yield()
                     with S["lock"]:
                         for c, h in got:
                             a = data.bars_to_arr(h)
@@ -9080,10 +9102,11 @@ def _scan_bg(codes: tuple[str, ...]):
     threading.Thread(target=work, daemon=True).start()
 
 
-@st.cache_data(ttl=30, show_spinner=False, max_entries=4)
 def load_scan_quotes(codes: tuple[str, ...]) -> dict:
-    """전 종목 실시간 시세(40종목씩 묶어 요청, 30초 기억)."""
-    return data.fetch_quotes(codes)[0]
+    """전 종목 실시간 시세(40종목씩 묶어 요청, 30초마다 새로).
+    ⚡ 예전엔 30초가 지난 뒤 탭을 누르면 전 종목 시세를 다 받을 때까지(몇 초) 화면이 멈췄어요
+    → 이제 지난 시세로 바로 그리고 새 시세는 뒤에서 받아요(처음 한 번만 기다려요). 보드 종목은 늘 실시간 시세로 덮어써요."""
+    return swr(("scan_quotes", codes), 30, lambda: data.fetch_quotes(codes)[0], "전 종목 시세를 불러오는 중이에요.") or {}
 
 
 def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
@@ -12029,24 +12052,16 @@ NAV_DESC = {
 _NAV_OF = {t: gi for gi, (_, ts) in enumerate(NAV_GROUPS) for t in ts}
 
 
-def _nav_pick_group():
-    ss = st.session_state
-    gi = [g for g, _ in NAV_GROUPS].index(ss.get("nav_group") or NAV_GROUPS[0][0])
-    last = ss.setdefault("nav_last", {})
-    ss["main_tab_sel"] = last.get(gi) or NAV_GROUPS[gi][1][0]
-
-
-def _nav_pick_tab(gi: int):
-    ss = st.session_state
-    t = ss.get(f"nav_tab_{gi}")
-    if t:
-        ss["main_tab_sel"] = t
-        ss.setdefault("nav_last", {})[gi] = t
-
-
 def main_nav() -> str:
-    """1줄: 6개 묶음 카드 · 2줄: 고른 묶음의 탭 알약 · 3줄: 지금 탭 한 줄 설명. 보고 있는 탭만 계산해요."""
+    """1줄: 6개 묶음 카드 · 2줄: 고른 묶음의 탭 알약 · 3줄: 지금 탭 한 줄 설명. 보고 있는 탭만 계산해요.
+    ⚡ 탭이 전 탭으로 되돌아가던 원인과 고친 방법:
+      예전엔 누를 때마다 '콜백'이 지금 탭을 바꾸고, 매번 서버가 두 선택 막대 값을 다시 써 넣었어요.
+      그러다 자동 새로고침·바쁜 화면 때문에 신호 여러 개가 한꺼번에 도착하면 묶음 막대와 탭 막대가 서로 다른 값을 내서
+      📋 리스트 같은 전 탭으로 돌아갔어요.
+    → 이제 콜백 없이 '화면의 막대 값'만 믿어요(가장 마지막에 누른 값이 이겨요).
+      서버가 막대 값을 써 넣는 건 처음 켤 때와 다른 곳(차트 링크 등)에서 탭을 옮길 때뿐이에요."""
     ss = st.session_state
+    groups = [g for g, _ in NAV_GROUPS]
     try:                          # 매매 보드 안 링크(?tab=탭 이름)로 탭 이동
         qt = st.query_params.get("tab")
         if qt:
@@ -12055,25 +12070,43 @@ def main_nav() -> str:
             del st.query_params["tab"]
     except Exception:  # noqa: BLE001
         pass
-    cur = ss.get("main_tab_sel")
-    if cur not in _NAV_OF:
-        cur = NAV_GROUPS[0][1][0]
-        ss["main_tab_sel"] = cur
-    gi = _NAV_OF[cur]
-    ss["nav_group"] = NAV_GROUPS[gi][0]               # 다른 곳(차트 링크 등)에서 탭을 바꿔도 묶음이 따라가요
-    ss[f"nav_tab_{gi}"] = cur
-    ss.setdefault("nav_last", {})[gi] = cur
+    want = ss.get("main_tab_sel")
+    if want not in _NAV_OF:
+        # 서버가 다시 켜지거나 연결이 끊겼다 이어져도 보던 탭으로 돌아오게(주소 끝 ?t= 에 기억)
+        try:
+            qt = st.query_params.get("t")
+        except Exception:  # noqa: BLE001
+            qt = None
+        want = qt if qt in _NAV_OF else NAV_GROUPS[0][1][0]
+    last = ss.setdefault("nav_last", {})
+    if want != ss.get("_nav_seen"):                 # 처음이거나, 다른 곳에서 탭을 옮겼을 때만 막대 값을 맞춰요
+        wg = _NAV_OF[want]
+        ss["nav_group"] = groups[wg]
+        ss[f"nav_tab_{wg}"] = want
+        last[wg] = want
+    g = ss.get("nav_group")
+    gi = groups.index(g) if g in groups else _NAV_OF[want]
+    if ss.get(f"nav_tab_{gi}") not in NAV_GROUPS[gi][1]:   # 이 묶음 탭 막대를 새로 그릴 때: 그 묶음에서 마지막에 본 탭
+        ss[f"nav_tab_{gi}"] = last.get(gi) or NAV_GROUPS[gi][1][0]
     with st.container(key="main_nav"):
         try:
-            st.segmented_control("묶음", [g for g, _ in NAV_GROUPS], key="nav_group", on_change=_nav_pick_group,
-                                 label_visibility="collapsed", required=True, width="stretch")
+            g = st.segmented_control("묶음", groups, key="nav_group", label_visibility="collapsed", required=True,
+                                     width="stretch")
         except TypeError:          # 예전 Streamlit(width 없음)
-            st.segmented_control("묶음", [g for g, _ in NAV_GROUPS], key="nav_group", on_change=_nav_pick_group,
-                                 label_visibility="collapsed", required=True)
-        st.segmented_control("탭", NAV_GROUPS[gi][1], key=f"nav_tab_{gi}", on_change=_nav_pick_tab, args=(gi,),
-                             label_visibility="collapsed", required=True)
+            g = st.segmented_control("묶음", groups, key="nav_group", label_visibility="collapsed", required=True)
+        cur = st.segmented_control("탭", NAV_GROUPS[gi][1], key=f"nav_tab_{gi}", label_visibility="collapsed",
+                                   required=True)
+        if cur not in _NAV_OF:
+            cur = last.get(gi) or NAV_GROUPS[gi][1][0]
         st.markdown(f'<div class="nav-desc"><b>{html.escape(cur)}</b> — {html.escape(NAV_DESC.get(cur, ""))}</div>',
                     unsafe_allow_html=True)
+    ss["main_tab_sel"] = ss["_nav_seen"] = cur
+    last[gi] = cur
+    try:
+        if st.query_params.get("t") != cur:
+            st.query_params["t"] = cur
+    except Exception:  # noqa: BLE001
+        pass
     return cur
 
 
@@ -12205,16 +12238,61 @@ def render_board():
         "🌙 종가배팅": lambda: render_zongbae(df),
     }
     MAIN_TABS_LAZY["v"] = True
+    st.session_state["_tab_jobs"] = jobs          # ⚡ 탭 칸(따로 도는 조각)이 이 표(df)를 그대로 써요
+    _prefetch_scan_quotes()
+
+
+def _prefetch_scan_quotes() -> None:
+    """⚡ 🏁 신고가 후보 등이 쓰는 전 종목 시세를 아직 한 번도 안 받았으면 뒤에서 미리 받아 둬요
+    (처음 그 탭을 누를 때 몇 초 기다리지 않게). 이미 있으면 아무것도 안 해요(새로 받기는 그 탭이 30초마다)."""
+    try:
+        uni = swr(("krx_universe", "v2"), 86400, data.fetch_krx_universe, first_wait=False, empty=[]) or []
+        if uni:
+            codes = tuple(sorted({u["code"] for u in uni}))
+            swr(("scan_quotes", codes), 10 ** 9, lambda: data.fetch_quotes(codes)[0], first_wait=False, empty={})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def render_tab_area():
+    """⚡ 메뉴(묶음·탭)와 탭 내용만 따로 다시 그려요(보드와 따로 도는 조각).
+    예전엔 탭을 누를 때마다 시세·표 계산·첫 화면 보드(매매 보드·경제지표·섹터 카드)까지 모두 다시 해서 2~3초 걸렸고,
+    자동 새로고침이 메뉴까지 다시 그리는 순간에 탭을 누르면 전 탭으로 되돌아가기도 했어요
+    → 이제 탭을 누르면 이 칸만 다시 그려요. 보드의 자동 새로고침은 메뉴를 건드리지 않고,
+      이 칸은 같은 간격으로 따로 새 표를 받아 그려요."""
+    with ui_busy():
+        _render_tab_area()
+
+
+def _render_tab_area():
+    jobs = st.session_state.get("_tab_jobs") or {}
     cur = main_nav()
+    if not jobs:
+        st.info("보드를 준비하는 중이에요. 잠시만요…")
+        return
     with st.container(key="main_body"):
         _t0 = rss_mb()
-        jobs.get(cur, jobs["📋 리스트"])()
+        try:
+            jobs.get(cur, jobs["📋 리스트"])()
+        except Exception as _e:  # noqa: BLE001 — 한 탭이 실패해도 앱이 처음 화면으로 튕기지 않게
+            st.warning(f"'{cur}' 탭을 그리는 중 문제가 생겼어요({type(_e).__name__}). 잠시 뒤 다시 눌러 주세요. "
+                       "다른 탭은 그대로 쓸 수 있어요.")
+            _log_tab_err(cur, _e)
         _PHASE["탭"] = (_t0, rss_mb())
     _t0 = rss_mb()
     _TRIM_T[0] = 0.0 if rss_mb() - (_PHASE.get("_low") or 1e9) > 150 else _TRIM_T[0]   # 많이 늘었으면 바로 정리
     trim_maybe()
     _PHASE["정리(gc·trim)"] = (_t0, rss_mb())
     _PHASE["_low"] = min(_PHASE.get("_low") or 1e9, rss_mb())
+
+
+def _log_tab_err(tab: str, e: Exception) -> None:
+    """탭 오류를 서버 기록에 남겨요(화면에는 짧은 안내만)."""
+    try:
+        import traceback
+        print(f"[탭 오류] {tab}: {type(e).__name__}: {e}\n" + "".join(traceback.format_exc()[-2000:]), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _attach_flows(f: pd.DataFrame) -> pd.DataFrame:
@@ -12283,3 +12361,4 @@ def render_list(df, histories, quote_error, shares_store, fins_all=None):
 
 theme.header("밸류체인 신고가 보드", "공부 자료 속 종목 · 52주 신고가 · 거래대금 흐름을 한눈에", "📈 실시간")
 st.fragment(render_board, run_every=REFRESH[refresh_label])()
+st.fragment(render_tab_area, run_every=REFRESH[refresh_label])()   # ⚡ 메뉴·탭은 따로(누르면 이 칸만)
