@@ -20,6 +20,9 @@ jobs:
           timeout 1500 python tools/perf_probe.py | tee probe.log || true
           sudo pkill -INT py-spy || true; sleep 5
           tail -200 st.log > st_tail.log
+          echo '===== PROFILE =====' && python tools/perf_agg.py spy.txt 26 || true
+          echo '===== BOARD =====' && python tools/perf_board.py spy.txt || true
+          echo '===== ERRORS =====' && grep -iE 'traceback|탭 오류|error' st.log | head -40 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
