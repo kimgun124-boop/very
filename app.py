@@ -1433,6 +1433,55 @@ def bg_sim(store: dict, key: tuple, stable: tuple, fn, spinner: str):
     return res, False
 
 
+_PC_STORES: dict = {}
+
+
+def per_code_swr(name: str, codes, ttl: float, fetch, cold_frac: float = 0.5) -> dict:
+    """⚡ 종목별로 따로 기억하는 실시간 자료(넥장 시세·공식 52주·수급 등).
+    - 가진 자료는 바로 돌려주고, 오래된(ttl 초 지남)·없는 종목만 뒤에서 받아요.
+    - 처음이라 대부분 없으면(cold_frac 넘게) 그때만 기다려서 받아요.
+    - 받다가 실패한 종목은 '없음'으로 둬요(지어낸 값을 넣지 않아요). fetch(codes) → {코드: 값}"""
+    S = _PC_STORES.setdefault(name, {"items": {}, "busy": False, "lock": threading.Lock()})
+    codes = list(codes)
+    now = time.time()
+    with S["lock"]:
+        items = S["items"]
+        miss = [c for c in codes if c not in items]
+        old = [c for c in codes if c in items and now - items[c][0] > ttl]
+
+    def run(need):
+        try:
+            got = fetch(tuple(need)) or {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"[per_code_swr:{name}] {type(exc).__name__}: {exc}", flush=True)
+            got = {}
+        t = time.time()
+        with S["lock"]:
+            for c in need:
+                v = got.get(c)
+                if v is not None:
+                    S["items"][c] = (t, v)
+                elif c not in S["items"]:
+                    S["items"][c] = (t - ttl + min(ttl, 60), None)     # 못 받음 → 1분 뒤 다시
+            if len(S["items"]) > 6000:
+                for c in sorted(S["items"], key=lambda k: S["items"][k][0])[:2000]:
+                    S["items"].pop(c, None)
+
+    if codes and len(miss) > len(codes) * cold_frac:
+        run(miss + old)
+    elif (miss or old) and not S["busy"] and rss_mb() < MEM_SOFT:
+        S["busy"] = True
+
+        def work(need=miss + old):
+            try:
+                run(need)
+            finally:
+                S["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+    with S["lock"]:
+        return {c: S["items"][c][1] for c in codes if c in S["items"] and S["items"][c][1] is not None}
+
+
 def _free_extra():
     """(메모리) 모의 계좌·피어 계산 결과와 보드 밖 종목 일봉 기억을 비워요 — 다시 열면 새로 계산해요."""
     _memo_store().get("tab", {}).clear()
@@ -7516,9 +7565,20 @@ def _track_save(store: dict) -> str:
     return "이 서버에만 저장(GITHUB_TOKEN 없음)"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_surprises(since_iso: str):
-    return tracker.collect_surprises(date.fromisoformat(since_iso))
+class _SurpriseLoader:
+    """어닝 서프라이즈 모음(30분마다 새로). ⚡ 지난 모음을 바로 보여주고 새 모음은 뒤에서 받아요(처음 한 번만 기다림)."""
+    def __call__(self, since_iso: str):
+        return swr(("surprises", since_iso), 1800, lambda: tracker.collect_surprises(date.fromisoformat(since_iso)),
+                   "어닝 서프라이즈를 모으는 중이에요.") or ([], [])
+
+    def clear(self):
+        st_ = _bg_store()
+        with st_["lock"]:
+            for k in [k for k in st_["items"] if isinstance(k, tuple) and k and k[0] == "surprises"]:
+                st_["items"].pop(k, None)
+
+
+load_surprises = _SurpriseLoader()
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -7696,15 +7756,15 @@ def load_peers(df: pd.DataFrame, histories: dict | None = None) -> list[dict]:
     """분류별 국내 vs 해외 피어 vs 수요처(5분 기억). 일봉은 이미 받아 둔 보드 일봉을 그대로 써요(새로 받지 않음)."""
     now = data.now_kst()
     key = (now.date(), now.hour * 12 + now.minute // 5, len(df))
-    if key not in _PEER_MEMO:
-        h = histories if histories is not None else _hist_store()["data"]
+    h = histories if histories is not None else _hist_store()["data"]
+
+    def calc():
         try:
-            res = views.peer_table(df, h)
+            return views.peer_table(df, h)
         except Exception:  # noqa: BLE001
-            res = []
-        _PEER_MEMO.clear()
-        _PEER_MEMO[key] = res
-    return _PEER_MEMO[key]
+            return []
+    res, _old = bg_sim(_PEER_MEMO, key, ("peers", len(df) // 50), calc, "국내·해외 피어를 맞춰 보는 중…")
+    return res
 
 
 def _views_box(keys: tuple[str, ...] | None = None, title: str = "📚 관점 노트 — 깡토 × 너쟁이(추노)"):
@@ -8348,7 +8408,10 @@ def render_zongbae(df: pd.DataFrame):
         else:
             codes = tuple(cand["code"].head(40))
             try:
-                trends = {**(_TRENDS_BG.get("v") or {}), **load_trends(tuple(c for c in codes if (_TRENDS_BG.get("v") or {}).get(c) is None))}
+                bgt = _TRENDS_BG.get("v") or {}
+                # ⚡ 보드 수급(뒤에서 받아 둔 것) + 후보만 종목별로 기억해 둔 수급. 처음 보는 후보는 뒤에서 받고 잠깐 '확인 중'
+                trends = {**bgt, **per_code_swr("trend", [c for c in codes if bgt.get(c) is None], 600,
+                                                lambda cs: data.fetch_stock_trends(cs), cold_frac=0.8)}
             except Exception:  # noqa: BLE001
                 trends = _TRENDS_BG.get("v") or {}
             grp_hot = cand.groupby("group").size()
@@ -9082,9 +9145,16 @@ def render_ath(df: pd.DataFrame, quotes: dict):
         st.markdown(_ath_table(renew, sub_fn=sub, by_sector=False, sort_col="_k"), unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=15, show_spinner=False, max_entries=20)
 def load_nxt_quotes(codes: tuple[str, ...]):
-    return data.fetch_nxt_quotes(codes)
+    """넥스트레이드 시세(15초마다 새로). ⚡ 종목별로 기억해서 후보가 조금 바뀌어도 바로 보여주고, 새 값은 뒤에서 받아요."""
+    err = []
+
+    def fetch(cs):
+        q, e = data.fetch_nxt_quotes(cs)
+        if e:
+            err.append(e)
+        return q
+    return per_code_swr("nxt", codes, 15, fetch), (err[0] if err else None)
 
 
 # ── 🏁 신고가 후보 전용: 코스피·코스닥 전 종목 일봉(가벼운 배열)을 뒤에서 받아 두는 곳 ──
@@ -9165,7 +9235,9 @@ def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
     now = time.time()
     with ms["lock"]:
         need = [c for c in codes if c not in ms["items"] or now - ms["items"][c][0] > 21600]
-    if need:
+        miss = [c for c in need if c not in ms["items"]]
+
+    def run(need):
         got = data.fetch_monthlies(tuple(need), workers=8)
         t = time.time()
         with ms["lock"]:
@@ -9175,6 +9247,21 @@ def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
                     ms["items"][c] = (t, df_)
                 elif c not in ms["items"]:
                     ms["items"][c] = (t - 21600 + 1800, None)
+    if need:
+        # ⚡ 대부분 있으면(새 후보 몇 개만 없음) 뒤에서 받아요 — 그 종목은 잠깐 '역사적 신고가 확인 중'으로 보여요
+        if len(miss) > max(3, len(codes) * 0.3):
+            run(need)
+        elif not ms.get("cand_busy"):
+            ms["cand_busy"] = True
+
+            def work(need=need):
+                try:
+                    run(need)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    ms["cand_busy"] = False
+            threading.Thread(target=work, daemon=True).start()
     with ms["lock"]:
         return {c: ms["items"][c][1] for c in codes if c in ms["items"] and ms["items"][c][1] is not None}
 
@@ -9215,9 +9302,9 @@ def _nh_hist_for(codes, src) -> dict:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False, max_entries=20)
 def load_official_52w_cand(codes: tuple[str, ...]) -> dict:
-    return data.fetch_official_52w(codes)
+    """네이버 공식 52주 최고·최저(10분 기억, 종목별). 못 받은 종목은 빠져요(일봉 계산값을 그대로 써요)."""
+    return per_code_swr("off52", codes, 600, data.fetch_official_52w)
 
 
 def _ago_txt(r) -> str:
@@ -11561,12 +11648,9 @@ def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
 
     now = data.now_kst()
     key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), p["retest_tol"], p["rsi_weak"])
-    res = _T126_MEMO.get(key)
-    if res is None:
-        with st.spinner("RSI · MACD · 일목 계산 중…"):
-            res = data.t126_screen(df, histories, quotes, p)
-        _T126_MEMO.clear()
-        _T126_MEMO[key] = res
+    # ⚡ 5분마다 새로 계산하되, 새 계산은 뒤에서 하고 그동안은 바로 전(5분 안쪽) 실제 계산을 보여줘요
+    res, _old = bg_sim(_T126_MEMO, key, (p["retest_tol"], p["rsi_weak"]),
+                       lambda: data.t126_screen(df, histories, quotes, p), "RSI · MACD · 일목 계산 중…")
     if res.empty:
         st.info("일봉이 아직 부족해요. 잠시 뒤 다시 볼게요.")
         return
@@ -12323,6 +12407,10 @@ def _prefetch_scan_quotes() -> None:
         if uni:
             codes = tuple(sorted({u["code"] for u in uni}))
             swr(("scan_quotes", codes), 10 ** 9, lambda: data.fetch_quotes(codes)[0], first_wait=False, empty={})
+        # 📣 실적·지분 탭 기본값(10월 1일부터)도 미리 모아 둬요(처음 열 때 10초 넘게 걸렸어요)
+        since = date(data.now_kst().year, 10, 1).isoformat()
+        swr(("surprises", since), 10 ** 9, lambda: tracker.collect_surprises(date.fromisoformat(since)),
+            first_wait=False, empty=([], []))
     except Exception:  # noqa: BLE001
         pass
 
