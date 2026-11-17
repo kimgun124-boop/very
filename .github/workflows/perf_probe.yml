@@ -1,0 +1,31 @@
+name: 🔬 탭 속도 점검 (perf-probe 가지 전용)
+on:
+  push:
+    branches: [perf-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt playwright py-spy && python -m playwright install --with-deps chromium
+      - name: run app + probe
+        run: |
+          nohup streamlit run app.py --server.port 8501 --server.headless true > st.log 2>&1 &
+          sleep 8
+          PID=$(pgrep -f "streamlit run" | head -1)
+          sudo env "PATH=$PATH" py-spy record -p $PID -d 1500 -r 50 -f raw -o spy.txt --nonblocking > /dev/null 2>&1 &
+          timeout 1500 python tools/perf_probe.py | tee probe.log || true
+          sudo pkill -INT py-spy || true; sleep 5
+          tail -200 st.log > st_tail.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf
+          path: |
+            probe.log
+            perf_result.json
+            spy.txt
+            st_tail.log
