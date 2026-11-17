@@ -1395,6 +1395,93 @@ def rss_mb() -> float:
         return 0.0
 
 
+def bg_sim(store: dict, key: tuple, stable: tuple, fn, spinner: str):
+    """⚡ 모의 계좌처럼 몇 초 걸리는 계산: 같은 설정(stable)으로 계산해 둔 게 있으면 그걸 바로 보여주고,
+    시각·자료가 바뀐 새 계산(key)은 뒤에서 해요(끝나면 다음에 열 때 새 값). 처음 한 번만 기다려요.
+    계산 재료는 모두 실제 일봉·시세라서 '조금 전 시각의 실제 계산'일 뿐 지어낸 값은 없어요(계산 시각을 같이 보여줘요)."""
+    hit = store.get(key)
+    if hit is not None:
+        return hit, False
+    last = store.get(("_last", stable))
+    if last is not None:
+        if not store.get(("_busy", stable)):
+            store[("_busy", stable)] = True
+
+            def work():
+                try:
+                    res = fn()
+                    res = {**res, "_calc_at": data.now_kst().strftime("%H:%M")} if isinstance(res, dict) else res
+                    for k in [k for k in store if not (isinstance(k, tuple) and k and k[0] in ("_last", "_busy"))]:
+                        store.pop(k, None)
+                    store[key] = res
+                    store[("_last", stable)] = res
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[bg_sim] {type(exc).__name__}: {exc}", flush=True)
+                finally:
+                    store.pop(("_busy", stable), None)
+            threading.Thread(target=work, daemon=True).start()
+        return last, True
+    with st.spinner(spinner):
+        res = fn()
+    res = {**res, "_calc_at": data.now_kst().strftime("%H:%M")} if isinstance(res, dict) else res
+    for k in [k for k in store if not (isinstance(k, tuple) and k and k[0] in ("_last", "_busy"))]:
+        store.pop(k, None)
+    for k in [k for k in store if isinstance(k, tuple) and k and k[0] == "_last" and k[1] != stable]:
+        store.pop(k, None)                   # 다른 설정의 지난 값은 버려요(메모리)
+    store[key] = res
+    store[("_last", stable)] = res
+    return res, False
+
+
+_PC_STORES: dict = {}
+
+
+def per_code_swr(name: str, codes, ttl: float, fetch, cold_frac: float = 0.5) -> dict:
+    """⚡ 종목별로 따로 기억하는 실시간 자료(넥장 시세·공식 52주·수급 등).
+    - 가진 자료는 바로 돌려주고, 오래된(ttl 초 지남)·없는 종목만 뒤에서 받아요.
+    - 처음이라 대부분 없으면(cold_frac 넘게) 그때만 기다려서 받아요.
+    - 받다가 실패한 종목은 '없음'으로 둬요(지어낸 값을 넣지 않아요). fetch(codes) → {코드: 값}"""
+    S = _PC_STORES.setdefault(name, {"items": {}, "busy": False, "lock": threading.Lock()})
+    codes = list(codes)
+    now = time.time()
+    with S["lock"]:
+        items = S["items"]
+        miss = [c for c in codes if c not in items]
+        old = [c for c in codes if c in items and now - items[c][0] > ttl]
+
+    def run(need):
+        try:
+            got = fetch(tuple(need)) or {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"[per_code_swr:{name}] {type(exc).__name__}: {exc}", flush=True)
+            got = {}
+        t = time.time()
+        with S["lock"]:
+            for c in need:
+                v = got.get(c)
+                if v is not None:
+                    S["items"][c] = (t, v)
+                elif c not in S["items"]:
+                    S["items"][c] = (t - ttl + min(ttl, 60), None)     # 못 받음 → 1분 뒤 다시
+            if len(S["items"]) > 6000:
+                for c in sorted(S["items"], key=lambda k: S["items"][k][0])[:2000]:
+                    S["items"].pop(c, None)
+
+    if codes and len(miss) > len(codes) * cold_frac:
+        run(miss + old)
+    elif (miss or old) and not S["busy"] and rss_mb() < MEM_SOFT:
+        S["busy"] = True
+
+        def work(need=miss + old):
+            try:
+                run(need)
+            finally:
+                S["busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+    with S["lock"]:
+        return {c: S["items"][c][1] for c in codes if c in S["items"] and S["items"][c][1] is not None}
+
+
 def _free_extra():
     """(메모리) 모의 계좌·피어 계산 결과와 보드 밖 종목 일봉 기억을 비워요 — 다시 열면 새로 계산해요."""
     _memo_store().get("tab", {}).clear()
@@ -1738,12 +1825,24 @@ _DATA_VER = {"v": None}
 def set_data_ver(df: pd.DataFrame, interval: int | None):
     """(속도) 이번 새로고침의 데이터 버전 = 새로고침 간격 단위 시각 + 보이는 종목 구성.
     같은 버전 안에서는 탭을 오가거나 버튼을 눌러도 무거운 계산을 다시 하지 않아요(다른 사람 화면과도 같이 써요)."""
-    sec = max(20, int(interval or 60))
+    # ⚡ (2026.11.17) 시각이 아니라 '실제 값'으로 버전을 정해요: 시세가 그대로면(장 마감 뒤·주말) 탭 계산을 다시 하지 않아
+    #   바로 열려요. 값이 하나라도 바뀌면 새로 계산해요(장중엔 새로고침마다). 그래도 5분마다 한 번은 새로 계산해요.
     try:
-        comp = hash(tuple(df["code"]))
+        cols = [c for c in ("code", "price", "change", "volume", "source", "high52") if c in df.columns]
+        comp = int(pd.util.hash_pandas_object(df[cols], index=False).sum())
     except Exception:  # noqa: BLE001
-        comp = len(df)
-    _DATA_VER["v"] = (int(time.time() // sec), len(df), comp)
+        comp = hash((len(df), int(time.time() // max(20, int(interval or 60)))))
+    _DATA_VER["v"] = (int(time.time() // 300), len(df), comp)
+
+
+def quotes_sig(q: dict | None) -> int:
+    """시세 묶음의 지문(값이 같으면 같은 수) — 탭 계산을 다시 할지 정할 때 써요."""
+    if not q:
+        return 0
+    try:
+        return hash(tuple(sorted((k, v.get("price"), v.get("high"), v.get("low")) for k, v in q.items())))
+    except Exception:  # noqa: BLE001
+        return hash(len(q))
 
 
 def tab_memo(name: str, key, fn):
@@ -6638,7 +6737,7 @@ def render_recovery(df: pd.DataFrame, histories: dict, trends):
         st.info("종목 일봉이 아직 부족해요. 잠시 뒤 다시 열어 주세요.")
         return
     by = "group" if by_lab == "세부 분류" else "sector"
-    sec = recovery.sector_recovery(sdf, by, min_n=2, idx_fall=idx_fall)
+    sec = tab_memo("rec_sec", (id(sdf), len(sdf), by, idx_fall), lambda: recovery.sector_recovery(sdf, by, min_n=2, idx_fall=idx_fall))
     _sec_h("🌿 먼저 싹트는 섹터",
            f"같은 날짜 기준 · 하락 구간 {ph['high_date']:%m/%d}→{ph['low_date']:%m/%d}, 회복 구간 {ph['low_date']:%m/%d}→오늘 · "
            f"{idx_name} 저점 이후 {idx_reb:+.1f}%" if idx_reb is not None else "")
@@ -7135,16 +7234,13 @@ def _pb_sim_run(df, histories, quotes, p, fins_all):
     now = data.now_kst()
     pk = tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float))))
     key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), len(meta), tuple(sorted(o.items())), pk)
-    res = _PB_SIM_MEMO.get(key)
-    if res is None:
-        ih = load_indexes()
-        idx = {sym: (ih.get(sym) or (None,))[0] for sym in data.MARKETS.values()}
-        with st.spinner("1천만 원 모의 계좌로 시작일부터 하루씩 눌림 타점을 매매해 보는 중…"):
-            res = data.pb_sim(df, histories, quotes, o["start"], meta, idx, p,
-                              {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"], "rr_min": o["rr"],
-                               "market_filter": o["mkt"]})
-        _PB_SIM_MEMO.clear()
-        _PB_SIM_MEMO[key] = res
+    ih = load_indexes()
+    idx = {sym: (ih.get(sym) or (None,))[0] for sym in data.MARKETS.values()}
+    res, _old = bg_sim(_PB_SIM_MEMO, key, (tuple(sorted(o.items())), pk),
+                       lambda: data.pb_sim(df, histories, quotes, o["start"], meta, idx, p,
+                                           {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"],
+                                            "rr_min": o["rr"], "market_filter": o["mkt"]}),
+                       "1천만 원 모의 계좌로 시작일부터 하루씩 눌림 타점을 매매해 보는 중…")
     return (res, None) if res.get("ok") else (None, "시작일 이후 일봉이 부족해요.")
 
 
@@ -7172,6 +7268,8 @@ def _pb_sim_view(sim: dict | None, msg: str | None):
     if not sim:
         st.info(msg or "계산할 수 있는 종목이 없어요.")
         return
+    if sim.get("_calc_at"):
+        st.caption(f"🕒 {sim['_calc_at']} 기준 실제 일봉·시세로 계산 · 새 계산은 뒤에서 해서 다음에 열 때 바뀌어요(5분마다)")
     col = UP if sim["pnl"] > 0 else DOWN if sim["pnl"] < 0 else "#26343E"
     kr = sim.get("kospi_ret")
     k = st.columns(4)
@@ -7467,9 +7565,20 @@ def _track_save(store: dict) -> str:
     return "이 서버에만 저장(GITHUB_TOKEN 없음)"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_surprises(since_iso: str):
-    return tracker.collect_surprises(date.fromisoformat(since_iso))
+class _SurpriseLoader:
+    """어닝 서프라이즈 모음(30분마다 새로). ⚡ 지난 모음을 바로 보여주고 새 모음은 뒤에서 받아요(처음 한 번만 기다림)."""
+    def __call__(self, since_iso: str):
+        return swr(("surprises", since_iso), 1800, lambda: tracker.collect_surprises(date.fromisoformat(since_iso)),
+                   "어닝 서프라이즈를 모으는 중이에요.") or ([], [])
+
+    def clear(self):
+        st_ = _bg_store()
+        with st_["lock"]:
+            for k in [k for k in st_["items"] if isinstance(k, tuple) and k and k[0] == "surprises"]:
+                st_["items"].pop(k, None)
+
+
+load_surprises = _SurpriseLoader()
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -7647,15 +7756,15 @@ def load_peers(df: pd.DataFrame, histories: dict | None = None) -> list[dict]:
     """분류별 국내 vs 해외 피어 vs 수요처(5분 기억). 일봉은 이미 받아 둔 보드 일봉을 그대로 써요(새로 받지 않음)."""
     now = data.now_kst()
     key = (now.date(), now.hour * 12 + now.minute // 5, len(df))
-    if key not in _PEER_MEMO:
-        h = histories if histories is not None else _hist_store()["data"]
+    h = histories if histories is not None else _hist_store()["data"]
+
+    def calc():
         try:
-            res = views.peer_table(df, h)
+            return views.peer_table(df, h)
         except Exception:  # noqa: BLE001
-            res = []
-        _PEER_MEMO.clear()
-        _PEER_MEMO[key] = res
-    return _PEER_MEMO[key]
+            return []
+    res, _old = bg_sim(_PEER_MEMO, key, ("peers", len(df) // 50), calc, "국내·해외 피어를 맞춰 보는 중…")
+    return res
 
 
 def _views_box(keys: tuple[str, ...] | None = None, title: str = "📚 관점 노트 — 깡토 × 너쟁이(추노)"):
@@ -8299,7 +8408,10 @@ def render_zongbae(df: pd.DataFrame):
         else:
             codes = tuple(cand["code"].head(40))
             try:
-                trends = {**(_TRENDS_BG.get("v") or {}), **load_trends(tuple(c for c in codes if (_TRENDS_BG.get("v") or {}).get(c) is None))}
+                bgt = _TRENDS_BG.get("v") or {}
+                # ⚡ 보드 수급(뒤에서 받아 둔 것) + 후보만 종목별로 기억해 둔 수급. 처음 보는 후보는 뒤에서 받고 잠깐 '확인 중'
+                trends = {**bgt, **per_code_swr("trend", [c for c in codes if bgt.get(c) is None], 600,
+                                                lambda cs: data.fetch_stock_trends(cs), cold_frac=0.8)}
             except Exception:  # noqa: BLE001
                 trends = _TRENDS_BG.get("v") or {}
             grp_hot = cand.groupby("group").size()
@@ -9033,9 +9145,16 @@ def render_ath(df: pd.DataFrame, quotes: dict):
         st.markdown(_ath_table(renew, sub_fn=sub, by_sector=False, sort_col="_k"), unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=15, show_spinner=False, max_entries=20)
 def load_nxt_quotes(codes: tuple[str, ...]):
-    return data.fetch_nxt_quotes(codes)
+    """넥스트레이드 시세(15초마다 새로). ⚡ 종목별로 기억해서 후보가 조금 바뀌어도 바로 보여주고, 새 값은 뒤에서 받아요."""
+    err = []
+
+    def fetch(cs):
+        q, e = data.fetch_nxt_quotes(cs)
+        if e:
+            err.append(e)
+        return q
+    return per_code_swr("nxt", codes, 15, fetch), (err[0] if err else None)
 
 
 # ── 🏁 신고가 후보 전용: 코스피·코스닥 전 종목 일봉(가벼운 배열)을 뒤에서 받아 두는 곳 ──
@@ -9116,7 +9235,9 @@ def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
     now = time.time()
     with ms["lock"]:
         need = [c for c in codes if c not in ms["items"] or now - ms["items"][c][0] > 21600]
-    if need:
+        miss = [c for c in need if c not in ms["items"]]
+
+    def run(need):
         got = data.fetch_monthlies(tuple(need), workers=8)
         t = time.time()
         with ms["lock"]:
@@ -9126,6 +9247,21 @@ def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
                     ms["items"][c] = (t, df_)
                 elif c not in ms["items"]:
                     ms["items"][c] = (t - 21600 + 1800, None)
+    if need:
+        # ⚡ 대부분 있으면(새 후보 몇 개만 없음) 뒤에서 받아요 — 그 종목은 잠깐 '역사적 신고가 확인 중'으로 보여요
+        if len(miss) > max(3, len(codes) * 0.3):
+            run(need)
+        elif not ms.get("cand_busy"):
+            ms["cand_busy"] = True
+
+            def work(need=need):
+                try:
+                    run(need)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    ms["cand_busy"] = False
+            threading.Thread(target=work, daemon=True).start()
     with ms["lock"]:
         return {c: ms["items"][c][1] for c in codes if c in ms["items"] and ms["items"][c][1] is not None}
 
@@ -9166,9 +9302,9 @@ def _nh_hist_for(codes, src) -> dict:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False, max_entries=20)
 def load_official_52w_cand(codes: tuple[str, ...]) -> dict:
-    return data.fetch_official_52w(codes)
+    """네이버 공식 52주 최고·최저(10분 기억, 종목별). 못 받은 종목은 빠져요(일봉 계산값을 그대로 써요)."""
+    return per_code_swr("off52", codes, 600, data.fetch_official_52w)
 
 
 def _ago_txt(r) -> str:
@@ -9315,7 +9451,8 @@ def render_nh_candidates(df: pd.DataFrame, histories: dict, quotes: dict):
                                           codes=list(cand["code"]))
         return cand
     _pk = tuple(sorted((k, v) for k, v in p.items() if isinstance(v, (int, float, str, bool))))
-    cand = tab_memo("nh_cand", (_pk, len(codes) if codes is not None else -1, len(histories), len(nxt or {})), _nh_calc).copy()
+    cand = tab_memo("nh_cand", (_pk, len(codes) if codes is not None else -1, len(histories), quotes_sig(nxt), quotes_sig(quotes)),
+                    _nh_calc).copy()
     if cand.empty:
         st.info("지금 조건에 맞는 신고가 후보가 없어요.")
         return
@@ -9434,8 +9571,32 @@ def _vol_svg(vol, close, split: int | None, recent: int, mult_line: float | None
     return "".join(parts)
 
 
+_VS_SPEC: dict = {}
+
+
 def _vs_chart(hist: pd.DataFrame, name: str, recent: int, quiet: int):
-    """일진전기 화면처럼: 위 캔들 + 이동평균, 아래 거래량(상승 빨강·하락 파랑)."""
+    """일진전기 화면처럼: 위 캔들 + 이동평균, 아래 거래량(상승 빨강·하락 파랑).
+    ⚡ 같은 일봉이면 그림 설계도(vega-lite)를 기억해 두고 바로 그려요(그림 만들기·변환이 탭마다 0.1~0.3초 걸렸어요)."""
+    try:
+        key = (id(hist), len(hist), float(hist["close"].iat[-1]), float(hist["volume"].iat[-1]), str(hist["date"].iat[-1]),
+               name, recent, quiet)
+    except Exception:  # noqa: BLE001
+        key = None
+    hit = _VS_SPEC.get(key) if key else None
+    if hit is not None and hit[0] is hist:
+        st.vega_lite_chart(hit[1], use_container_width=True)
+        st.vega_lite_chart(hit[2], use_container_width=True)
+        return
+    top, bottom = _vs_chart_build(hist, name, recent, quiet)
+    if key:
+        if len(_VS_SPEC) > 300:
+            _VS_SPEC.clear()
+        _VS_SPEC[key] = (hist, top.to_dict(), bottom.to_dict())
+    st.altair_chart(top)
+    st.altair_chart(bottom)
+
+
+def _vs_chart_build(hist: pd.DataFrame, name: str, recent: int, quiet: int):
     h = hist.tail(250).copy()
     h["date"] = pd.to_datetime(h["date"])
     for n_ in (5, 20, 60, 120):
@@ -9460,8 +9621,7 @@ def _vs_chart(hist: pd.DataFrame, name: str, recent: int, quiet: int):
         .encode(x="s:T", x2="e:T")
     vol = base.mark_bar(width=2.4).encode(y=alt.Y("volume:Q", title=None, axis=alt.Axis(format="~s")), color=color)
     bottom = (band + vol).properties(height=110, width="container")
-    st.altair_chart(top)
-    st.altair_chart(bottom)
+    return top, bottom
 
 
 def render_volume_surge(df: pd.DataFrame, histories: dict, quotes: dict):
@@ -11342,14 +11502,12 @@ def _t126_sim_run(df, histories, quotes, p, fins_all):
     now = data.now_kst()
     key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), len(meta), tuple(sorted(o.items())),
            p["retest_tol"], p["rsi_weak"])
-    res = _T126_SIM_MEMO.get(key)
-    if res is None:
-        kospi = (load_indexes().get("KOSPI") or (None,))[0]
-        with st.spinner("1천만 원 모의 계좌를 시작일부터 하루씩 매매해 보는 중…"):
-            res = data.t126_sim(df, histories, quotes, o["start"], meta, kospi, p,
-                                {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"]})
-        _T126_SIM_MEMO.clear()
-        _T126_SIM_MEMO[key] = res
+    kospi = (load_indexes().get("KOSPI") or (None,))[0]
+    stable = (tuple(sorted(o.items())), p["retest_tol"], p["rsi_weak"])
+    res, _old = bg_sim(_T126_SIM_MEMO, key, stable,
+                       lambda: data.t126_sim(df, histories, quotes, o["start"], meta, kospi, p,
+                                             {"seed": o["seed"], "risk_pct": o["risk"], "max_pos": o["max_pos"]}),
+                       "1천만 원 모의 계좌를 시작일부터 하루씩 매매해 보는 중…")
     return (res, None) if res.get("ok") else (None, "시작일 이후 일봉이 부족해요.")
 
 
@@ -11369,6 +11527,8 @@ def _t126_sim_view(sim: dict | None, msg: str | None):
     if not sim:
         st.info(msg or "계산할 수 있는 종목이 없어요.")
         return
+    if sim.get("_calc_at"):
+        st.caption(f"🕒 {sim['_calc_at']} 기준 실제 일봉·시세로 계산 · 새 계산은 뒤에서 해서 다음에 열 때 바뀌어요(5분마다)")
     seed = sim["seed"]
     col = UP if sim["pnl"] > 0 else DOWN if sim["pnl"] < 0 else "#26343E"
     kr = sim.get("kospi_ret")
@@ -11488,12 +11648,9 @@ def render_126(df: pd.DataFrame, histories: dict, quotes: dict, fins_all=None):
 
     now = data.now_kst()
     key = (now.date(), now.hour * 12 + now.minute // 5, len(histories), p["retest_tol"], p["rsi_weak"])
-    res = _T126_MEMO.get(key)
-    if res is None:
-        with st.spinner("RSI · MACD · 일목 계산 중…"):
-            res = data.t126_screen(df, histories, quotes, p)
-        _T126_MEMO.clear()
-        _T126_MEMO[key] = res
+    # ⚡ 5분마다 새로 계산하되, 새 계산은 뒤에서 하고 그동안은 바로 전(5분 안쪽) 실제 계산을 보여줘요
+    res, _old = bg_sim(_T126_MEMO, key, (p["retest_tol"], p["rsi_weak"]),
+                       lambda: data.t126_screen(df, histories, quotes, p), "RSI · MACD · 일목 계산 중…")
     if res.empty:
         st.info("일봉이 아직 부족해요. 잠시 뒤 다시 볼게요.")
         return
@@ -12250,6 +12407,10 @@ def _prefetch_scan_quotes() -> None:
         if uni:
             codes = tuple(sorted({u["code"] for u in uni}))
             swr(("scan_quotes", codes), 10 ** 9, lambda: data.fetch_quotes(codes)[0], first_wait=False, empty={})
+        # 📣 실적·지분 탭 기본값(10월 1일부터)도 미리 모아 둬요(처음 열 때 10초 넘게 걸렸어요)
+        since = date(data.now_kst().year, 10, 1).isoformat()
+        swr(("surprises", since), 10 ** 9, lambda: tracker.collect_surprises(date.fromisoformat(since)),
+            first_wait=False, empty=([], []))
     except Exception:  # noqa: BLE001
         pass
 
@@ -12281,9 +12442,28 @@ def _render_tab_area():
         _PHASE["탭"] = (_t0, rss_mb())
     _t0 = rss_mb()
     _TRIM_T[0] = 0.0 if rss_mb() - (_PHASE.get("_low") or 1e9) > 150 else _TRIM_T[0]   # 많이 늘었으면 바로 정리
-    trim_maybe()
+    _trim_bg()                       # ⚡ 메모리 정리는 뒤에서(탭을 누른 사람이 정리 시간을 기다리지 않게)
     _PHASE["정리(gc·trim)"] = (_t0, rss_mb())
     _PHASE["_low"] = min(_PHASE.get("_low") or 1e9, rss_mb())
+
+
+_TRIM_BUSY = data.__dict__.setdefault("_TRIM_BUSY", [False])
+
+
+def _trim_bg() -> None:
+    """정리할 때가 됐으면(1분에 한 번) 뒤 스레드에서 해요. 이미 정리 중이면 건너뛰어요."""
+    if _TRIM_BUSY[0] or time.time() - _TRIM_T[0] < float(os.environ.get("TRIM_EVERY") or 60.0):
+        return
+    _TRIM_BUSY[0] = True
+
+    def work():
+        try:
+            trim_maybe()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _TRIM_BUSY[0] = False
+    threading.Thread(target=work, daemon=True).start()
 
 
 def _log_tab_err(tab: str, e: Exception) -> None:

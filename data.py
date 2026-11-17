@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import time as _time
@@ -97,11 +98,13 @@ def to_num(value) -> float | None:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).replace(",", "").strip())
-    except ValueError:
-        return None
+        v = float(value)
+    else:
+        try:
+            v = float(str(value).replace(",", "").strip())
+        except ValueError:
+            return None
+    return v if math.isfinite(v) else None          # NaN·무한대 같은 깨진 값은 받지 않아요
 
 
 _EMPTY_FRAME = None
@@ -223,9 +226,12 @@ def parse_polling(text: str) -> dict[str, dict]:
             price = to_num(item.get("nv"))
             if not code.strip("0") or not price:
                 continue
-            out[code] = {
+            if price <= 0:
+                continue
+            out[code] = q = {
                 "price": price,
                 "prev": to_num(item.get("pcv")) or to_num(item.get("sv")),
+                "base": to_num(item.get("sv")),        # 기준가(권리락·액면분할 날엔 전일 종가와 달라요)
                 "high": to_num(item.get("hv")),
                 "low": to_num(item.get("lv")),
                 "open": to_num(item.get("ov")),
@@ -233,7 +239,27 @@ def parse_polling(text: str) -> dict[str, dict]:
                 "value": to_num(item.get("aa")),      # 누적 거래대금(단위가 응답마다 달라 쓸 때 점검)
                 "status": item.get("ms"),
             }
+            _check_quote(q)
     return out
+
+
+KRX_LIMIT = 0.30      # 한국 주식 하루 가격제한폭 ±30%
+
+
+def _check_quote(q: dict) -> None:
+    """🔒 사실 확인: 말이 안 되는 시세는 표시해 두고(suspect) 계산에 쓰지 않아요.
+    - 전일 대비 ±30%(가격제한폭)를 넘는 값 → 상장 첫날이 아니면 잘못 받은 값
+    - 고가 < 저가, 또는 현재가가 그날 고가·저가 밖 → 고가·저가만 버려요(현재가는 그대로)"""
+    p = q.get("price")
+    bases = [b for b in (q.get("prev"), q.get("base")) if b and b > 0]
+    if bases and not any(b * (1 - KRX_LIMIT) - 1 <= p <= b * (1 + KRX_LIMIT) + 1 for b in bases):
+        q["suspect"] = "±30% 밖"          # 전일 종가·기준가 어느 쪽으로 봐도 가격제한폭 밖
+    hi, lo = q.get("high"), q.get("low")
+    if hi and lo and (hi < lo or not (lo * 0.999 <= p <= hi * 1.001)):
+        q["high"] = q["low"] = None
+    for k in ("high", "low", "open", "volume", "value"):
+        if q.get(k) is not None and q[k] < 0:
+            q[k] = None
 
 
 # ─────────────────────────── 네트워크 조회 ───────────────────────────
@@ -559,7 +585,41 @@ def fetch_quotes(codes) -> tuple[dict[str, dict], str | None]:
             out.update(got)
             if err:
                 errors.append(err)
+    _verify_suspects(out)
     return out, ("실시간 시세 조회 실패: " + ", ".join(sorted(set(errors)))) if errors else None
+
+
+def _verify_suspects(out: dict) -> None:
+    """🔒 가격제한폭(±30%) 밖 시세는 다른 창구(일봉 차트)의 오늘 봉과 맞춰 봐요.
+    같으면(상장 첫날·액면분할 등 진짜 큰 움직임) 그대로 쓰고, 다르면 잘못 받은 값이라 버려요(→ 확인된 일봉 종가를 써요)."""
+    sus = [c for c, q in out.items() if q.get("suspect")]
+    if not sus:
+        return
+    if len(sus) > 30:                   # 한꺼번에 많이 이상함 = 시세 창구 고장 → 전부 버려요
+        for c in sus:
+            out.pop(c, None)
+        return
+    today = now_kst().strftime("%Y%m%d")
+
+    def check(c):
+        try:
+            _, h, _ = fetch_history(c, count=5)
+            if h is not None and not h.empty:
+                last = h.iloc[-1]
+                d = pd.Timestamp(last["date"]).strftime("%Y%m%d")
+                if d == today and abs(float(last["close"]) / out[c]["price"] - 1) < 0.005:
+                    return c, True
+        except Exception:  # noqa: BLE001
+            pass
+        return c, False
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for c, ok in pool.map(check, sus):
+            if ok:
+                out[c].pop("suspect", None)
+                out[c]["verified"] = "일봉과 맞춰 봄"
+            else:
+                out.pop(c, None)
 
 
 # ─────────────────────────── 지표 계산 ───────────────────────────
@@ -600,6 +660,8 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     today64 = np.datetime64(today, "D")
     last_is_today = dts[-1] == today64
 
+    if quote and quote.get("suspect") and len(closes0) >= 2:
+        quote = None          # 🔒 ±30%를 넘는 시세(상장 첫날 아님) = 잘못 받은 값 → 확인된 일봉 종가를 써요
     if quote and quote.get("price"):
         price = float(quote["price"])
         prev = quote.get("prev")
@@ -2229,7 +2291,26 @@ def fetch_stock_trends(codes, workers: int = 12) -> dict[str, pd.DataFrame]:
     return out
 
 
+_TS_MEMO: dict = {}
+
+
 def trend_summary(df: pd.DataFrame | None) -> dict:
+    """표에 넣을 값(_trend_summary_calc). ⚡ 같은 수급 표(같은 객체·같은 길이)면 지난 계산을 그대로 써요
+    (리스트·급상승·종가배팅 탭이 새로고침마다 수백 종목을 다시 계산했어요)."""
+    if df is None or df.empty:
+        return _trend_summary_calc(df)
+    k = id(df)
+    hit = _TS_MEMO.get(k)
+    if hit is not None and hit[0] is df and hit[1] == len(df):
+        return dict(hit[2])
+    out = _trend_summary_calc(df)
+    if len(_TS_MEMO) > 6000:
+        _TS_MEMO.clear()
+    _TS_MEMO[k] = (df, len(df), out)
+    return dict(out)
+
+
+def _trend_summary_calc(df: pd.DataFrame | None) -> dict:
     """표에 넣을 값: 최근 거래일 순매수 금액(억원), 5일 누적, 외국인·기관 연속 순매수 일수."""
     out = {"flow_date": None, **{f"flow_{k}": None for k in INVESTORS}, **{f"flow5_{k}": None for k in INVESTORS},
            "streak_외국인": None, "streak_기관": None}
@@ -2721,7 +2802,7 @@ def fetch_financials_many(codes, workers: int = 8) -> dict[str, pd.DataFrame | N
         return dict(zip(codes, pool.map(fetch_financials, codes)))
 
 
-def earnings_trend(df: pd.DataFrame | None, actual_years: int = 3) -> dict:
+def _earnings_trend_pd(df: pd.DataFrame | None, actual_years: int = 3) -> dict:
     """영업이익·EPS가 최근 실적 N년 + 컨센서스(E) 전 구간에서 해마다 증가(정배열)하는지.
 
     - 실적 연도는 최근 actual_years년, 전망(E)은 있는 만큼 전부
@@ -2752,6 +2833,40 @@ def earnings_trend(df: pd.DataFrame | None, actual_years: int = 3) -> dict:
     else:
         out["earn_ok"] = bool(out["op_ok"] and out["eps_ok"])
     periods = seq["period"].tolist()
+    out["earn_span"] = f"{periods[0]}~{periods[-1]}" if periods else None
+    return out
+
+
+def earnings_trend(df: pd.DataFrame | None, actual_years: int = 3) -> dict:
+    """영업이익·EPS 정배열 판정(_earnings_trend_pd와 똑같은 규칙). ⚡ pandas 대신 배열로 계산해서 수십 배 빨라요
+    (매수 신호·후보 탭이 새로고침마다 수백 종목을 판정해요)."""
+    out = {"earn_ok": None, "op_ok": None, "eps_ok": None, "earn_span": None, "n_est": 0}
+    if df is None or df.empty or "op" not in df or "eps" not in df:
+        return out
+    est_m = df["is_est"].to_numpy(dtype=bool)
+    op = pd.to_numeric(df["op"], errors="coerce").to_numpy(dtype=float)
+    eps = pd.to_numeric(df["eps"], errors="coerce").to_numpy(dtype=float)
+    per = df["period"].tolist() if "period" in df else [None] * len(df)
+    n = len(df)
+    act = [i for i in range(n) if not est_m[i] and not (op[i] != op[i] and eps[i] != eps[i])][-actual_years:] if actual_years > 0 else []
+    est = [i for i in range(n) if est_m[i]]
+    out["n_est"] = sum(1 for i in est if op[i] == op[i] or eps[i] == eps[i])
+    seq = act + est
+
+    def rising(a):
+        n_act = sum(1 for i in act if a[i] == a[i])
+        n_e = sum(1 for i in est if a[i] == a[i])
+        if n_act < actual_years or n_e == 0:
+            return None
+        last = [a[i] for i in act if a[i] == a[i]][-1]
+        if last <= 0:
+            return False
+        vals = [a[i] for i in seq if a[i] == a[i]]
+        return all(b > x for x, b in zip(vals, vals[1:]))
+
+    out["op_ok"], out["eps_ok"] = rising(op), rising(eps)
+    out["earn_ok"] = None if out["op_ok"] is None or out["eps_ok"] is None else bool(out["op_ok"] and out["eps_ok"])
+    periods = [per[i] for i in seq]
     out["earn_span"] = f"{periods[0]}~{periods[-1]}" if periods else None
     return out
 
@@ -3389,7 +3504,7 @@ SCENARIO_PRESETS = {
 SCN_WINDOWS = {"오늘": 1.0, "이번 주": 2.0, "5거래일": 2.0, "20거래일": 4.0}   # 창별 기본 기준(%)
 
 
-def _closes_frame(df: pd.DataFrame, histories: dict, codes) -> pd.DataFrame:
+def _closes_frame_slow(df: pd.DataFrame, histories: dict, codes) -> pd.DataFrame:
     """종목별 종가를 날짜로 맞춘 표. 오늘 봉은 현재가로 바꿔요."""
     today = pd.Timestamp(now_kst().date())
     cols = {}
@@ -3411,6 +3526,55 @@ def _closes_frame(df: pd.DataFrame, histories: dict, codes) -> pd.DataFrame:
     if not cols:
         return pd.DataFrame()
     return pd.DataFrame(cols).sort_index().ffill()
+
+
+_CF_BASE: dict = {}
+
+
+def _closes_frame(df: pd.DataFrame, histories: dict, codes) -> pd.DataFrame:
+    """종목별 종가를 날짜로 맞춘 표. 오늘 봉은 현재가로 바꿔요(_closes_frame_slow와 같은 결과).
+    ⚡ 일봉 부분(하루 한 번 바뀜)은 기억해 두고, 새로고침마다 현재가만 덮어써요(800종목 표를 매번 새로 만들지 않게)."""
+    today = pd.Timestamp(now_kst().date())
+    use, sig = [], []
+    for c in codes:
+        h = histories.get(c, (None, None, None))[1]
+        if h is None or h.empty:
+            continue
+        use.append((c, h))
+        sig.append((c, len(h), h["date"].iat[-1], float(h["close"].iat[-1]), id(h)))
+    if not use:
+        return pd.DataFrame()
+    key = (today, hash(tuple(sig)))
+    base = _CF_BASE.get(key)
+    if base is None:
+        cols = {}
+        for c, h in use:
+            sr = pd.Series(h["close"].to_numpy(dtype=float), index=pd.to_datetime(h["date"]).dt.normalize())
+            cols[c] = sr[~sr.index.duplicated(keep="last")]
+        base = pd.DataFrame(cols).sort_index()
+        has_today = {c for c, sr in cols.items() if sr.index[-1] == today}
+        base = (base, has_today)
+        if len(_CF_BASE) > 6:
+            _CF_BASE.clear()
+        _CF_BASE[key] = base
+    frame, has_today = base
+    idx = df.set_index("code")
+    idx = idx[~idx.index.duplicated(keep="first")]
+    pr = pd.to_numeric(idx["price"], errors="coerce") if "price" in idx else pd.Series(dtype=float)
+    live = idx["source"].eq("실시간") if "source" in idx else pd.Series(dtype=bool)
+    weekday = today.weekday() < 5
+    upd = {}
+    for c in frame.columns:
+        p = pr.get(c)
+        if p is not None and p == p and bool(live.get(c, False)) and (c in has_today or weekday):
+            upd[c] = float(p)
+    out = frame.copy()
+    if upd:
+        if today not in out.index:
+            out.loc[today] = np.nan
+            out = out.sort_index()
+        out.loc[today, list(upd)] = list(upd.values())
+    return out.ffill()
 
 
 def basket_stats(df: pd.DataFrame, histories: dict, groups, window: str, trends: dict | None = None) -> dict:
@@ -4994,7 +5158,7 @@ def _rsi_np(c: np.ndarray, n: int = 14) -> np.ndarray:
     return out
 
 
-def t126_indicators(hist: pd.DataFrame, quote: dict | None = None, today: date | None = None,
+def _t126_indicators_pd(hist: pd.DataFrame, quote: dict | None = None, today: date | None = None,
                     p: dict | None = None) -> pd.DataFrame:
     """일봉(+오늘 실시간) → RSI · MACD · 일목(전환·기준·구름대). 구름대는 26일 앞으로 밀어 그린 값(그날 머리 위 구름)."""
     p = {**T126_DEFAULTS, **(p or {})}
@@ -5016,6 +5180,59 @@ def t126_indicators(hist: pd.DataFrame, quote: dict | None = None, today: date |
     df["cloud_bot"] = np.fmin(span_a, span_b)
     df.loc[df["macd"].index[:p["macd_slow"]], ["macd", "signal"]] = np.nan
     return df
+
+
+_T126_IND: dict = {}
+
+
+def _shift_np(x: np.ndarray, k: int) -> np.ndarray:
+    out = np.full(len(x), np.nan)
+    if k <= 0:
+        return x.astype(float).copy()
+    if k < len(x):
+        out[k:] = x[:len(x) - k]
+    return out
+
+
+def t126_indicators(hist: pd.DataFrame, quote: dict | None = None, today: date | None = None,
+                    p: dict | None = None) -> pd.DataFrame:
+    """일봉(+오늘 실시간) → RSI · MACD · 일목(전환·기준·구름대). _t126_indicators_pd와 같은 값.
+    ⚡ 배열로 한 번에 계산하고, 같은 일봉·같은 시세면 지난 계산을 그대로 써요(1:2:6 탭이 수백 종목을 매번 계산했어요)."""
+    p = {**T126_DEFAULTS, **(p or {})}
+    q = quote or {}
+    try:
+        key = (id(hist), len(hist), hist["date"].iat[-1] if len(hist) else None, float(hist["close"].iat[-1]) if len(hist) else None,
+               q.get("price"), q.get("prev"), q.get("high"), q.get("low"), q.get("open"), q.get("volume"), today,
+               tuple(sorted((k2, v2) for k2, v2 in p.items() if isinstance(v2, (int, float)))))
+    except Exception:  # noqa: BLE001
+        key = None
+    if key is not None:
+        hit = _T126_IND.get(key)
+        if hit is not None and hit[0] is hist:
+            return hit[1].copy()
+    d, o, h, l, c, v = _session_bars(hist, quote, today)
+    c = np.asarray(c, dtype=float)
+    cs = pd.Series(c)
+    rsi = _rsi_np(c, p["rsi_n"])
+    macd = (cs.ewm(span=p["macd_fast"], adjust=False).mean() - cs.ewm(span=p["macd_slow"], adjust=False).mean()).to_numpy().copy()
+    signal = pd.Series(macd).ewm(span=p["macd_sig"], adjust=False).mean().to_numpy().copy()
+    hh, ll = pd.Series(np.asarray(h, dtype=float)), pd.Series(np.asarray(l, dtype=float))
+    tenkan = ((hh.rolling(p["tenkan"]).max() + ll.rolling(p["tenkan"]).min()) / 2).to_numpy()
+    kijun = ((hh.rolling(p["kijun"]).max() + ll.rolling(p["kijun"]).min()) / 2).to_numpy()
+    span_a = _shift_np((tenkan + kijun) / 2, p["shift"])
+    span_b = _shift_np(((hh.rolling(p["senkou_b"]).max() + ll.rolling(p["senkou_b"]).min()) / 2).to_numpy(), p["shift"])
+    ms = int(p["macd_slow"])
+    macd[:ms] = np.nan
+    signal[:ms] = np.nan
+    df = pd.DataFrame({"date": pd.to_datetime(d), "open": o, "high": h, "low": l, "close": c, "volume": v,
+                       "rsi": rsi, "macd": macd, "signal": signal, "tenkan": tenkan, "kijun": kijun,
+                       "span_a": span_a, "span_b": span_b,
+                       "cloud_top": np.fmax(span_a, span_b), "cloud_bot": np.fmin(span_a, span_b)})
+    if key is not None:
+        if len(_T126_IND) > 4000:
+            _T126_IND.clear()
+        _T126_IND[key] = (hist, df)
+    return df.copy()
 
 
 def t126_scan_one(ind: pd.DataFrame, p: dict | None = None) -> dict:
