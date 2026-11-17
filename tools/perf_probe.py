@@ -4,11 +4,17 @@ from playwright.async_api import async_playwright
 TABS = [("기본",["내 종목","차트","리포트","리스트"]),("신고가·돌파",["신고가 후보","신고가","신규상장","52주 최대 거래량","거래량 폭발","인더스트리 액션","매수 후보"]),
         ("타점·매매",["초기 매수","눌림 타점","1:2:6 매매","종가배팅"]),("섹터 흐름",["큰 그림","거래대금","급상승","차기 주도","회복 리더","증거 쌓기","글로벌 피어"]),
         ("시장·이벤트",["시장 신호","하락장 점검","시나리오","실적·지분","현금창출"])]
-BUSY = "()=>!!document.querySelector('[data-testid=stStatusWidget]')"
+STATE = "()=>[document.querySelector('[data-testid=stApp]')?.getAttribute('data-test-script-state'), document.querySelectorAll('[data-stale=true]').length]"
 async def idle(pg, cap=300):
-    t0 = time.time(); await pg.wait_for_timeout(150)
-    while await pg.evaluate(BUSY) and time.time() - t0 < cap: await pg.wait_for_timeout(40)
-    return time.time() - t0
+    """누른 뒤 → 화면이 다 바뀔 때까지(실행 끝 + 흐린(옛) 칸 0개). 실행이 시작되는 걸 먼저 확인해요."""
+    t0 = time.time(); started = False
+    while time.time() - t0 < cap:
+        st, stale = await pg.evaluate(STATE)
+        if st == "running" or stale: started = True
+        if (started or time.time() - t0 > 1.0) and st != "running" and stale == 0:
+            return time.time() - t0
+        await pg.wait_for_timeout(20)
+    return -1
 async def main():
     res = []
     async with async_playwright() as p:
