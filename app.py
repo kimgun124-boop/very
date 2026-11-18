@@ -259,7 +259,7 @@ if re.fullmatch(r"\d{6}", _qp_diag):
         st.markdown(f"연속성 점검 실패 {type(_e).__name__}: {_e}")
     st.stop()
 
-REQUIRED = ("is_kr", "ipo_scan", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
+REQUIRED = ("is_kr", "rs_leader_scan", "kt_rs", "ipo_scan", "market_of", "quote_url", "INDEXES", "fetch_index_histories", "index_summary",
             "fetch_kr_shares", "fetch_fx", "format_krw", "fetch_investor_flows", "fetch_market_overview",
             "market_mood", "fetch_stock_trends", "trend_summary", "resolve_codes", "INST_DETAIL",
             "breakout_hold", "add_rs_ranks", "atr_pct", "BO_MODES",
@@ -275,7 +275,7 @@ REQUIRED = ("is_kr", "ipo_scan", "market_of", "quote_url", "INDEXES", "fetch_ind
             "scan_frame", "bars_to_arr", "merge_arr", "arr_df", "last_session_day", "SCAN_BARS",
             "ia_buy_signals", "market_health", "fetch_deposits", "exposure_for", "IBD_LADDER",
             "vol52_scan", "V52_DEFAULTS", "v52_reasons", "v52_kind", "leading_report", "LEAD_RULES", "fetch_ktb10")
-DATA_VERSION = "2026-11-12-ipo"   # data.py의 DATA_VERSION과 같아야 해요
+DATA_VERSION = "2026-11-18-rs4"   # data.py의 DATA_VERSION과 같아야 해요
 
 
 def _data_stale() -> bool:
@@ -294,7 +294,7 @@ MARKET_VERSION = "2026-11-02-ftdbreak"
 _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
-            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "AI_VIEWS"),
+            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "RS_VIEWS", "AI_VIEWS"),
             "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line"),
             "gq": ("QUOTES_VERSION", "today_quote", "load", "CAT_COLOR")}
 _MOD_VER = {"gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
@@ -12182,13 +12182,120 @@ def render_bear_check(df: pd.DataFrame):
     _views_box_kq(("하락장", "재진입", "손절", "타점"), "📚 깡토 급락장 Q&A — 버틴 종목 · 다시 들어갈 자리")
 
 
+# ─────────────────────────── 👑 주도주 찾기 — 깡토 4강 RS ───────────────────────────
+RSL_STYLE = {"주도주 후보": ("✅ 주도주 후보", "#2f9e44"), "지켜보기": ("👀 지켜보기", "#7048e8"),
+             "보류(테마 의심)": ("🎈 보류(테마 의심)", "#e8590c"), "관심 제외": ("✖ 관심 제외(지수보다 약함)", "#868e96")}
+
+
+def _views_box_rs(expanded: bool = False):
+    with st.expander("📚 깡토 4강 — 주도주를 찾는 법: RS (수업 정리)", expanded=expanded):
+        st.markdown("> **주도주는 반에서 제일 잘한 우등생. 다만 기준은 등수가 아니라 '반 평균(시장)보다 잘했나'.**")
+        for k, t, x in views.RS_VIEWS:
+            st.markdown(f"- **{t}** — {x}")
+        st.markdown("**4강에서 꼭 기억할 네 가지** — ① 덜 오른 종목이 아니라 시장보다 강한 종목에서 찾는다 · ② RS는 시장과 비교, RSI는 자기 자신과 비교 · "
+                    "③ 기준은 등수가 아니라 '반 평균(시장 RS)'보다 높은가 · ④ 지표 하나가 아니라 트리거가 한 방향으로 모일 때")
+        st.caption(f"출처: {views.RS_SRC} · 효석 원칙(리스크관리 > 멘탈 > 종목 > 타점)이 항상 우선이고, 매수는 🎯 매수 후보·판단 보드의 원칙 조건을 그대로 따라요.")
+
+
+def render_rs_leaders(df: pd.DataFrame, histories: dict, trends, leaders: set):
+    _sec_h("👑 주도주 찾기 (RS)", "깡토 4강 — 덜 오른 종목이 아니라 시장보다 강한 종목 · 트리거가 한 방향으로 모일 때")
+    _views_box_rs()
+    hist = load_indexes()
+    idx = {name: data.index_rs(hist.get(sym, (data.empty_frame(), None))[0], df) for name, sym in data.MARKETS.items()}
+    with st.expander("⚙️ 기준"):
+        d0 = data.RSL_DEFAULTS
+        c1, c2, c3 = st.columns(3)
+        min_trig = c1.number_input("후보 = 트리거 몇 개 이상", 2, 4, d0["min_trig"], key="rsl_trig")
+        hot = c2.number_input("단기 고점 주의 RS", 90, 99, d0["hot"], key="rsl_hot")
+        theme_cap = c3.number_input("테마 의심 시총(억) 미만", 1000, 30000, int(d0["theme_cap"] / 1e8), step=500, key="rsl_cap")
+        st.caption("① RS line: 종목 RS > 그 시장(코스피·코스닥) 지수 RS — 아니면 관심 제외 · ② 스마트머니: 외국인+기관 20일·5일 순매수 "
+                   "(투신·연기금은 기관 합계 안에 있어요 — 따로 나눠 주는 공식 자료를 아직 못 받아요) · ③ 섹터 동반: 주도섹터이거나 섹터 종목 절반 이상이 지수보다 강하고 "
+                   "1개월 수익률 중앙값 플러스 · ④ 주간 차트: 주봉 종가 > 10주선, 10주선 상승(4주 전보다 높음), 10주선 ≥ 30주선. "
+                   f"🎈 테마 의심 = RS 70↑인데 개인 20일 순매수 · 외국인+기관 20일 순매도 · 시총 {theme_cap:,}억 미만.")
+    if trends is None:
+        st.info("수급(외국인·기관·개인)을 받는 중이에요(처음 1~2분). 그동안 ② 수급은 '?'로 보여요.")
+    p = {"min_trig": int(min_trig), "hot": int(hot), "theme_cap": float(theme_cap) * 1e8}
+    res, sec = tab_memo("rs_leaders", (tuple(sorted(p.items())), len(histories or {}), trends is None, len(trends or {}), len(leaders),
+                                       tuple((k, v.get("rs")) for k, v in idx.items())),
+                        lambda: data.rs_leader_scan(df, histories, trends, idx, leaders, p))
+    if res.empty:
+        st.info("판정할 국내 종목 데이터가 아직 없어요.")
+        return
+    # 지수 RS(반 평균)
+    def _ix(n):
+        v = idx.get(n) or {}
+        kt = data.kt_rs(v.get("rs_12m"), v.get("rs_6m"), v.get("rs_3m"))
+        return f"RS {v['rs']:.0f}" + (f" · 가중 {kt:.0f}" if kt is not None else "") if v.get("rs") is not None else "-"
+    cnt = res["rsl_tier"].value_counts()
+    tiles = [_tile(None, "📏 반 평균 = 코스피 RS", _ix("코스피")), _tile(None, "📏 반 평균 = 코스닥 RS", _ix("코스닥")),
+             _tile(True if cnt.get("주도주 후보", 0) else None, "✅ 주도주 후보", f"{cnt.get('주도주 후보', 0)}"),
+             _tile(None, "👀 지켜보기", f"{cnt.get('지켜보기', 0)}"),
+             _tile(False if cnt.get("보류(테마 의심)", 0) else None, "🎈 보류(테마 의심)", f"{cnt.get('보류(테마 의심)', 0)}"),
+             _tile(None, "✖ 지수보다 약함", f"{cnt.get('관심 제외', 0)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    st.caption("기준은 등수가 아니라 반 평균(시장 RS) — 지수 RS만 넘으면 RS 95도 80도 같은 후보예요. 순서는 트리거 수 → 깡토 가중 RS(12M×0.2 + 6M×0.3 + 3M×0.5).")
+
+    def mark(v):
+        return "?" if v is None or (isinstance(v, float) and v != v) else ("✓" if (v is True or v == 1) else "✕")
+    tiers = st.multiselect("보기", RSL_TIERS_SHOW, default=["주도주 후보", "지켜보기", "보류(테마 의심)"], key="rsl_show",
+                           format_func=lambda t: RSL_STYLE[t][0])
+    only_flow = st.toggle("🔁 가장 좋은 흐름(12M 강함 → 6M 쉼 → 3M 다시 강함)만", value=False, key="rsl_flow")
+    v = res[res["rsl_tier"].isin(tiers)]
+    if only_flow:
+        v = v[v["flow_tag"] == "🔁 쉬었다 다시 강세"]
+    if v.empty:
+        st.info("조건에 맞는 종목이 없어요.")
+    else:
+        v = v.head(300)
+        view = pd.DataFrame({
+            "상태": v["rsl_tier"].map(lambda t: RSL_STYLE[t][0]), "종목": v["name"], "섹터": v["group"],
+            "트리거": v["n_trig"].map(lambda n: f"{'●' * int(n)}{'○' * (4 - int(n))} {int(n)}/4"),
+            "① 지수보다 강함": v.apply(lambda r: f"{mark(r['beat'])} {r['rs']:.0f} vs {r['idx_rs']:.0f}" if pd.notna(r["rs"]) and pd.notna(r["idx_rs"]) else "?", axis=1),
+            "② 외+기 수급": v["t_flow"].map(mark), "③ 섹터 동반": v["t_sector"].map(mark), "④ 주간 우상향": v["t_week"].map(mark),
+            "가중 RS": v["kt_rs"], "RS 12·6·3M": v.apply(lambda r: " · ".join("-" if pd.isna(r.get(c)) else f"{r[c]:.0f}" for c in ("rs_12m", "rs_6m", "rs_3m")), axis=1),
+            "흐름": v["flow_tag"] + v["hot"].map(lambda h: " 🌡️단기 고점 주의" if h else ""),
+            "외+기 20일(억)": v["fi20"], "개인 20일(억)": v["p20"],
+            "현재가": v["price"], "등락률": v["change"], "52주 고가 대비": v["gap"],
+        })
+        st.dataframe(
+            view.style.format({"가중 RS": "{:.0f}", "외+기 20일(억)": _eok_num, "개인 20일(억)": _eok_num, "현재가": "{:,.0f}",
+                               "등락률": "{:+.2f}%", "52주 고가 대비": "{:+.1f}%"}, na_rep="-")
+            .map(lambda x: "" if pd.isna(x) or x == 0 else f"color: {UP if x > 0 else DOWN}; font-weight: 700",
+                 subset=["외+기 20일(억)", "개인 20일(억)", "등락률"]),
+            hide_index=True, height=min(620, 36 * (len(view) + 1) + 4),
+            column_config={"종목": st.column_config.Column(pinned=True)},
+        )
+    # 섹터 1등 vs 시장
+    _sec_h("🏫 섹터 1등보다 시장 대비가 먼저", "섹터 1등이라도 지수보다 약하면 탈락 · 섹터 3등이어도 지수보다 강하면 후보")
+    if sec.empty:
+        return
+    weak_top = sec[~sec["top_beat"]]
+    if not weak_top.empty:
+        st.markdown("**⚠️ 섹터 1등인데 시장보다 약한 섹터** — " + " · ".join(
+            f"{r.group}({r.top} RS {r.top_rs:.0f} < 지수 {r.idx_rs:.0f})" for r in weak_top.head(8).itertuples()
+            if pd.notna(r.top_rs) and pd.notna(r.idx_rs)))
+    sv = pd.DataFrame({
+        "섹터": sec["group"] + sec["leading"].map(lambda b: " 👑" if b else ""),
+        "③ 섹터 동반": sec["sector_ok"].map(lambda b: "✓" if b else "✕"),
+        "지수보다 강한 종목": sec.apply(lambda r: f"{r['n_beat']}/{r['n']}", axis=1), "비율": sec["beat_ratio"] * 100,
+        "섹터 1등": sec.apply(lambda r: f"{'✓' if r['top_beat'] else '✕'} {r['top']} (RS {r['top_rs']:.0f})" if pd.notna(r["top_rs"]) else r["top"], axis=1),
+        "지수보다 강한 종목들": sec["beat_names"],
+    })
+    st.dataframe(sv, hide_index=True, height=min(520, 36 * (len(sv) + 1) + 4),
+                 column_config={"섹터": st.column_config.Column(pinned=True),
+                                "비율": st.column_config.ProgressColumn("비율", min_value=0, max_value=100, format="%d%%")})
+
+
+RSL_TIERS_SHOW = ["주도주 후보", "지켜보기", "보류(테마 의심)", "관심 제외"]
+
+
 # ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
     ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🆕 신규상장", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
     ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
-    ("🔭 섹터 흐름", ["🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
+    ("🔭 섹터 흐름", ["👑 주도주 찾기", "🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
 NAV_DESC = {
@@ -12200,6 +12307,7 @@ NAV_DESC = {
     "🔊 52주 최대 거래량": "1년 중 최대 거래량이 터진 종목 — 얼마나·왜(뉴스·섹터 동반)", "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
     "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "🌙 종가배팅": "4인 관점(M·K·C·D) 오늘 후보 자동 점검 + 비교표", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
+    "👑 주도주 찾기": "깡토 4강 RS — 시장(반 평균)보다 강한 종목 · RS·수급·섹터·주간 트리거가 모일 때",
     "🗺️ 큰 그림": "AI · 비AI · 그외 → 테마별 등락·신고가 확산·대장주", "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
     "🪜 증거 쌓기": "실적 → 섹터 → 글로벌 → 근거, 증거만큼 비중", "🌏 글로벌 피어": "한국 분류 vs 해외 피어·수요처",
@@ -12378,6 +12486,7 @@ def render_board():
         "🏭 인더스트리 액션": lambda: render_industry_action(df, histories, quotes),
         "⚖️ 1:2:6 매매": lambda: render_126(df, histories, quotes, fins_all),
         "🎯 매수 후보": lambda: render_buy(df, quotes),
+        "👑 주도주 찾기": lambda: render_rs_leaders(df, histories, trends_all, leaders_now),
         "🗺️ 큰 그림": lambda: render_bigpicture(df),
         "💰 거래대금": lambda: render_money(df),
         "🚀 급상승": lambda: render_engine(df, trends_all, leaders_now, fins_all),

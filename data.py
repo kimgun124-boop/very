@@ -43,7 +43,7 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 # app.py가 이 값으로 서버에 남아 있는 예전 data.py를 알아채고 새로 읽어요. data.py를 고칠 때마다 올려요.
-DATA_VERSION = "2026-11-12-ipo"
+DATA_VERSION = "2026-11-18-rs4"
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 
 class _GuardedSession(requests.Session):
@@ -785,7 +785,7 @@ def compute_metrics(hist: pd.DataFrame, quote: dict | None, today: date | None =
     rets = {}
     for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
         rets[key] = (price / float(cc[-1 - n]) - 1) * 100 if len(cc) > n else None
-    res.update(ret_1m=rets["ret_1m"], ret_3m=rets["ret_3m"], ret_6m=rets["ret_6m"])
+    res.update(ret_1m=rets["ret_1m"], ret_3m=rets["ret_3m"], ret_6m=rets["ret_6m"], ret_12m=rets["ret_12m"])
     res["rs_raw"] = rs_raw_score(rets)
     res.update(_breakout_np(dts, hh, cc, bo_mode))
     res.update(_newhigh_np(dts, hh, _monthly_arrays(monthly)))
@@ -940,7 +940,10 @@ def add_rs_ranks(df: pd.DataFrame) -> pd.DataFrame:
     """RS 점수(1~99). 국내는 보드의 국내 종목끼리, 해외는 해외 종목끼리 수익률 순위를 백분위로 바꿔요."""
     df = df.copy()
     kr = df["code"].map(is_kr)
-    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m")):
+    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m"), ("rs_12m", "ret_12m")):
+        if raw not in df:
+            df[col] = np.nan
+            continue
         df[col] = None
         for mask in (kr, ~kr):
             vals = pd.to_numeric(df.loc[mask, raw], errors="coerce")
@@ -3068,7 +3071,7 @@ def ma_signal(df: pd.DataFrame | None, n: int = 20, slope_days: int = 5) -> dict
 
 def index_rs(index_df: pd.DataFrame | None, board: pd.DataFrame) -> dict:
     """지수의 RS: 지수 수익률을 보드 국내 종목들 수익률 분포에 놓고 1~99로. 종목 RS와 같은 잣대."""
-    out = {"rs": None, "rs_1m": None, "rs_3m": None, "rs_6m": None}
+    out = {"rs": None, "rs_1m": None, "rs_3m": None, "rs_6m": None, "rs_12m": None}
     if index_df is None or len(index_df) < 30 or board is None or board.empty:
         return out
     close = index_df["close"].astype(float).reset_index(drop=True)
@@ -3076,9 +3079,9 @@ def index_rs(index_df: pd.DataFrame | None, board: pd.DataFrame) -> dict:
     rets = {}
     for key, n in (("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_9m", 189), ("ret_12m", 250)):
         rets[key] = (last / float(close.iloc[-1 - n]) - 1) * 100 if len(close) > n else None
-    mine = {"rs": rs_raw_score(rets), "rs_1m": rets["ret_1m"], "rs_3m": rets["ret_3m"], "rs_6m": rets["ret_6m"]}
+    mine = {"rs": rs_raw_score(rets), "rs_1m": rets["ret_1m"], "rs_3m": rets["ret_3m"], "rs_6m": rets["ret_6m"], "rs_12m": rets["ret_12m"]}
     kr = board[board["code"].map(is_kr)]
-    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m")):
+    for col, raw in (("rs", "rs_raw"), ("rs_1m", "ret_1m"), ("rs_3m", "ret_3m"), ("rs_6m", "ret_6m"), ("rs_12m", "ret_12m")):
         v = mine[col]
         vals = pd.to_numeric(kr.get(raw), errors="coerce").dropna() if raw in kr else pd.Series(dtype=float)
         if v is None or len(vals) < 2:
@@ -3383,6 +3386,160 @@ def _year_ops(fins: dict | None) -> dict:
     out = {c: _year_op(f) for c, f in (fins or {}).items()}
     _yo_memo["v"] = (fins, out)
     return out
+
+
+# ─────────────────────────── 👑 주도주 찾기 — 깡토 4강 RS(2026.11.18 학습) ───────────────────────────
+# 주도주 = 반에서 제일 잘한 우등생. 다만 기준은 '등수'가 아니라 '반 평균(시장 RS)보다 잘했나'.
+#   ① RS line(2분법): 지수보다 강한가 O/X — 지수 RS보다 낮으면 관심종목에서 뺀다
+#   ② RS 점수(100분율)는 시장 RS만 넘으면 같은 후보 — 95와 80을 숫자로 경쟁시키지 않는다(너무 높으면 단기 고점일 수도)
+#   ③ 깡토 가중 RS = 12개월 RS × 0.2 + 6개월 RS × 0.3 + 3개월 RS × 0.5 (최근에 무게) — 가장 좋은 흐름: 12M 높음 → 6M 쉼 → 3M 다시 높음
+#   ④ 섹터 1등보다 시장 대비가 먼저 — 섹터 1등이어도 지수보다 약하면 탈락, 섹터 3등이어도 지수보다 강하면 후보
+#   ⑤ 트리거가 한 방향으로 모일 때: RS(지수보다 강함) · 수급(외국인+기관) · 섹터 동반(인더스트리 액션) · 주간 차트 우상향
+#   ⑥ RS가 높아도 개인 위주로 혼자 급등한 테마주(작은 종목)는 '보류'
+RSL_DEFAULTS = {"w12": 0.2, "w6": 0.3, "w3": 0.5, "hot": 97, "theme_cap": 5000e8, "flow_hi": 70, "flow_lo": 60,
+                "sec_beat": 0.5, "min_trig": 3}
+RSL_TIERS = ["주도주 후보", "지켜보기", "보류(테마 의심)", "관심 제외"]
+
+
+def kt_rs(r12, r6, r3, p: dict | None = None) -> float | None:
+    """깡토 가중 RS: (12M×0.2)+(6M×0.3)+(3M×0.5). 없는 기간은 빼고 가중치를 다시 나눠요."""
+    p = {**RSL_DEFAULTS, **(p or {})}
+    parts = [(p["w12"], r12), (p["w6"], r6), (p["w3"], r3)]
+    parts = [(w, float(v)) for w, v in parts if v is not None and v == v]
+    if not parts:
+        return None
+    return sum(w * v for w, v in parts) / sum(w for w, _ in parts)
+
+
+def rs_flow_tag(r12, r6, r3, idx: float | None = None, p: dict | None = None) -> str:
+    """RS 흐름 이름: 12M·6M·3M RS 모양."""
+    p = {**RSL_DEFAULTS, **(p or {})}
+    ok = [v is not None and v == v for v in (r12, r6, r3)]
+    if not ok[2]:
+        return ""
+    hi, lo = p["flow_hi"], p["flow_lo"]
+    if ok[0] and ok[1] and r12 >= hi and r6 <= min(lo, r12 - 15) and r3 >= hi:
+        return "🔁 쉬었다 다시 강세"
+    if ok[0] and ok[1] and min(r12, r6, r3) >= hi:
+        return "📈 꾸준히 강함"
+    if ok[1] and r6 < lo and r3 >= hi:
+        return "🌱 새로 강해짐"
+    if ok[0] and r12 >= hi and idx is not None and r3 < idx:
+        return "🥶 식는 중"
+    return ""
+
+
+def _weekly_up(hist: pd.DataFrame | None) -> bool | None:
+    """주간 차트 우상향: 주봉 종가 > 10주선, 10주선이 4주 전보다 높고, 10주선 ≥ 30주선(30주가 없으면 생략)."""
+    if hist is None or len(hist) < 60 or "close" not in hist:
+        return None
+    try:
+        c = hist["close"].astype(float)
+        if "date" in hist:
+            c.index = pd.to_datetime(hist["date"])
+        elif not isinstance(c.index, pd.DatetimeIndex):
+            c.index = pd.to_datetime(c.index)
+        w = c.resample("W-FRI").last().dropna()
+    except Exception:  # noqa: BLE001
+        return None
+    if len(w) < 15:
+        return None
+    m10 = w.rolling(10).mean()
+    up = bool(w.iloc[-1] > m10.iloc[-1] and m10.iloc[-1] > m10.iloc[-5])
+    if len(w) >= 30:
+        up = up and bool(m10.iloc[-1] >= w.rolling(30).mean().iloc[-1])
+    return up
+
+
+def rs_leader_scan(df: pd.DataFrame, histories: dict | None, trends: dict | None, idx_rs: dict,
+                   leaders: set | None = None, p: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """👑 주도주 찾기(깡토 4강). idx_rs = {"코스피": {"rs", "rs_3m", "rs_6m", "rs_12m"}, "코스닥": {...}}.
+    반환: (종목표, 섹터표). 종목표는 국내 종목 전부(티어로 나눠요), 섹터표는 '섹터 1등 vs 시장'."""
+    p = {**RSL_DEFAULTS, **(p or {})}
+    leaders = leaders or set()
+    d = df[df["code"].map(is_kr) & df["price"].notna() & ~df["group"].isin(NON_SECTOR_GROUPS)].copy()
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    num = lambda c: pd.to_numeric(d[c], errors="coerce") if c in d else pd.Series(np.nan, index=d.index)  # noqa: E731
+    rs, r3, r6, r12 = num("rs"), num("rs_3m"), num("rs_6m"), num("rs_12m")
+    # 종목이 속한 시장의 지수 RS(모르면 두 지수 중 높은 쪽 — 엄하게)
+    known = {k: v for k, v in (idx_rs or {}).items() if v and v.get("rs") is not None}
+    def idx_of(mk, key="rs"):
+        v = (known.get(mk) or {}).get(key)
+        if v is not None:
+            return v
+        vals = [x.get(key) for x in known.values() if x.get(key) is not None]
+        return max(vals) if vals else None
+    mk = d["market"] if "market" in d else pd.Series("", index=d.index)
+    d["idx_rs"] = [idx_of(m) for m in mk]
+    d["idx_kt"] = [kt_rs(idx_of(m, "rs_12m"), idx_of(m, "rs_6m"), idx_of(m, "rs_3m"), p) for m in mk]
+    d["kt_rs"] = [kt_rs(a, b, c, p) for a, b, c in zip(r12, r6, r3)]
+    ix = pd.to_numeric(d["idx_rs"], errors="coerce")
+    d["beat"] = np.where(rs.notna() & ix.notna(), rs > ix, np.nan)
+    d["flow_tag"] = [rs_flow_tag(a, b, c, i, p) for a, b, c, i in zip(r12, r6, r3, ix)]
+    d["hot"] = rs >= p["hot"]
+    # ② 수급: 외국인+기관(스마트머니) 20일·5일 순매수 · 개인 20일
+    ft = _flow_table(trends).set_index("code") if trends else pd.DataFrame()
+    def g(col):
+        return d["code"].map(ft[col]) if (not ft.empty and col in ft) else pd.Series(np.nan, index=d.index)
+    f5, i5, f20, i20 = g("f5"), g("i5"), g("f20"), g("i20")
+    have = f20.notna() | i20.notna()
+    d["fi5"] = (f5.fillna(0) + i5.fillna(0)).where(f5.notna() | i5.notna())
+    d["fi20"] = (f20.fillna(0) + i20.fillna(0)).where(have)
+    d["f20"], d["i20"] = f20, i20
+    def ind20(code):
+        t = (trends or {}).get(code)
+        if t is None or getattr(t, "empty", True) or "개인금액" not in t:
+            return np.nan
+        col = t["개인금액"].tail(20)
+        return float(col.dropna().sum()) if col.notna().any() else np.nan
+    d["p20"] = d["code"].map(ind20)
+    d["t_flow"] = np.where(have, (d["fi20"] > 0) & (d["fi5"].fillna(0) > 0), np.nan)
+    # ③ 섹터 동반: 주도섹터이거나, 섹터 종목 절반 이상이 지수보다 강하고 섹터 1개월 수익률 중앙값이 플러스
+    gb = d.groupby("group")
+    sec_beat = gb["beat"].apply(lambda s: pd.to_numeric(s, errors="coerce").mean())
+    sec_ret = gb["ret_1m"].median() if "ret_1m" in d else pd.Series(dtype=float)
+    sec_ok = {grp: bool(grp in leaders or ((sec_beat.get(grp) or 0) >= p["sec_beat"] and (sec_ret.get(grp, np.nan) or 0) > 0))
+              for grp in sec_beat.index}
+    d["sec_beat"] = d["group"].map(sec_beat)
+    d["t_sector"] = d["group"].map(sec_ok)
+    # ④ 주간 차트
+    d["t_week"] = d["code"].map(lambda c: _weekly_up((histories or {}).get(c)))
+    # 트리거 합계
+    def tv(v):
+        return v is True or v == 1 or v is np.True_
+    trig = ["beat", "t_flow", "t_sector", "t_week"]
+    d["n_trig"] = d[trig].apply(lambda r: sum(1 for v in r if tv(v)), axis=1)
+    cap = num("cap_krw")
+    d["theme"] = (rs >= 70) & (d["p20"] > 0) & (d["fi20"] < 0) & (cap < p["theme_cap"])
+    def tier(r):
+        if not tv(r["beat"]):
+            return "관심 제외"
+        if r["theme"]:
+            return "보류(테마 의심)"
+        return "주도주 후보" if r["n_trig"] >= p["min_trig"] else "지켜보기"
+    d["rsl_tier"] = d.apply(tier, axis=1)
+    order = {k: i for i, k in enumerate(RSL_TIERS)}
+    d["_o"] = d["rsl_tier"].map(order)
+    d = d.sort_values(["_o", "n_trig", "kt_rs"], ascending=[True, False, False]).drop(columns="_o")
+    # 섹터 1등 vs 시장: 섹터 안 RS 1등이 지수보다 약하면 '섹터 1등이어도 탈락'
+    srows = []
+    for grp, sub in d.groupby("group"):
+        if len(sub) < 2:
+            continue
+        sr = pd.to_numeric(sub["rs"], errors="coerce")
+        if sr.notna().sum() == 0:
+            continue
+        top = sub.loc[sr.idxmax()]
+        strong = sub[sub["beat"] == True]  # noqa: E712
+        srows.append({"group": grp, "n": len(sub), "top": top["name"], "top_rs": top.get("rs"), "idx_rs": top.get("idx_rs"),
+                      "top_beat": tv(top.get("beat")), "n_beat": len(strong), "beat_ratio": len(strong) / len(sub),
+                      "sector_ok": sec_ok.get(grp, False), "leading": grp in leaders,
+                      "beat_names": ", ".join(strong.sort_values("rs", ascending=False)["name"].head(5))})
+    sec = pd.DataFrame(srows)
+    if not sec.empty:
+        sec = sec.sort_values(["sector_ok", "beat_ratio", "n_beat"], ascending=False).reset_index(drop=True)
+    return d.reset_index(drop=True), sec
 
 
 NEXT_DEFAULTS = {"near_pct": 10.0, "near_rs": 70, "min_near": 3, "min_cover": 0.5}
