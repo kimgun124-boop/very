@@ -160,6 +160,17 @@ CSS = f"""
   .stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] {{ padding: 0.25rem 0.75rem !important; min-height: 2.1rem; }}
   .stApp .st-key-main_nav [class*="st-key-nav_tab_"] [data-testid="stButtonGroup"] button[data-variant="segmented_control"] p {{ font-size: 0.88rem !important; }} }}
 /* 탭 안쪽 작은 탭: 보라 밑줄 */
+/* ⚡ 부드러운 화면 전환(2026.11.18): 다시 그리는 동안 옛 화면을 회색으로 흐리지 않고 그대로 두고,
+   새 탭 내용은 살짝 떠오르듯 나타나요 */
+.stApp [data-stale="true"] {{ opacity: 1 !important; transition: none !important; }}
+.stApp [class*="st-key-tabin_"] {{ animation: tabIn .22s cubic-bezier(.2,.7,.2,1) both; }}
+@keyframes tabIn {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: none; }} }}
+@media (prefers-reduced-motion: reduce) {{ .stApp [class*="st-key-tabin_"] {{ animation: none; }} }}
+/* 📂 첫 화면 칸 접기/펴기 막대 */
+.stApp [class*="st-key-foldbar_"] {{ background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: .3rem .85rem; margin: .55rem 0 .25rem; }}
+.stApp [class*="st-key-foldbar_"] label p {{ font-weight: 800 !important; font-size: .98rem !important; color: #16212B !important; }}
+.stApp [class*="st-key-foldbar_"]:hover {{ border-color: var(--pri); }}
 .st-key-main_body [role="tab"], .st-key-main_body [role="tab"]:nth-child(n) {{
   background: transparent !important; border: none !important; border-bottom: 2px solid transparent !important;
   border-radius: 0 !important; box-shadow: none !important; padding: 0.45rem 0.85rem !important; }}

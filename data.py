@@ -3431,23 +3431,27 @@ def rs_flow_tag(r12, r6, r3, idx: float | None = None, p: dict | None = None) ->
 
 def _weekly_up(hist: pd.DataFrame | None) -> bool | None:
     """주간 차트 우상향: 주봉 종가 > 10주선, 10주선이 4주 전보다 높고, 10주선 ≥ 30주선(30주가 없으면 생략)."""
-    if hist is None or len(hist) < 60 or "close" not in hist:
+    if isinstance(hist, tuple):                      # (이름, 표, 오류) 모양도 받아요
+        hist = hist[1] if len(hist) > 1 else None
+    if hist is None or len(hist) < 60 or "close" not in hist or "date" not in hist:
         return None
     try:
-        c = hist["close"].astype(float)
-        if "date" in hist:
-            c.index = pd.to_datetime(hist["date"])
-        elif not isinstance(c.index, pd.DatetimeIndex):
-            c.index = pd.to_datetime(c.index)
-        w = c.resample("W-FRI").last().dropna()
+        # ⚡ pandas resample 대신 numpy로: 날짜를 주 번호로 바꿔 주마다 마지막 종가(같은 결과, 수십 배 빠름)
+        d = pd.to_datetime(hist["date"]).values.astype("datetime64[D]").astype("int64")
+        c = pd.to_numeric(hist["close"], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(c)
+        d, c = d[ok], c[ok]
+        wk = (d + 3) // 7                            # 1970-01-01(목) 기준 → 월~일을 한 주로
+        last = np.r_[wk[1:] != wk[:-1], True]
+        w = c[last]
     except Exception:  # noqa: BLE001
         return None
     if len(w) < 15:
         return None
-    m10 = w.rolling(10).mean()
-    up = bool(w.iloc[-1] > m10.iloc[-1] and m10.iloc[-1] > m10.iloc[-5])
+    m10 = np.convolve(w, np.ones(10) / 10, mode="valid")
+    up = bool(w[-1] > m10[-1] and m10[-1] > m10[-5])
     if len(w) >= 30:
-        up = up and bool(m10.iloc[-1] >= w.rolling(30).mean().iloc[-1])
+        up = up and bool(m10[-1] >= w[-30:].mean())
     return up
 
 

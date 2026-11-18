@@ -1224,6 +1224,35 @@ def _warm_pack() -> dict:
 
 
 @st.cache_resource(show_spinner=False)
+def _scan_pack() -> dict:
+    """⚡ 전 종목 묶음(warm.py scan.npz): 코스피·코스닥 약 2,500종목 일봉 300일 + 네이버 공식 52주.
+    GitHub Actions가 아침 7:2x에 만들어 둬요. 서버가 켜질 때 뒤에서 한 번 받아 🏁 신고가 후보·주요500 창고를 바로 채워요
+    (예전엔 종목마다 네이버에서 받느라 몇 분 걸렸어요). 못 쓰면(없음·오래됨·버전 다름) 예전처럼 처음부터 받아요."""
+    box = {"ready": threading.Event(), "arr": {}, "h52": {}, "uni": [], "thru": None, "t": 0.0, "error": None, "used": False}
+    if (data.MOCK and not os.environ.get("WARM_FORCE")) or os.environ.get("WARM_OFF"):
+        box["error"] = "꺼짐"
+        box["ready"].set()
+        return box
+
+    def run():
+        try:
+            got = warm_mod.load_scan(data.DATA_VERSION) if hasattr(warm_mod, "load_scan") else {"error": "옛 warm.py"}
+            if got.get("arr"):
+                meta = got.get("meta") or {}
+                box.update(arr=got["arr"], h52=got.get("h52") or {}, uni=got.get("uni") or [], t=float(meta.get("built") or 0),
+                           thru=np.datetime64(meta["thru"], "D") if meta.get("thru") else None, meta=meta)
+            else:
+                box["error"] = got.get("error") or "비어 있음"
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = repr(exc)[:200]
+        finally:
+            box["ready"].set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return box
+
+
+@st.cache_resource(show_spinner=False)
 def _boot_t() -> float:
     return time.time()
 
@@ -1243,6 +1272,7 @@ def warm_get(wait: float = 20.0) -> dict | None:
 
 _boot_t()
 _warm_pack()     # ⚡ 비밀번호 화면을 띄우는 동안에도 뒤에서 미리 받아요
+_scan_pack()     # ⚡ 전 종목 묶음도 같이(🏁 신고가 후보·주요500)
 _app_gate()      # 🛡️ 모든 화면보다 먼저(스타일만 입힌 뒤)
 
 
@@ -1436,7 +1466,21 @@ def bg_sim(store: dict, key: tuple, stable: tuple, fn, spinner: str):
 _PC_STORES: dict = {}
 
 
-def per_code_swr(name: str, codes, ttl: float, fetch, cold_frac: float = 0.5) -> dict:
+def per_code_seed(name: str, items: dict, t: float) -> int:
+    """⚡ 종목별 창고를 미리 받아 둔 값(빠른 시작 묶음)으로 채워요. 이미 있는 종목은 건드리지 않아요.
+    t = 그 값을 받은 시각 → ttl이 지났으면 '오래된 값'이라 보여주면서 뒤에서 새로 받아요."""
+    S = _PC_STORES.setdefault(name, {"items": {}, "busy": False, "lock": threading.Lock()})
+    n = 0
+    with S["lock"]:
+        for c, v in (items or {}).items():
+            if v is not None and c not in S["items"]:
+                S["items"][c] = (t, v)
+                n += 1
+    return n
+
+
+def per_code_swr(name: str, codes, ttl: float, fetch, cold_frac: float = 0.5, wait_miss: bool = False,
+                 spinner: str | None = None) -> dict:
     """⚡ 종목별로 따로 기억하는 실시간 자료(넥장 시세·공식 52주·수급 등).
     - 가진 자료는 바로 돌려주고, 오래된(ttl 초 지남)·없는 종목만 뒤에서 받아요.
     - 처음이라 대부분 없으면(cold_frac 넘게) 그때만 기다려서 받아요.
@@ -1467,6 +1511,14 @@ def per_code_swr(name: str, codes, ttl: float, fetch, cold_frac: float = 0.5) ->
                 for c in sorted(S["items"], key=lambda k: S["items"][k][0])[:2000]:
                     S["items"].pop(c, None)
 
+    if wait_miss and miss:
+        # 없는 종목만 기다려서 받고(정확도), 가진 종목의 새로 받기는 뒤에서(속도)
+        if spinner and len(miss) > 30:
+            with st.spinner(spinner.format(n=len(miss))):
+                run(miss)
+        else:
+            run(miss)
+        miss = []
     if codes and len(miss) > len(codes) * cold_frac:
         run(miss + old)
     elif (miss or old) and not S["busy"] and rss_mb() < MEM_SOFT:
@@ -1944,8 +1996,21 @@ def load_histories(codes: tuple[str, ...]):
 _UNI_RETRY = _memo_store().setdefault("uni_retry", {"t": 0.0})
 
 
+def _uni_seed() -> None:
+    """⚡ 전 종목 목록을 아침 묶음 값으로 먼저 채우고(바로 보이게), 10분 뒤 뒤에서 오늘 목록으로 새로 받아요(신규상장 반영)."""
+    store = _bg_store()
+    if ("krx_universe", "v2") in store["items"]:
+        return
+    sp = _scan_pack()
+    if not sp["ready"].wait(0.0 if not booting(20) else 8.0) or not sp.get("uni"):
+        return
+    with store["lock"]:
+        store["items"].setdefault(("krx_universe", "v2"), {"value": sp["uni"], "t": time.time() - 86400 + 600, "busy": False})
+
+
 def load_universe() -> list[dict]:
     """전체 종목 목록(하루 기억). 못 받았으면(빈 목록) 하루 동안 비워 두지 않고 2분마다 다시 시도해요."""
+    _uni_seed()
     val = swr(("krx_universe", "v2"), 86400, data.fetch_krx_universe, "코스피·코스닥 전체 종목 목록을 불러오는 중이에요.")
     if not val and time.time() - _UNI_RETRY["t"] > 120:
         _UNI_RETRY["t"] = time.time()
@@ -1955,6 +2020,14 @@ def load_universe() -> list[dict]:
 
 def load_industry_map(codes: tuple[str, ...]) -> tuple[dict, dict]:
     """전 종목 공식 업종(하루 기억). 목록과 따로 받아서, 목록을 예전에 받아 뒀어도 업종은 새로 채워져요."""
+    store = _bg_store()
+    if ("industry_map", "v2") not in store["items"]:          # ⚡ 아침 전 종목 묶음의 업종으로 먼저(뒤에서 오늘 값으로 새로)
+        sp = _scan_pack()
+        ind = (sp.get("meta") or {}).get("ind") if sp["ready"].is_set() else None
+        if ind:
+            with store["lock"]:
+                store["items"].setdefault(("industry_map", "v2"), {"value": (ind, (sp.get("meta") or {}).get("ind_diag") or {}),
+                                                                   "t": time.time() - 86400 + 1800, "busy": False})
     got = swr(("industry_map", "v2"), 86400, lambda: data.fetch_industry_map(codes),
               "전 종목의 업종(네이버 업종 · WICS)을 확인하는 중이에요. 처음 한 번 10~30초 걸려요.")
     if not got or not got[0]:
@@ -1980,11 +2053,32 @@ def load_histories_overseas(codes: tuple[str, ...]):
     return swr(("hist_os", codes), 900, lambda: data.fetch_histories(codes), "해외 종목 일봉을 불러오는 중이에요.")
 
 
+_OFF52_SEEDED: dict = {}
+
+
+def _off52_seed() -> None:
+    """⚡ 네이버 공식 52주 값을 빠른 시작 묶음(보드 종목 warm.npz + 전 종목 scan.npz)으로 미리 채워요(한 번씩)."""
+    if not _OFF52_SEEDED.get("warm"):
+        box = warm_get(wait=0.0)
+        if box and box.get("h52"):
+            per_code_seed("off52", box["h52"], box["t"])
+            _OFF52_SEEDED["warm"] = True
+    if not _OFF52_SEEDED.get("scan"):
+        sp = _scan_pack()
+        if sp["ready"].is_set():
+            if sp.get("h52"):
+                per_code_seed("off52", sp["h52"], sp["t"])
+            _OFF52_SEEDED["scan"] = True
+
+
 def load_official_52w(codes: tuple[str, ...]) -> dict:
-    """네이버 공식 52주 최고·최저(10분마다). 일봉으로 계산한 값과 대조해서 다르면 공식값으로 고쳐요."""
-    _swr_seed(("h52", codes), lambda box: {c: box["h52"][c] for c in codes if c in box["h52"]})
-    return swr(("h52", codes), 600, lambda: data.fetch_official_52w(codes),
-               "네이버 공식 52주 최고·최저가와 대조하는 중이에요. 처음 한 번만 몇 초 걸려요.")
+    """네이버 공식 52주 최고·최저. 일봉으로 계산한 값과 대조해서 다르면 공식값으로 고쳐요.
+    ⚡ (2026.11.18) 예전엔 종목 구성(코드 묶음)이 조금만 바뀌어도 전 종목을 처음부터 다시 받으며 기다렸어요(수백~2천여 종목).
+    이제 종목별로 기억해서 ① 아침 묶음 값을 바로 쓰고 ② 처음 보는 종목만 기다려서 받고 ③ 10분 지난 값은 뒤에서 새로 받아요.
+    장중에 새로 쓴 고가는 예전처럼 실시간 시세가 우선이고, 공식값은 일봉에 같은 값이 있을 때만 써요(정확도 그대로)."""
+    _off52_seed()
+    return per_code_swr("off52", codes, 600, data.fetch_official_52w, wait_miss=True,
+                        spinner="네이버 공식 52주 최고·최저가와 대조하는 중이에요 — 처음 보는 {n}종목만 받아요.")
 
 
 @st.cache_resource
@@ -2990,9 +3084,39 @@ def _econ_chart(w: pd.DataFrame):
             .properties(height=300, width="container", padding={"left": 4, "right": 48, "top": 4, "bottom": 4}))
 
 
+FOLD_KEYS = ("econ", "sector", "radar")
+
+
+def _fold_save() -> None:
+    try:
+        closed = [k for k in FOLD_KEYS if not st.session_state.get(f"fold_{k}", True)]
+        if closed:
+            st.query_params["fold"] = ",".join(closed)
+        elif "fold" in st.query_params:
+            del st.query_params["fold"]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fold(key: str, title: str) -> bool:
+    """📂 첫 화면 칸 접기/펴기. 접으면 그 칸은 계산도 안 해서 화면이 더 빨라요. 고른 상태는 주소(?fold=)에 남아 새로고침해도 그대로."""
+    k = f"fold_{key}"
+    if k not in st.session_state:
+        try:
+            closed = set((st.query_params.get("fold") or "").split(","))
+        except Exception:  # noqa: BLE001
+            closed = set()
+        st.session_state[k] = key not in closed
+    with st.container(key=f"foldbar_{key}"):
+        st.toggle(title, key=k, on_change=_fold_save)
+    return bool(st.session_state[k])
+
+
 def render_econ():
     """첫 화면: 일일 경제지표 — KOSPI · 원/달러 · 국고채 10년을 한 차트에(각자 축)."""
-    st.markdown(ECON_CSS + '<div class="ec-hd"><b>📈 일일 경제지표</b></div>', unsafe_allow_html=True)
+    st.markdown(ECON_CSS, unsafe_allow_html=True)
+    if not _fold("econ", "📈 일일 경제지표 · KOSPI · 원/달러 · 국고채 10년"):
+        return
     period = st.segmented_control("기간", ["3개월", "6개월", "1년"], default="1년", key="ec_period",
                                   label_visibility="collapsed") or "1년"
     w0 = tab_memo("econ_frame", (len(load_indexes()), id((load_ktb10() or (None,))[0])), _econ_frame)
@@ -3163,7 +3287,8 @@ def _sm_eok(v) -> str:
 
 def render_sector_movers(df: pd.DataFrame, quotes: dict):
     """첫 화면: 오늘 섹터별 강세 카드(순위 · 섹터 등락·거래대금 · 대표 뉴스 · 종목별 등락·거래대금·가로 캔들)."""
-    st.markdown('<div class="sm-hd">🔥 주도 테마 · 오늘 돈이 몰린 섹터</div>', unsafe_allow_html=True)
+    if not _fold("sector", "🔥 주도 테마 · 오늘 돈이 몰린 섹터"):
+        return
     with st.container(key="sm_box"):
         c1, c2, c3, c4 = st.columns([1.25, 1.25, 1, 1])
         by_lab = c1.segmented_control("묶기", ["세부 분류", "산업"], default="세부 분류", key="sm_by",
@@ -3250,6 +3375,8 @@ def _pctv(r, k) -> float:
 
 
 def render_radar(df: pd.DataFrame):
+    if not _fold("radar", "🧭 주도섹터 레이더"):
+        return
     leaders = lead_groups(df)
     if leaders:
         body = "".join(
@@ -9169,10 +9296,53 @@ def _scan_store() -> dict:
     return {"arr": {}, "thru": {}, "lock": threading.Lock(), "running": False, "done": 0, "total": 0, "err": 0}
 
 
+def _scan_seed(S: dict) -> None:
+    """⚡ 전 종목 묶음(아침 7:2x, 어제까지 완성 봉)으로 창고를 한 번 채워요. 이미 받은 종목은 건드리지 않아요.
+    묶음의 마지막 완성 봉 날짜(thru)까지만 믿고, 그 뒤 봉은 _scan_bg가 예전처럼 새로 받아 붙여요."""
+    sp = _scan_pack()
+    if sp.get("used"):
+        return
+    if not sp["ready"].is_set() and not S["arr"]:
+        sp["ready"].wait(15.0)          # 창고가 비었으면 묶음을 잠깐 기다려요(종목마다 2,500번 받는 것보다 훨씬 빨라요)
+    if not sp["ready"].is_set():
+        return
+    sp["used"] = True
+    if not sp.get("arr") or sp.get("thru") is None:
+        return
+    with S["lock"]:
+        for c, a in sp["arr"].items():
+            if c not in S["arr"]:
+                S["arr"][c] = a
+                S["thru"][c] = sp["thru"]
+    sp["arr"] = {}                    # (메모리) 창고로 옮겼으니 묶음 쪽은 비워요
+
+
+def _scan_recheck(S: dict, quotes: dict) -> int:
+    """🔍 정확도 지킴이: 창고 일봉의 마지막 종가가 실시간 시세의 '전일 종가'와 안 맞는 종목(액면분할·무상증자 같은
+    수정주가가 생겼거나 일봉이 늦은 종목)은 창고에서 빼서 _scan_bg가 300일을 처음부터 다시 받게 해요. 지어낸 값 없이 다시 받기만."""
+    today = np.datetime64(data.now_kst().date(), "D")
+    drop = []
+    with S["lock"]:
+        for c, a in S["arr"].items():
+            q = quotes.get(c) or {}
+            prev = q.get("prev")
+            if not prev or a is None or len(a[0]) < 2:
+                continue
+            d, cl = a[0], a[4]
+            last = float(cl[-1]) if d[-1] < today else float(cl[-2])   # 오늘 봉이 이미 붙어 있으면 그 전 봉과 비교
+            if last > 0 and abs(float(prev) / last - 1) > 0.003 and not (len(cl) >= 2 and d[-1] < today and abs(float(prev) / float(cl[-2]) - 1) <= 0.003):
+                drop.append(c)
+        for c in drop[:200]:
+            S["arr"].pop(c, None)
+            S["thru"].pop(c, None)
+    return len(drop)
+
+
 def _scan_bg(codes: tuple[str, ...]):
     """없는 종목은 300일, 지난 세션 완성 봉이 없는 종목은 최근 10일만 받아 붙여요. 한 번에 하나의 작업만, 화면은 안 기다려요.
     (메모리 여유 기준이 보드보다 느슨해요: 이 배열은 종목당 약 10KB라 전 종목이어도 30MB 안쪽이에요.)"""
     S = _scan_store()
+    _scan_seed(S)
     exp = data.last_session_day()
     now = data.now_kst()
     done_today = now.weekday() >= 5 or now.time() >= dtime(15, 40) or now.time() < dtime(9, 0)
@@ -9266,6 +9436,9 @@ def load_cand_monthlies(codes: tuple[str, ...]) -> dict:
         return {c: ms["items"][c][1] for c in codes if c in ms["items"] and ms["items"][c][1] is not None}
 
 
+_SCAN_CHK = {"t": 0.0}
+
+
 def _nh_universe(df: pd.DataFrame, histories: dict, quotes: dict):
     """신고가 후보를 고를 표·일봉·시세. 사이드바 범위(내 보드 등)와 상관없이 코스피·코스닥 전 종목이에요.
     전 종목 일봉을 아직 다 못 받았으면 받은 만큼 + 보드 종목으로 먼저 보여줘요."""
@@ -9279,6 +9452,12 @@ def _nh_universe(df: pd.DataFrame, histories: dict, quotes: dict):
         arrs = dict(S["arr"])
         prog = {"have": len(arrs), "total": len(codes), "running": S["running"], "done": S["done"], "todo": S["total"]}
     q_all = {**load_scan_quotes(codes), **{k: v for k, v in quotes.items() if v}}
+    if time.time() - _SCAN_CHK["t"] > 600 and data.market_status(q_all).startswith(("장중", "장 마감")):
+        _SCAN_CHK["t"] = time.time()
+        if _scan_recheck(S, q_all):          # 다시 받을 종목이 생겼으면 곧바로 뒤에서 받아요
+            _scan_bg(codes)
+        with S["lock"]:
+            arrs = dict(S["arr"])
     sf = data.scan_frame({c: a for c, a in arrs.items() if c in uni}, q_all, uni, df)
     missing_board = [c for c in df["code"] if data.is_kr(c) and c not in arrs] if len(df) else []
     if missing_board:                           # 아직 전 종목을 못 받았을 때: 보드 종목은 보드 값으로
@@ -9303,8 +9482,10 @@ def _nh_hist_for(codes, src) -> dict:
 
 
 def load_official_52w_cand(codes: tuple[str, ...]) -> dict:
-    """네이버 공식 52주 최고·최저(10분 기억, 종목별). 못 받은 종목은 빠져요(일봉 계산값을 그대로 써요)."""
-    return per_code_swr("off52", codes, 600, data.fetch_official_52w)
+    """네이버 공식 52주 최고·최저(10분 기억, 종목별). 처음 보는 종목만 기다려서 받고, 나머지는 바로(오래되면 뒤에서 새로)."""
+    _off52_seed()
+    return per_code_swr("off52", codes, 600, data.fetch_official_52w, wait_miss=True,
+                        spinner="후보 {n}종목의 네이버 공식 52주 값과 대조하는 중이에요.")
 
 
 def _ago_txt(r) -> str:
@@ -10428,6 +10609,13 @@ DB_CSS = """
 .db-card{background:var(--card);border:1px solid var(--ln);border-radius:18px;box-shadow:0 1px 2px rgba(16,24,40,.04),0 6px 22px rgba(43,127,240,.05);
          padding:1.05rem 1.15rem}
 .db-hero{display:flex;gap:1rem;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:1rem}
+.db-buy{display:flex;flex-direction:column;gap:.2rem;border-radius:16px;padding:.85rem 1.15rem;margin:0 0 .8rem;border:2px solid}
+.db-buy b{font-size:1.45rem;font-weight:900;letter-spacing:-.01em;line-height:1.25}
+.db-buy span{font-size:.9rem;font-weight:600;opacity:.92}
+.db-buy.go{background:#E9F7EE;border-color:#15803D;color:#14532D}
+.db-buy.scout{background:#EAF2FE;border-color:#1A62CC;color:#123E7C}
+.db-buy.stop{background:#F6F7F9;border-color:#CBD2DA;color:#374151}
+@media (max-width:640px){.db-buy b{font-size:1.2rem}}
 .db-hl{display:flex;gap:.9rem;align-items:flex-start;min-width:280px;flex:1 1 420px}
 .db-ic{flex:0 0 auto;width:48px;height:48px;border-radius:14px;background:var(--bs);display:flex;align-items:center;justify-content:center}
 .db-k{font-size:0.93rem;font-weight:700;color:#374151}
@@ -11026,6 +11214,18 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
         mode, mcol, mbg, micon, mtitle = "관찰 모드", "#B45309", "#FFF7E8", "!", "관찰 · 신규 매수 멈춤"
         action = "신규 매수 멈춤"
     headline = f"{pb['title'].split(' — ')[0]} · {action}"
+    # ✅ 한 줄 결론: 원칙을 모두 통과한 종목이 있으면 '매수'라고 분명히, 없으면 '매수 없음'과 막힌 이유를 분명히
+    buy_names = [str(r["name"]) for r in rows if r["kind"] in ("main", "early", "scout")]
+    if buy_names and decision == "매수":
+        buy_line, buy_cls = f"✅ 매수 — {' · '.join(buy_names[:4])}{f' 외 {len(buy_names) - 4}' if len(buy_names) > 4 else ''}", "go"
+        buy_sub = f"내 원칙 전부 통과 · 종목당 {size} · 손절선을 먼저 걸고 아침·종가로 나눠 사기"
+    elif buy_names and decision == "정찰병만":
+        buy_line, buy_cls = f"✅ 매수(정찰병 크기) — {' · '.join(buy_names[:4])}{f' 외 {len(buy_names) - 4}' if len(buy_names) > 4 else ''}", "scout"
+        buy_sub = f"지수 60일선 아래라 종목당 계좌 약 {W:.0f}%만 · 손절 1R 그대로 · 지수가 회복하면 살아남은 종목부터 1유닛"
+    else:
+        why0 = (stop_reasons[0].split(" — ")[0] + " — " + stop_reasons[0].split(" — ")[1]) if stop_reasons else "조건을 모두 채운 종목이 없어요"
+        buy_line, buy_cls = "⛔ 오늘은 매수 없음", "stop"
+        buy_sub = f"막힌 곳: {why0} · 억지로 사지 않는 것도 원칙"
     mdesc = {"매수": f"원칙 매수 {n_m} · 선매입 {n_e} · 정찰병 {n_s} — 아침·종가로 나눠 사고, 손절선을 먼저 정해 둡니다.",
              "정찰병만": f"선매입 {n_e} · 정찰병 {n_s} · 원칙 매수 {n_m} — 종목당 계좌 약 {W:.0f}%, 손절 1R 그대로. 지수가 60일선을 회복하면 살아남은 종목부터 1유닛.",
              "대기": "국면과 섹터는 허락했지만 거래량·신고가·매물대 조건을 채운 종목이 없어요. 억지로 사지 않습니다.",
@@ -11057,6 +11257,7 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
 
     # ── HTML
     o = [
+         f'<div class="db-buy {buy_cls}"><b>{esc(buy_line)}</b><span>{esc(buy_sub)}</span></div>'
          f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
          f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" / ".join(why_bits) or "막힌 단계 없음")}</p><p><b>할 일</b> {esc(concl_act)}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
@@ -12315,6 +12516,7 @@ NAV_DESC = {
     "💵 현금창출": "저CAPEX·매출 성장·FCF 증가·낮은 부채 — 스스로 번 현금으로 크는 기업",
 }
 _NAV_OF = {t: gi for gi, (_, ts) in enumerate(NAV_GROUPS) for t in ts}
+_TAB_IDX = {t: i for i, t in enumerate(t for _, ts in NAV_GROUPS for t in ts)}
 
 
 def main_nav() -> str:
@@ -12543,7 +12745,8 @@ def _render_tab_area():
     with st.container(key="main_body"):
         _t0 = rss_mb()
         try:
-            jobs.get(cur, jobs["📋 리스트"])()
+            with st.container(key=f"tabin_{_TAB_IDX.get(cur, 0)}"):     # 탭마다 새 칸 → 바뀔 때 부드럽게 나타나요
+                jobs.get(cur, jobs["📋 리스트"])()
         except Exception as _e:  # noqa: BLE001 — 한 탭이 실패해도 앱이 처음 화면으로 튕기지 않게
             st.warning(f"'{cur}' 탭을 그리는 중 문제가 생겼어요({type(_e).__name__}). 잠시 뒤 다시 눌러 주세요. "
                        "다른 탭은 그대로 쓸 수 있어요.")

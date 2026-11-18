@@ -29,6 +29,10 @@ jobs:
       - run: pip install -r requirements.txt
       - name: 보드 종목 일봉·상장주식수·공식 52주 받기
         run: python -W ignore warm.py build /tmp/warm.npz
+      - name: 전 종목(코스피·코스닥) 일봉 300일·공식 52주 받기 — 🏁 신고가 후보·주요500 바로 쓰기
+        continue-on-error: true
+        timeout-minutes: 20
+        run: python -W ignore warm.py scan /tmp/scan.npz
       - name: warm 브랜치에 덮어쓰기(main 기록은 그대로)
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,9 +41,13 @@ jobs:
           git init -q
           git checkout -q --orphan warm
           cp /tmp/warm.npz .
+          if [ -f /tmp/scan.npz ]; then cp /tmp/scan.npz .; else
+            # 전 종목 묶음을 이번에 못 만들었으면 지난 묶음을 그대로 둬요(앱이 오래된 묶음은 알아서 안 써요)
+            curl -sfL -o scan.npz "https://raw.githubusercontent.com/${{ github.repository }}/warm/scan.npz" || rm -f scan.npz; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git add warm.npz
+          [ -f scan.npz ] && git add scan.npz
           git commit -qm "⚡ 빠른 시작 묶음 $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M')"
           git push -qf "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" warm
       - name: 앱 미리 깨우기

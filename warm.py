@@ -209,8 +209,115 @@ def build(out_path: str):
     print(_js({**meta, "bytes": len(raw)}))
 
 
+# ─────────────────────────── 전 종목 묶음(scan.npz) ───────────────────────────
+# 🏁 신고가 후보·주요500 범위가 쓰는 코스피·코스닥 전 종목(약 2,500개) 일봉 300일 + 네이버 공식 52주 최고·최저.
+# 예전엔 서버가 켜질 때마다 이걸 종목마다 네이버에서 받느라 몇 분 걸렸어요 → 아침에 한 번 받아 두고 앱은 바로 써요.
+# 앱은 묶음의 마지막 봉 날짜(thru)까지만 '완성 봉'으로 믿고, 그 뒤는 예전처럼 새로 받아 붙여요(오늘 장중 봉은 실시간 시세).
+SCAN_URL = os.environ.get("SCAN_URL") or "https://raw.githubusercontent.com/kimgun124-boop/very/warm/scan.npz"
+SCAN_FORMAT = 1
+
+
+def pack_scan(arrs: dict, h52: dict, uni: list, meta: dict) -> bytes:
+    codes = sorted(c for c, a in arrs.items() if a is not None and len(a[0]))
+    offs = np.cumsum([0] + [len(arrs[c][0]) for c in codes]).astype("int64")
+    buf = io.BytesIO()
+    cat = (lambda i, dt: np.concatenate([np.asarray(arrs[c][i], dtype=dt) for c in codes]) if codes else np.zeros(0, dt))
+    np.savez_compressed(buf, codes=np.array(codes, dtype="U12"), offs=offs,
+                        dates=cat(0, "datetime64[D]").astype("int32"),
+                        **{k: cat(i + 1, "float32") for i, k in enumerate(_COLS)},
+                        h52=np.array(_js(h52)), uni=np.array(_js(uni)), meta=np.array(_js({**meta, "format": SCAN_FORMAT})))
+    return buf.getvalue()
+
+
+def unpack_scan(raw: bytes) -> dict:
+    z = np.load(io.BytesIO(raw), allow_pickle=False)
+    meta = json.loads(str(z["meta"]))
+    if meta.get("format") != SCAN_FORMAT:
+        raise ValueError("전 종목 묶음 형식이 달라요")
+    codes, offs = z["codes"].tolist(), z["offs"]
+    dates = z["dates"].astype("datetime64[D]")
+    cols = [z[k] for k in _COLS]
+    arrs = {}
+    for i, c in enumerate(codes):
+        a, b = int(offs[i]), int(offs[i + 1])
+        arrs[c] = (dates[a:b].copy(), *[col[a:b].copy() for col in cols])
+    return {"arr": arrs, "h52": json.loads(str(z["h52"])), "uni": json.loads(str(z["uni"])), "meta": meta}
+
+
+def load_scan(data_version: str | None = None, timeout: float = 25.0) -> dict:
+    try:
+        import requests
+        if SCAN_URL.startswith("file://"):
+            with open(SCAN_URL[7:], "rb") as f:
+                raw = f.read()
+        else:
+            r = requests.get(SCAN_URL, timeout=timeout)
+            r.raise_for_status()
+            raw = r.content
+        got = unpack_scan(raw)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{exc.__class__.__name__}: {exc}"[:200]}
+    meta = got["meta"]
+    age = time.time() - float(meta.get("built") or 0)
+    if age > MAX_AGE:
+        return {"error": f"전 종목 묶음이 오래됐어요({age / 3600:.0f}시간 전)", "meta": meta}
+    if data_version and meta.get("data_version") and meta["data_version"] != data_version:
+        return {"error": f"데이터 버전이 달라요({meta['data_version']} ≠ {data_version})", "meta": meta}
+    got["age"] = age
+    return got
+
+
+def build_scan(out_path: str):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import data
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
+    uni = data.fetch_krx_universe()
+    codes = sorted({u["code"] for u in uni})
+    arrs = {}
+    def one(c):
+        for k in range(3):                              # 네이버가 잠깐 막으면 천천히 다시
+            h = data.fetch_history(c, data.SCAN_BARS)[1]
+            if h is not None and not h.empty:
+                return c, data.bars_to_arr(h)
+            time.sleep(1.5 * (k + 1))
+        return c, None
+    # 장중에 만들면 오늘 봉은 아직 완성 전이라 빼요(앱은 오늘 봉을 실시간 시세로 붙여요)
+    now = data.now_kst()
+    exp = data.last_session_day()
+    from datetime import time as dtime
+    done_today = now.weekday() >= 5 or now.time() >= dtime(15, 40) or now.time() < dtime(9, 0)
+    thru = exp if done_today else np.busday_offset(exp, -1, roll="forward")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for c, a in pool.map(one, codes):
+            if a is not None:
+                keep = a[0] <= thru
+                if keep.any():
+                    arrs[c] = tuple(x[keep] for x in a)
+    t1 = time.time()
+    h52 = data.fetch_official_52w(codes)
+    try:
+        ind = data.fetch_industry_map(codes)                 # 전 종목 공식 업종(주요500 범위 분류)
+    except Exception:  # noqa: BLE001
+        ind = ({}, {})
+    t2 = time.time()
+    last = max((a[0][-1] for a in arrs.values() if len(a[0])), default=None)
+    meta = {"built": time.time(), "built_kst": data.now_kst().strftime("%Y-%m-%d %H:%M"), "data_version": data.DATA_VERSION,
+            "n_uni": len(codes), "n_arr": len(arrs), "n_h52": len(h52), "last": str(last) if last is not None else None, "thru": str(thru),
+            "secs": {"hist": round(t1 - t0), "h52": round(t2 - t1)}}
+    if len(arrs) < 0.9 * len(codes) or len(codes) < 1500:
+        raise SystemExit(f"받은 게 너무 적어서 저장 안 해요: {meta}")
+    meta["n_ind"] = len(ind[0] or {})
+    raw = pack_scan(arrs, h52, uni, {**meta, "ind": ind[0] or {}, "ind_diag": ind[1] or {}})
+    with open(out_path, "wb") as f:
+        f.write(raw)
+    print(_js({**meta, "bytes": len(raw)}))
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "build":
         build(sys.argv[2] if len(sys.argv) > 2 else "warm.npz")
+    elif len(sys.argv) >= 2 and sys.argv[1] == "scan":
+        build_scan(sys.argv[2] if len(sys.argv) > 2 else "scan.npz")
     else:
         print(__doc__)
