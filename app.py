@@ -178,6 +178,7 @@ import bigpicture
 import quotes as gq
 import zongbae
 import bear_check
+import kangto
 import ipo as ipo_mod
 import warm as warm_mod
 
@@ -294,10 +295,11 @@ MARKET_VERSION = "2026-11-02-ftdbreak"
 _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
-            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "RS_VIEWS", "AI_VIEWS"),
+            "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "RS_VIEWS", "BF_VIEWS", "BO_VIEWS", "AI_VIEWS"),
+            "kangto": ("KT5_VERSION", "bf_market", "bf_scan", "bf_sim", "bo_quality", "bo_scan", "bo_reason"),
             "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line"),
             "gq": ("QUOTES_VERSION", "today_quote", "load", "CAT_COLOR")}
-_MOD_VER = {"gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
+_MOD_VER = {"kangto": ("KT5_VERSION", "2026-11-27-kt5"), "gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
 
 
 def _old_ver(alias, mod) -> bool:
@@ -11156,20 +11158,34 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
 
     # ── TOP 6: 원칙 매수 → 선매입 → 정찰병 → (남는 칸) 준비 종목
     rows, seen = [], set()
+    # 깡토 5강: 원칙 매수·선매입 후보의 오늘 봉을 진짜/가짜 돌파로 한 번 더 걸러요(가짜 의심이면 '매수'에서 내려 대기)
+    try:
+        _c5 = [x["code"] for x in (sig.get("signals") or [])] + (list(eb["code"].head(6)) if len(eb) else [])
+        bo5 = bo_check_codes(_c5, histories, quotes, df, {g for g, _ in leaders}) if _c5 else {}
+    except Exception:  # noqa: BLE001
+        bo5 = {}
+    fake5 = {c for c, q in bo5.items() if q.get("verdict") == "가짜 돌파 의심"}
     for x in sig.get("signals") or []:
         seen.add(x["code"])
+        q5, fk = bo5.get(x["code"]), x["code"] in fake5
         why = " · ".join(t for t in (f"거래량 {x['vx']:.1f}배", x["lead"], "⭐ 첫 돌파" if x["first"] else None,
-                                     "52주 신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%", "원칙 전부 통과") if t)
-        rows.append({"kind": "main" if can_buy else "watch", "tag": "원칙 매수" if can_buy else "원칙 통과(대기)", "code": x["code"],
+                                     "52주 신고가 돌파" if x["brk"] else f"저항까지 {x['to_res']:.1f}%", "원칙 전부 통과",
+                                     kangto.bo_reason(q5) if q5 else None) if t)
+        rows.append({"kind": "main" if can_buy and not fk else "watch",
+                     "tag": ("가짜 돌파 의심(5강·대기)" if fk else "원칙 매수") if can_buy else "원칙 통과(대기)", "code": x["code"],
                      "name": x["name"], "group": x["group"], "price": x["price"], "chg": x["chg"], "why": why,
-                     "plan": f"손절 {x['stop']:,.0f} · 3R {x['target']:,.0f} · {size}" if can_buy else None})
+                     "plan": (f"손절 {x['stop']:,.0f} · 3R {x['target']:,.0f} · {size} · 5강: 돌파 때 절반, 종가 유지되면 나머지" if can_buy and not fk
+                              else ("윗꼬리·바닥권 등 가짜 돌파 신호 — 종가로 다시 확인" if fk else None))})
     for r in eb.head(6).itertuples():
         if r.code in seen:
             continue
         seen.add(r.code)
-        rows.append({"kind": "early" if can_buy else "watch", "tag": "선매입" if can_buy else "선매입 후보(대기)", "code": r.code,
-                     "name": r.name, "group": r.group, "price": r.price, "chg": r.chg, "why": r.why,
-                     "plan": (f"손절 {r.stop:,.0f}(-{r.stop_pct:.1f}%, 매물대 아래) · 3R {r.target:,.0f} · {size}" if can_buy
+        q5, fk = bo5.get(r.code), r.code in fake5
+        rows.append({"kind": "early" if can_buy and not fk else "watch",
+                     "tag": ("가짜 돌파 의심(5강·대기)" if fk else "선매입") if can_buy else "선매입 후보(대기)", "code": r.code,
+                     "name": r.name, "group": r.group, "price": r.price, "chg": r.chg,
+                     "why": r.why + (" · " + kangto.bo_reason(q5) if q5 else ""),
+                     "plan": (f"손절 {r.stop:,.0f}(-{r.stop_pct:.1f}%, 매물대 아래) · 3R {r.target:,.0f} · {size}" if can_buy and not fk
                               else f"매물대 {r.node_lo:,.0f}~{r.node_hi:,.0f} 위 유지 확인")})
     if can_buy and phase != "up":
         for r in scout.pick(cands, n=6, per_group=2).itertuples() if len(cands) else []:
@@ -11190,6 +11206,8 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
             rows.append({"kind": "watch", "tag": "우선 검토" if r.tier == "투입" else "관찰 후보", "code": r.code, "name": r.name,
                          "group": r.group, "price": r.price, "chg": r.chg, "why": r.why, "plan": None})
     for x in (sig.get("signals") or []):
+        if x["code"] in fake5:
+            continue
         if x["code"] not in st.session_state.setdefault("ia_toasted", set()):
             st.session_state["ia_toasted"].add(x["code"])
             st.toast(f"🔔 매수하세요: {x['name']} {x['chg']:+.1f}% · 거래량 {x['vx']:.1f}배", icon="🏭")
@@ -11255,9 +11273,23 @@ def render_trade_board(df: pd.DataFrame, histories: dict, quotes: dict):
     stats.append(f'<div class="db-st"><div class="t"><span style="background:{sbg};color:{scol}">{sic}</span>진입 신호</div>'
                  f'<b>{esc(sv)}</b><small>{esc(("막힘: " + stop_reasons[0].split(" — ")[0]) if stop_reasons else "막힌 단계 없음")}</small></div>')
 
+    # 🧺 바닥 줍기(깡토 하락장 백테스트) — 추세 원칙과 별개 매매라 판정에 섞지 않고 한 줄로만 알려요
+    bf_line = ""
+    try:
+        _bf = bf_status(df, histories, quotes)
+        if _bf.get("armed"):
+            _h = _bf["hits"]
+            _nm = " · ".join(_h["name"].astype(str).head(2)) if len(_h) else ""
+            bf_line = (f'<a href="?tab={quote_plus("🧺 바닥 줍기")}" target="_self" style="display:block;text-decoration:none;'
+                       f'background:#FFF7E8;border:1px solid #F5D9A8;color:#7A4A06;border-radius:12px;padding:.5rem .9rem;margin:-.4rem 0 .8rem;'
+                       f'font-size:.88rem;font-weight:700">🧺 바닥 줍기 출동 중 — 코스피 1년 고점 {_bf["dd"]:+.1f}% · '
+                       + (f'규칙상 내일 시가 매수: {esc(_nm)}' if _nm else "오늘 규칙 해당 종목 없음")
+                       + ' · 추세 원칙과 별개(손절 없음·짧게) →</a>')
+    except Exception:  # noqa: BLE001
+        bf_line = ""
     # ── HTML
     o = [
-         f'<div class="db-buy {buy_cls}"><b>{esc(buy_line)}</b><span>{esc(buy_sub)}</span></div>'
+         f'<div class="db-buy {buy_cls}"><b>{esc(buy_line)}</b><span>{esc(buy_sub)}</span></div>' + bf_line +
          f'<div class="db-card db-hero"><div class="db-hl"><div class="db-ic">{_CLOCK}</div><div>'
          f'<div class="db-k">오늘의 매매 보드</div><h2>{esc(headline)}</h2><p><b>왜?</b> {esc(" / ".join(why_bits) or "막힌 단계 없음")}</p><p><b>할 일</b> {esc(concl_act)}</p>'
          f'<span class="db-mode" style="background:{mbg};color:{mcol}">{mode}</span></div></div>'
@@ -12490,12 +12522,278 @@ def render_rs_leaders(df: pd.DataFrame, histories: dict, trends, leaders: set):
 RSL_TIERS_SHOW = ["주도주 후보", "지켜보기", "보류(테마 의심)", "관심 제외"]
 
 
+# ─────────────────────────── 🧺 바닥 줍기 · 🚪 돌파 확인 — 깡토 학습(2026.11.27) ───────────────────────────
+KT_CSS = """<style>
+.db-buy{display:flex;flex-direction:column;gap:.2rem;border-radius:16px;padding:.85rem 1.15rem;margin:0 0 .8rem;border:2px solid}
+.db-buy b{font-size:1.3rem;font-weight:900;line-height:1.25}.db-buy span{font-size:.88rem;font-weight:600;opacity:.92}
+.db-buy.go{background:#E9F7EE;border-color:#15803D;color:#14532D}.db-buy.stop{background:#F6F7F9;border-color:#CBD2DA;color:#374151}
+.kt-note{background:#FFF7E8;border:1px solid #F5D9A8;color:#7A4A06;border-radius:12px;padding:.65rem .9rem;margin:.2rem 0 .7rem;font-size:.9rem;line-height:1.5}
+@media (max-width:640px){.db-buy b{font-size:1.1rem}}
+</style>"""
+
+
+def _kospi_df() -> pd.DataFrame:
+    hist = load_indexes()
+    return hist.get("KOSPI", (data.empty_frame(), None))[0]
+
+
+def _views_box(title: str, rows, src: str, expanded: bool = False, head: str | None = None, tail: str | None = None):
+    with st.expander(title, expanded=expanded):
+        if head:
+            st.markdown(head)
+        for k, t, x in rows:
+            st.markdown(f"- **[{k}] {t}** — {x}")
+        if tail:
+            st.markdown(tail)
+        st.caption(f"출처: {src} · 효석 원칙(리스크관리 > 멘탈 > 종목 > 타점)이 항상 우선이에요.")
+
+
+def bf_status(df: pd.DataFrame, histories: dict, quotes: dict) -> dict:
+    """첫 화면·탭 공용: 출동 여부 + 오늘 규칙 해당 종목(10분 기억)."""
+    m = kangto.bf_market(_kospi_df())
+    now = data.now_kst()
+    scan = tab_memo("bf_scan", (now.date(), now.hour * 6 + now.minute // 10, len(df), len(histories)),
+                    lambda: kangto.bf_scan(df, histories, quotes))
+    hits = scan[scan["ok"]] if len(scan) else scan
+    return {**m, "scan": scan, "hits": hits}
+
+
+def render_bottom_fish(df: pd.DataFrame, histories: dict, quotes: dict):
+    _sec_h("🧺 하락장 바닥 줍기", "깡토 백테스트 최종 규칙 — 코스피가 같이 무너졌을 때만, 큰 종목만, 짧게(5일선) · 손절·물타기·신용 없음")
+    st.markdown(KT_CSS + '<div class="kt-note">⚠️ <b>추세추종(내 원칙)과 다른 별도 매매예요.</b> 내 원칙은 지수 60일선 아래면 쉬고, 바닥 줍기는 그 구간에만 출동해요. '
+                '손절이 없는 매매라 추세 계좌와 섞지 말고, 한다면 따로 떼어 둔 돈으로. 깡토 결론: 확실한 건 <b>하락장에서 덜 아프게 버티기</b>이고 '
+                '지수를 이긴다는 근거는 약해요(과최적화 · 하루 늦으면 연 +6.5%).</div>', unsafe_allow_html=True)
+    _views_box("📚 깡토 「하락장에서 할 수 있는 매매」 — 10년 백테스트 정리", views.BF_VIEWS, views.BF_SRC,
+               head="> **남들 하는 대로(물타기·손절 없음) 주웠더니 1,000만 원 → 286만 원. 고친 건 세 가지: 큰 종목만 · 하락장에만 · 짧게.**")
+    p = kangto.BF_DEFAULTS
+    s = bf_status(df, histories, quotes)
+    dd, armed = s["dd"], s["armed"]
+    hits, scan = s["hits"], s["scan"]
+    tiles = [_tile(armed, "출동 조건 (코스피 1년 고점 -12%↓)",
+                   f"{dd:+.1f}%" + (f" · 고점 {s['peak']:,.0f}({s['peak_date']:%y.%m.%d})" if s.get("peak_date") else "") if dd is not None else "-"),
+             _tile(True if len(hits) and armed else None, "오늘 규칙 해당", f"{len(hits)}종목"),
+             _tile(None, "동시 보유", f"최대 {p['slots']}종목 · 계좌 절반씩"),
+             _tile(None, "팔기", f"종가 > {p['exit_ma']}일선 → 다음 날 시가 · {p['time_stop']}거래일 정리")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    if armed is None:
+        st.info("코스피 일봉을 받는 중이에요.")
+    elif not armed:
+        st.success(f"⛔ 출동 꺼짐 — 코스피가 1년 고점에서 {dd:+.1f}%라 새로 줍지 않아요(규칙: -12%보다 더 빠졌을 때만). 이미 산 종목만 파는 규칙대로 정리.")
+    elif len(hits):
+        top = hits.head(p["slots"])
+        st.markdown(f'<div class="db-buy go"><b>🧺 규칙상 내일 아침 시가 매수 — {" · ".join(top["name"].astype(str))}</b>'
+                    f'<span>바닥 줍기 규칙(출동 중 · 시총 1조↑ · 20일선 -22%↓) 통과 · 거래대금 큰 순 {p["slots"]}종목 · 한 종목에 계좌 절반 · '
+                    f'판단은 종가 기준이라 장중이면 바뀔 수 있어요 · 내 추세 원칙 계좌와는 별개</span></div>', unsafe_allow_html=True)
+    else:
+        st.info(f"🧺 출동 중(코스피 {dd:+.1f}%)이지만 오늘 규칙을 모두 통과한 종목은 없어요 — 20일선보다 22% 넘게 빠진 1조↑ 종목을 기다려요.")
+    if len(scan):
+        mk = lambda b: "✓" if b else "✕"  # noqa: E731
+        v = scan.head(60)
+        view = pd.DataFrame({
+            "판정": v["ok"].map(lambda b: "🧺 규칙 해당" if b else "· 일부 미달"), "종목": v["name"], "섹터": v["group"],
+            "현재가": v["price"], "등락률": v["change"], "20일선 대비": v["gap20"],
+            "시총(억)": v["cap_krw"] / 1e8, "20일 거래대금(억)": v["tv20"] / 1e8,
+            "조건": v.apply(lambda r: f"20일선 -22%↓ {mk(r['c_gap'])} · 1조↑ {mk(r['c_cap'])} · 10억↑ {mk(r['c_tv'])} · "
+                                      f"1,000원↑ {mk(r['c_px'])} · 상장 1년↑ {mk(r['c_age'])}", axis=1),
+            "팔 자리(5일선)": v["ma5"]})
+        st.markdown("**20일선에서 크게 빠진 종목 (-13%↓, 거래대금 큰 순)**")
+        st.dataframe(view.style.format({"현재가": "{:,.0f}", "등락률": "{:+.2f}%", "20일선 대비": "{:+.1f}%", "시총(억)": "{:,.0f}",
+                                        "20일 거래대금(억)": "{:,.0f}", "팔 자리(5일선)": "{:,.0f}"}, na_rep="-")
+                     .map(_won_c, subset=["등락률", "20일선 대비"]), hide_index=True, width="stretch", height=360)
+        st.caption("대상: 보드의 국내 보통주(시총 3,000억↑ 주요 종목 — 1조↑는 모두 들어 있어요). 상장 1년 = 일봉 250거래일 이상.")
+
+    st.markdown("#### 🧾 같은 규칙으로 1,000만 원 모의 계좌")
+    kdf = _kospi_df()
+    first = pd.to_datetime(kdf["date"]).min().date() if len(kdf) else date(2026, 7, 1)
+    c1, c2 = st.columns(2)
+    start = c1.date_input("시작일", value=max(date(2026, 7, 1), first), min_value=first, max_value=data.now_kst().date(), key="bf_start",
+                          help="깡토 글의 '지금 하락장'은 2026년 7월부터예요. 일봉을 1년 남짓 받아 그보다 이전은 짧게만 돼요.")
+    seed = c2.number_input("시드(원)", 1_000_000, 1_000_000_000, 10_000_000, step=1_000_000, key="bf_seed")
+    now = data.now_kst()
+    sim = tab_memo("bf_sim", (now.date(), now.hour * 6 + now.minute // 10, str(start), int(seed), len(histories)),
+                   lambda: kangto.bf_sim(df, histories, kdf, start, float(seed)))
+    if not sim:
+        st.info("모의 계좌를 돌릴 일봉이 아직 부족해요.")
+        return
+    col = UP if sim["pnl"] > 0 else DOWN if sim["pnl"] < 0 else "#26343E"
+    k = st.columns(4)
+    k[0].markdown(f'<div class="pf-k">평가금액</div><div class="pf-v">{sim["equity"]:,.0f}원</div>'
+                  f'<div class="pf-s">시드 <b>{sim["seed"]:,.0f}원</b> · {sim["start"]:%Y.%m.%d}~{sim["end"]:%m.%d}</div>', unsafe_allow_html=True)
+    k[1].markdown(f'<div class="pf-k">수익금 · 수익률</div><div class="pf-v" style="color:{col}">{sim["pnl"]:+,.0f}원</div>'
+                  f'<div class="pf-s">수익률 <b style="color:{col}">{sim["ret"]:+.2f}%</b> · 같은 기간 코스피 <b>{sim["kospi_ret"]:+.2f}%</b></div>',
+                  unsafe_allow_html=True)
+    wr = f'{sim["wins"] / sim["closed"] * 100:.0f}%' if sim["closed"] else "-"
+    k[2].markdown(f'<div class="pf-k">승률</div><div class="pf-v">{wr}</div><div class="pf-s">끝난 매매 <b>{sim["closed"]}건</b> · '
+                  f'출동한 날 <b>{sim["armed_days"]}/{sim["days"]}</b></div>', unsafe_allow_html=True)
+    k[3].markdown(f'<div class="pf-k">최대 낙폭</div><div class="pf-v">{sim["mdd"]:.1f}%</div>'
+                  f'<div class="pf-s">현금 {sim["cash"]:,.0f}원 · 대상 {sim["universe"]}종목</div>', unsafe_allow_html=True)
+    cv = sim["curve"]
+    long = pd.concat([cv.assign(구분="바닥 줍기 모의 계좌", 값=cv["equity"]), cv.assign(구분="코스피(같은 돈)", 값=cv["kospi"])]) \
+        .rename(columns={"date": "날짜"})
+    ch = (alt.Chart(long).mark_line(interpolate="monotone").encode(
+        x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%m.%d", labelAngle=0, grid=False)),
+        y=alt.Y("값:Q", title="원", scale=alt.Scale(zero=False), axis=alt.Axis(format="~s")),
+        color=alt.Color("구분:N", scale=alt.Scale(domain=["바닥 줍기 모의 계좌", "코스피(같은 돈)"], range=["#5B47F5", "#B9B4D8"]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("값:Q", format=",.0f")]).properties(height=240, width="container"))
+    st.altair_chart(ch)
+    t1, t2 = st.tabs([f"📒 매매 일지 {len(sim['journal'])}", f"🧾 매매 내역 {len(sim['trades'])}"])
+    with t1:
+        if sim["journal"]:
+            jt = pd.DataFrame([{
+                "상태": "🟢 보유" if j["status"] == "보유" else ("✅ 수익" if j["pnl"] > 0 else "❌ 손실"), "종목": f"{j['name']} · {j['code']}",
+                "매수일": f"{j['entry_date']:%m/%d}", "매수가": j["entry_px"], "수량": j["qty"], "비중": j["weight"], "근거": j["why"],
+                "매도일": f"{j['exit_date']:%m/%d}" if j.get("exit_date") is not None else "-",
+                "매도가": j.get("exit_px") if j["status"] == "청산" else j.get("cur_px"), "이유": j.get("exit_why"),
+                "보유일": j.get("days"), "수익률": j.get("ret"), "손익": j.get("pnl")} for j in sim["journal"]])
+            st.dataframe(jt.style.format({"매수가": "{:,.0f}", "수량": "{:,.0f}", "비중": "{:.0f}%", "매도가": "{:,.0f}", "보유일": "{:.0f}일",
+                                          "수익률": "{:+.2f}%", "손익": "{:+,.0f}"}, na_rep="-").map(_won_c, subset=["수익률", "손익"]),
+                         hide_index=True, width="stretch", height=380)
+        else:
+            st.caption("시작일 이후 규칙에 걸린 종목이 없었어요.")
+    with t2:
+        if sim["trades"]:
+            tr = pd.DataFrame([{"날짜": f"{x['date']:%Y-%m-%d}", "종목": x["name"], "구분": x["side"], "이유": x["why"], "가격": x["price"],
+                                "수량": x["qty"], "금액": x["amount"], "실현손익": x["pnl"]} for x in sim["trades"]])
+            st.dataframe(tr.style.format({"가격": "{:,.0f}", "수량": "{:,.0f}", "금액": "{:,.0f}", "실현손익": "{:+,.0f}"}, na_rep="")
+                         .map(_won_c, subset=["실현손익"]).map(lambda v: f"color:{UP if v == '매수' else DOWN}", subset=["구분"]),
+                         hide_index=True, width="stretch", height=380)
+    if sim.get("pending_buy") or sim.get("pending_sell"):
+        nm = {j["code"]: j["name"] for j in sim["journal"]}
+        bits = []
+        if sim["pending_sell"]:
+            bits.append("내일 시가 매도: " + ", ".join(nm.get(c_, c_) for c_ in sim["pending_sell"]))
+        if sim["pending_buy"]:
+            nb = df.set_index("code")["name"].to_dict() if len(df) else {}
+            bits.append("내일 시가 매수: " + ", ".join(nb.get(c_, c_) for c_ in sim["pending_buy"]))
+        st.markdown("**📌 모의 계좌 다음 행동** — " + " · ".join(bits))
+    st.caption("🤖 규칙 그대로: 장 끝 종가로 판단 → 다음 날 아침 시가 체결 · 수수료 0.015%·거래세 0.20%·체결 밀림 0.1% 반영 · 손절·물타기·신용 없음. "
+               "⚠️ 시가총액은 '지금 주식 수 × 그날 종가' 근사이고, 지금 상장된 종목만 들어가 상장폐지 종목이 빠져요(실제보다 좋게 나올 수 있음). "
+               "오늘 칸은 장중이면 종가에 바뀌어요. 모의 결과이고 매수 권유가 아니에요.")
+
+
+BO_STYLE = {"진짜 돌파": ("✅ 진짜 돌파", "#2f9e44"), "애매 — 종가 확인": ("🤔 애매 — 종가 확인", "#7048e8"),
+            "가짜 돌파 의심": ("🚫 가짜 돌파 의심", "#e8590c"), "돌파 전": ("⏳ 돌파 전(3% 안)", "#868e96")}
+
+
+def _bo_market() -> tuple[bool | None, dict]:
+    """지수 20일선 위(5강 트리거 '시장 분위기') + 내 원칙(지수 둘 다 60일선 위)."""
+    hist = load_indexes()
+    sm = {n: (data.index_summary(hist.get(sym, (data.empty_frame(), None))[0]) or {}) for n, sym in data.MARKETS.items()}
+    k = hist.get("KOSPI", (data.empty_frame(), None))[0]
+    m20 = None
+    if len(k) >= 20:
+        c = pd.to_numeric(k["close"], errors="coerce")
+        m20 = bool(c.iloc[-1] > c.tail(20).mean())
+    return m20, sm
+
+
+def bo_check_codes(codes, histories: dict, quotes: dict, df: pd.DataFrame, leaders: set) -> dict:
+    """첫 화면 매수 후보용: 종목 몇 개만 5강 점검(보드 일봉)."""
+    m20, _ = _bo_market()
+    mv = kangto.sector_moves(df)
+    info = df.drop_duplicates("code").set_index("code") if len(df) else pd.DataFrame()
+    out = {}
+    for c in codes:
+        hist = (histories.get(c) or (None, None, None))[1]
+        if hist is None or len(hist) < 80 or c not in info.index:
+            continue
+        d, o, h, l, cl, v = data._session_bars(hist, quotes.get(c))
+        grp = info.loc[c].get("group") or ""
+        chg = (cl[-1] / cl[-2] - 1) * 100 if cl[-2] > 0 else 0
+        sec = bool(grp in leaders or mv.get(grp, 0) - (1 if chg >= 3 else 0) >= 2) if grp else None
+        q = kangto.bo_quality(d, o, h, l, cl, v, sec, m20)
+        if q:
+            out[c] = q
+    return out
+
+
+def render_breakout5(df: pd.DataFrame, histories: dict, quotes: dict, leaders: set):
+    _sec_h("🚪 돌파 확인 (5강)", "진짜 돌파는 거래량이 말해준다 · 가짜는 손절로 막고 진짜는 놓치지 않는다 · 트리거가 모일 때 비중")
+    _views_box("📚 깡토 5강 — 진입 타점: 돌파매매 (수업 정리)", views.BO_VIEWS, views.BO_SRC,
+               head="> **정답 패턴은 없다. 상승 → 조정 → 돌파라는 원리 위에서, 여러 트리거가 같은 방향을 가리킬 때 확률이 높아진다.**",
+               tail="**5강에서 꼭 기억할 네 가지** — ① 타점보다 리스크 관리가 먼저 · ② 건전한 조정 = 1차 상승분의 절반 이상을 반납하지 않는 조정 · "
+                    "③ 진짜 돌파는 거래량·장대양봉·섹터 동반으로 확인 · ④ 패턴 이름이 아니라 트리거가 한 방향으로 모일 때(베이지안)")
+    st.markdown(KT_CSS, unsafe_allow_html=True)
+    m20, sm = _bo_market()
+    above60 = [x.get("above60") for x in sm.values()]
+    mkt60 = all(a is True for a in above60) if above60 and None not in above60 else (False if False in above60 else None)
+    sf, hsrc, q_all, prog = _nh_universe(df, histories, quotes)
+    p = kangto.BO_DEFAULTS
+    pre = data.nh_prefilter(sf, {"watch": p["near"] + 2})
+    hmap = _nh_hist_for(tuple(sorted(pre)), hsrc)
+    now = data.now_kst()
+    res = tab_memo("bo5", (now.date(), now.hour * 60 + now.minute, len(pre), len(leaders), m20),
+                   lambda: kangto.bo_scan(sf, lambda c: (hmap.get(c) or (None, None, None))[1], q_all, leaders, m20, codes=pre))
+    n_lead = len(leaders)
+    gate_ok = bool(mkt60) and n_lead > 0
+    gate_txt = ("본매매 가능 — 코스피·코스닥 60일선 위 · 주도섹터 있음" if gate_ok else
+                "⛔ 내 원칙상 돌파매매 쉼 — " + " · ".join(t for t in (
+                    "지수 60일선 아래(정찰병 크기만)" if mkt60 is False else None,
+                    "주도섹터 없음" if n_lead == 0 else None) if t))
+    cnt = res["verdict"].value_counts() if len(res) else pd.Series(dtype=int)
+    tiles = [_tile(m20, "시장 분위기 (코스피 20일선)", "위" if m20 else ("아래" if m20 is False else "-")),
+             _tile(gate_ok, "내 원칙 관문", "통과" if gate_ok else "막힘"),
+             _tile(True if cnt.get("진짜 돌파", 0) else None, "✅ 진짜 돌파", f"{cnt.get('진짜 돌파', 0)}"),
+             _tile(None, "🤔 애매", f"{cnt.get('애매 — 종가 확인', 0)}"),
+             _tile(False if cnt.get("가짜 돌파 의심", 0) else None, "🚫 가짜 의심", f"{cnt.get('가짜 돌파 의심', 0)}"),
+             _tile(None, "⏳ 돌파 전(3% 안)", f"{cnt.get('돌파 전', 0)}")]
+    st.markdown(f'<div class="tiles" style="margin-bottom:.6rem">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    real = res[(res["verdict"] == "진짜 돌파") & (pd.to_numeric(res["rs"], errors="coerce").fillna(0) >= 70)] if len(res) else res
+    if len(real) and gate_ok:
+        top = real.head(4)
+        st.markdown(f'<div class="db-buy go"><b>✅ 매수 — {" · ".join(top["name"].astype(str))}</b>'
+                    f'<span>5강 진짜 돌파 + RS 70↑ + 원칙 관문 통과 · 장중 돌파 때 절반, 종가 유지되면 나머지 절반 · 밀리면 -1R 손절 · '
+                    f'🎯 매수 후보 탭의 영업이익·주도섹터 조건까지 확인</span></div>', unsafe_allow_html=True)
+    elif len(real):
+        st.markdown(f'<div class="db-buy stop"><b>⛔ 매수 쉼 — 진짜 돌파 모양 {len(real)}개({", ".join(real["name"].astype(str).head(4))})</b>'
+                    f'<span>{html.escape(gate_txt)} · 목록에 넣고 관문이 풀리면 다시</span></div>', unsafe_allow_html=True)
+    else:
+        st.caption(gate_txt)
+    if res.empty:
+        st.info("52주 고가 3% 안이거나 최근 5거래일 안에 돌파한 종목이 아직 없어요."
+                + (f" (전 종목 일봉 받는 중 {prog['have']:,}/{prog['total']:,})" if prog and prog["have"] < prog["total"] * 0.97 else ""))
+        return
+    shows = st.multiselect("보기", kangto.BO_VERDICTS, default=["진짜 돌파", "애매 — 종가 확인", "가짜 돌파 의심"], key="bo5_show",
+                           format_func=lambda t: BO_STYLE[t][0])
+    min_t = st.slider("트리거 최소", 0, 8, 0, key="bo5_min")
+    v = res[res["verdict"].isin(shows) & (res["n_trig"] >= min_t)].head(300)
+    if v.empty:
+        st.info("조건에 맞는 종목이 없어요.")
+        return
+    mk = lambda x: "?" if x is None or (isinstance(x, float) and x != x) else ("✓" if x is True else "✕")  # noqa: E731
+    view = pd.DataFrame({
+        "판정": v["verdict"].map(lambda t: BO_STYLE[t][0]), "종목": v["name"], "섹터": v["group"] + v["leading"].map(lambda b: " 👑" if b else ""),
+        "트리거": v["n_trig"].map(lambda n: f"{'●' * int(n)}{'○' * (8 - int(n))} {int(n)}/8"),
+        "거래량(50일 대비)": v["vol_x"], "DCR": v["dcr"], "등락률": v["chg"], "ATR%": v["atr"],
+        "신고가": v.apply(lambda r: "종가 돌파" + (f"({int(r['brk_ago'])}일 전)" if r["brk_ago"] and r["brk_ago"] > 0 else "") if r["brk_ago"] is not None or r["nh"]
+                          else ("찍고 밀림" if r["nh_touch"] else f"{r['dist']:.1f}% 남음"), axis=1),
+        "섹터 동반": v.apply(lambda r: f"{mk(r['sector'])} (+3%↑ {int(r['mates'])}개)", axis=1),
+        "조정 깊이": v.apply(lambda r: "-" if r["retr"] is None or r["retr"] != r["retr"] else f"{mk(r['base'])} {r['retr'] * 100:.0f}% · {int(r['base_len'])}일", axis=1),
+        "VCP": v["vcp"].map(mk), "ATR↑": v["atr"].combine(v["chg"], lambda a, c: "✓" if a and c >= a else "✕"),
+        "가짜 신호": v.apply(lambda r: " · ".join(lbl for k_, lbl in kangto.BO_FAKES if r[k_]) or "-", axis=1),
+        "RS": v["rs"], "현재가": v["price"]})
+    st.dataframe(view.style.format({"거래량(50일 대비)": "{:.1f}배", "DCR": "{:.0f}%", "등락률": "{:+.2f}%", "ATR%": "{:.1f}%", "RS": "{:.0f}",
+                                    "현재가": "{:,.0f}"}, na_rep="-").map(_won_c, subset=["등락률"]),
+                 hide_index=True, width="stretch", height=460, column_config={"종목": st.column_config.Column(pinned=True)})
+    with st.expander("읽는 법 · 판정 기준"):
+        st.markdown(
+            "- **대상** = 코스피·코스닥 전 종목 중 52주 고가 3% 안이거나 최근 5거래일 안에 종가로 52주 고가를 처음 넘은 종목(오늘 못 샀으면 내일 OK, 일주일 뒤는 X).\n"
+            "- **✅ 진짜 돌파** = 거래량 1.5배↑(50일 평균, 장중이면 지금까지 시간 비율로 환산) + 장대양봉(몸통 ≥ 하루 폭 55%, DCR 70%↑) + 52주 신고가 종가 돌파 + 가짜 신호 0개.\n"
+            "- **🚫 가짜 돌파 의심** = 긴 윗꼬리(DCR 50% 미만이거나 윗꼬리 > 몸통) 또는 바닥권 장대양봉(52주 고가보다 25% 넘게 아래) 또는 가짜 신호 2개↑.\n"
+            "- **가짜 신호** = 거래량 없이 슬쩍(1.2배 미만) · 긴 윗꼬리 · 혼자만 상승(주도섹터가 아니고 같은 섹터에 +3%↑ 종목이 2개 미만) · 바닥권 장대양봉.\n"
+            "- **트리거 8개(베이지안)** = 거래량 폭발 · 장대양봉·DCR · 신고가 종가 돌파 · 섹터 동반 · 건전한 조정(직전 60일 고점 뒤 저점이 1차 상승분(고점 전 120일 저점→고점)의 50% 이내) · "
+            "VCP(고점 뒤 베이스를 셋으로 나눠 흔들림이 차례로 줄고, 최근 10일 거래량 < 50일 평균 85%) · 평균 ATR 이상 움직임(등락률 ≥ 20일 ATR%) · 시장 분위기(코스피 20일선 위).\n"
+            "- **매수**는 진짜 돌파 + RS 70↑ + 내 원칙 관문(코스피·코스닥 60일선 위 · 주도섹터 있음)일 때만 '매수'라고 말해요. 진입은 5강대로 장중 돌파 때 절반 · 종가 유지되면 나머지.\n"
+            "- 판정은 지금 가격 기준이라 장중엔 바뀔 수 있어요(종가가 확정 기준).")
+
+
 # ─────────────────────────── 메인 메뉴: 묶음(1줄) → 탭(2줄) ───────────────────────────
 NAV_GROUPS = [
     ("📋 기본", ["📋 리스트", "⭐ 내 종목", "🕯️ 차트", "📥 리포트"]),
     ("💼 내 계좌", ["💼 내 보유", "👀 보유 살피기"]),
-    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🆕 신규상장", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🎯 매수 후보"]),
-    ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
+    ("🏔️ 신고가·돌파", ["🏁 신고가 후보", "🏔️ 신고가", "🆕 신규상장", "🔊 52주 최대 거래량", "💥 거래량 폭발", "🏭 인더스트리 액션", "🚪 돌파 확인", "🎯 매수 후보"]),
+    ("🎯 타점·매매", ["🎯 초기 매수", "🪃 눌림 타점", "🧺 바닥 줍기", "⚖️ 1:2:6 매매", "🌙 종가배팅"]),
     ("🔭 섹터 흐름", ["👑 주도주 찾기", "🗺️ 큰 그림", "💰 거래대금", "🚀 급상승", "🔭 차기 주도", "🌱 회복 리더", "🪜 증거 쌓기", "🌏 글로벌 피어"]),
     ("🚦 시장·이벤트", ["🚦 시장 신호", "📉 하락장 점검", "🧭 시나리오", "📣 실적·지분", "💵 현금창출"]),
 ]
@@ -12508,6 +12806,8 @@ NAV_DESC = {
     "🔊 52주 최대 거래량": "1년 중 최대 거래량이 터진 종목 — 얼마나·왜(뉴스·섹터 동반)", "💥 거래량 폭발": "조용하다가 거래량이 터진 종목", "🏭 인더스트리 액션": "섹터 동반 거래량 1.5배↑ 매수 후보",
     "🎯 매수 후보": "내 원칙을 모두 통과한 종목", "🎯 초기 매수": "리 태너 — 표준 피벗보다 싸게 사는 자리",
     "🪃 눌림 타점": "지지선까지 쉬어 갈 때 + 1천만원 모의 매매", "🌙 종가배팅": "4인 관점(M·K·C·D) 오늘 후보 자동 점검 + 비교표", "⚖️ 1:2:6 매매": "후지모토 1:2:6 + 모의 계좌",
+    "🚪 돌파 확인": "깡토 5강 — 진짜 돌파 vs 가짜 돌파 · 트리거가 모일 때(베이지안)",
+    "🧺 바닥 줍기": "깡토 하락장 백테스트 — 코스피 -12%↓일 때만 출동, 시총 1조↑ 20일선 -22%↓ 줍기 + 모의 계좌",
     "👑 주도주 찾기": "깡토 4강 RS — 시장(반 평균)보다 강한 종목 · RS·수급·섹터·주간 트리거가 모일 때",
     "🗺️ 큰 그림": "AI · 비AI · 그외 → 테마별 등락·신고가 확산·대장주", "💰 거래대금": "섹터별 거래대금 쏠림", "🚀 급상승": "섹터 안에서 가장 빠르게 치고 오르는 종목",
     "🔭 차기 주도": "이익·수급·신고가로 본 다음 주도섹터 후보", "🌱 회복 리더": "조정 뒤 먼저 회복하는 종목",
@@ -12689,6 +12989,8 @@ def render_board():
         "⚖️ 1:2:6 매매": lambda: render_126(df, histories, quotes, fins_all),
         "🎯 매수 후보": lambda: render_buy(df, quotes),
         "👑 주도주 찾기": lambda: render_rs_leaders(df, histories, trends_all, leaders_now),
+        "🚪 돌파 확인": lambda: render_breakout5(df, histories, quotes, leaders_now),
+        "🧺 바닥 줍기": lambda: render_bottom_fish(df, histories, quotes),
         "🗺️ 큰 그림": lambda: render_bigpicture(df),
         "💰 거래대금": lambda: render_money(df),
         "🚀 급상승": lambda: render_engine(df, trends_all, leaders_now, fins_all),
