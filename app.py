@@ -296,10 +296,10 @@ _MOD_REQ = {"msig": ("MARKET_VERSION", "analyze", "action_text"),
             "scout": ("index_phase", "combine", "resilient", "candidates", "pick", "early_buys", "volume_profile", "PLAYBOOK"),
             "bigpicture": ("summary", "bucket_summary", "tag", "BIG"),
             "views": ("NJ_VIEWS", "KQ_VIEWS", "KF_VIEWS", "ZB_VIEWS", "RS_VIEWS", "BF_VIEWS", "BO_VIEWS", "AI_VIEWS"),
-            "kangto": ("KT5_VERSION", "bf_market", "bf_scan", "bf_sim", "bo_quality", "bo_scan", "bo_reason"),
+            "kangto": ("KT5_VERSION", "bf_market", "bf_scan", "bf_sim", "env_sim", "bo_quality", "bo_scan", "bo_reason"),
             "zongbae": ("ZB_VERSION", "VIEWS", "checks", "verdict", "candidates", "market_type", "summary_line"),
             "gq": ("QUOTES_VERSION", "today_quote", "load", "CAT_COLOR")}
-_MOD_VER = {"kangto": ("KT5_VERSION", "2026-11-27-kt5"), "gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
+_MOD_VER = {"kangto": ("KT5_VERSION", "2026-11-27-kt5env"), "gq": ("QUOTES_VERSION", "2026-11-03-guru"), "msig": ("MARKET_VERSION", MARKET_VERSION), "scout": ("SCOUT_VERSION", "2026-11-02-ftdbreak")}
 
 
 def _old_ver(alias, mod) -> bool:
@@ -12602,7 +12602,7 @@ def render_bottom_fish(df: pd.DataFrame, histories: dict, quotes: dict):
                      .map(_won_c, subset=["등락률", "20일선 대비"]), hide_index=True, width="stretch", height=360)
         st.caption("대상: 보드의 국내 보통주(시총 3,000억↑ 주요 종목 — 1조↑는 모두 들어 있어요). 상장 1년 = 일봉 250거래일 이상.")
 
-    st.markdown("#### 🧾 같은 규칙으로 1,000만 원 모의 계좌")
+    st.markdown("#### 🧾 1,000만 원 모의 계좌 — 깡토 최종 규칙 vs 남들 하는 엔벨로프 하단")
     kdf = _kospi_df()
     first = pd.to_datetime(kdf["date"]).min().date() if len(kdf) else date(2026, 7, 1)
     c1, c2 = st.columns(2)
@@ -12627,17 +12627,61 @@ def render_bottom_fish(df: pd.DataFrame, histories: dict, quotes: dict):
                   f'출동한 날 <b>{sim["armed_days"]}/{sim["days"]}</b></div>', unsafe_allow_html=True)
     k[3].markdown(f'<div class="pf-k">최대 낙폭</div><div class="pf-v">{sim["mdd"]:.1f}%</div>'
                   f'<div class="pf-s">현금 {sim["cash"]:,.0f}원 · 대상 {sim["universe"]}종목</div>', unsafe_allow_html=True)
+    env = tab_memo("env_sim", (now.date(), now.hour * 6 + now.minute // 10, str(start), int(seed), len(histories)),
+                   lambda: kangto.env_sim(df, histories, kdf, start, float(seed)))
     cv = sim["curve"]
-    long = pd.concat([cv.assign(구분="바닥 줍기 모의 계좌", 값=cv["equity"]), cv.assign(구분="코스피(같은 돈)", 값=cv["kospi"])]) \
-        .rename(columns={"date": "날짜"})
+    parts = [cv.assign(구분="바닥 줍기 최종 규칙", 값=cv["equity"]), cv.assign(구분="코스피(같은 돈)", 값=cv["kospi"])]
+    if env:
+        parts.append(env["curve"].assign(구분="엔벨로프 하단(물타기)", 값=env["curve"]["equity"]))
+    long = pd.concat(parts).rename(columns={"date": "날짜"})
+    dom = ["바닥 줍기 최종 규칙", "엔벨로프 하단(물타기)", "코스피(같은 돈)"]
+    if env:
+        st.markdown("**⚖️ 같은 기간·같은 시드 비교 — 남들 하는 엔벨로프 하단 매매 vs 깡토 최종 규칙**")
+        def _fmt(x):
+            return f"{x:+.2f}%" if x is not None else "-"
+        wr_e = f'{env["wins"] / env["closed"] * 100:.0f}%' if env["closed"] else "-"
+        cmp_ = pd.DataFrame({
+            "": ["평가금액", "수익률", "최대 낙폭", "끝난 매매", "승률", "규칙"],
+            "🧺 바닥 줍기 최종 규칙": [f"{sim['equity']:,.0f}원", _fmt(sim["ret"]), f"{sim['mdd']:.1f}%", f"{sim['closed']}건", wr,
+                                  "코스피 -12%↓만 · 1조↑ · 20일선 -22% · 한 번에 · 5일선 매도 · 2종목"],
+            "📉 엔벨로프 하단(물타기)": [f"{env['equity']:,.0f}원", _fmt(env["ret"]), f"{env['mdd']:.1f}%", f"{env['closed']}건", wr_e,
+                                    "언제나 · 20일선 -20% 1/3 · -10%·-20% 물타기 · 20일선 매도 · 5종목"],
+            "코스피": ["-", _fmt(sim["kospi_ret"]), "-", "-", "-", "그냥 들고 있기"]})
+        st.dataframe(cmp_, hide_index=True, width="stretch")
+        bn = env.get("by_buys") or {}
+        if bn:
+            st.caption("엔벨로프 물타기 횟수별 승률 — " + " · ".join(
+                f"{n}번 매수 {v[0]}건 중 {v[1] / v[0] * 100:.0f}% 이김" for n, v in sorted(bn.items()) if v[0])
+                + " (깡토 10년: 한 번만 산 거래 90% · 세 번 끝까지 26%)")
     ch = (alt.Chart(long).mark_line(interpolate="monotone").encode(
         x=alt.X("날짜:T", title=None, axis=alt.Axis(format="%m.%d", labelAngle=0, grid=False)),
         y=alt.Y("값:Q", title="원", scale=alt.Scale(zero=False), axis=alt.Axis(format="~s")),
-        color=alt.Color("구분:N", scale=alt.Scale(domain=["바닥 줍기 모의 계좌", "코스피(같은 돈)"], range=["#5B47F5", "#B9B4D8"]),
+        color=alt.Color("구분:N", scale=alt.Scale(domain=dom, range=["#5B47F5", "#E8590C", "#B9B4D8"]),
                         legend=alt.Legend(orient="top", title=None)),
         tooltip=[alt.Tooltip("날짜:T", format="%Y-%m-%d"), "구분:N", alt.Tooltip("값:Q", format=",.0f")]).properties(height=240, width="container"))
     st.altair_chart(ch)
-    t1, t2 = st.tabs([f"📒 매매 일지 {len(sim['journal'])}", f"🧾 매매 내역 {len(sim['trades'])}"])
+    t1, t2, t3, t4 = st.tabs([f"📒 최종 규칙 일지 {len(sim['journal'])}", f"🧾 최종 규칙 내역 {len(sim['trades'])}",
+                              f"📉 엔벨로프 일지 {len(env['journal']) if env else 0}", f"🧾 엔벨로프 내역 {len(env['trades']) if env else 0}"])
+    with t3:
+        if env and env["journal"]:
+            et = pd.DataFrame([{
+                "상태": "🟢 보유" if j["status"] == "보유" else ("✅ 수익" if j["pnl"] > 0 else "❌ 손실"), "종목": f"{j['name']} · {j['code']}",
+                "첫 매수일": f"{j['entry_date']:%m/%d}", "첫 매수가": j["entry_px"], "매수 횟수": j.get("buys"), "평단": j.get("avg"),
+                "수량": j.get("qty"), "매도일": f"{j['exit_date']:%m/%d}" if j.get("exit_date") is not None else "-",
+                "매도가": j.get("exit_px") if j["status"] == "청산" else j.get("cur_px"), "이유": j.get("exit_why"),
+                "보유일": j.get("days"), "수익률": j.get("ret"), "손익": j.get("pnl")} for j in env["journal"]])
+            st.dataframe(et.style.format({"첫 매수가": "{:,.0f}", "매수 횟수": "{:.0f}번", "평단": "{:,.0f}", "수량": "{:,.0f}", "매도가": "{:,.0f}",
+                                          "보유일": "{:.0f}일", "수익률": "{:+.2f}%", "손익": "{:+,.0f}"}, na_rep="-")
+                         .map(_won_c, subset=["수익률", "손익"]), hide_index=True, width="stretch", height=380)
+        else:
+            st.caption("엔벨로프 규칙에 걸린 매매가 없었어요.")
+    with t4:
+        if env and env["trades"]:
+            tr = pd.DataFrame([{"날짜": f"{x['date']:%Y-%m-%d}", "종목": x["name"], "구분": x["side"], "이유": x["why"], "가격": x["price"],
+                                "수량": x["qty"], "금액": x["amount"], "실현손익": x["pnl"]} for x in env["trades"]])
+            st.dataframe(tr.style.format({"가격": "{:,.0f}", "수량": "{:,.0f}", "금액": "{:,.0f}", "실현손익": "{:+,.0f}"}, na_rep="")
+                         .map(_won_c, subset=["실현손익"]).map(lambda v: f"color:{UP if v == '매수' else DOWN}", subset=["구분"]),
+                         hide_index=True, width="stretch", height=380)
     with t1:
         if sim["journal"]:
             jt = pd.DataFrame([{
@@ -12668,6 +12712,8 @@ def render_bottom_fish(df: pd.DataFrame, histories: dict, quotes: dict):
             bits.append("내일 시가 매수: " + ", ".join(nb.get(c_, c_) for c_ in sim["pending_buy"]))
         st.markdown("**📌 모의 계좌 다음 행동** — " + " · ".join(bits))
     st.caption("🤖 규칙 그대로: 장 끝 종가로 판단 → 다음 날 아침 시가 체결 · 수수료 0.015%·거래세 0.20%·체결 밀림 0.1% 반영 · 손절·물타기·신용 없음. "
+               "📉 엔벨로프 비교는 깡토 글 0단계 그대로(시장 상관없이 20일선 -20% → 1/3, 첫 매수가 -10%·-20%에 1/3씩, 20일선 회복 매도, 손절 없음, 5종목 · 같은 비용) — "
+               "단 보드 종목(시총 3,000억↑)만이라 작은 종목·거래정지·상장폐지가 빠져 깡토 결과(-71%)보다 덜 나쁘게 나와요. "
                "⚠️ 시가총액은 '지금 주식 수 × 그날 종가' 근사이고, 지금 상장된 종목만 들어가 상장폐지 종목이 빠져요(실제보다 좋게 나올 수 있음). "
                "오늘 칸은 장중이면 종가에 바뀌어요. 모의 결과이고 매수 권유가 아니에요.")
 

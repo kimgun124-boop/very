@@ -24,7 +24,7 @@ import pandas as pd
 
 import data
 
-KT5_VERSION = "2026-11-27-kt5"
+KT5_VERSION = "2026-11-27-kt5env"
 
 # ─────────────────────────── ① 🧺 하락장 바닥 줍기 ───────────────────────────
 BF_DEFAULTS = {"arm_dd": 12.0, "gap20": 22.0, "min_cap": 1e12, "min_tv": 10e8, "min_px": 1000.0, "min_bars": 250,
@@ -398,3 +398,134 @@ def bo_scan(frame: pd.DataFrame, hist_of, quotes: dict, leaders: set, market_ok:
     order = {k_: i for i, k_ in enumerate(BO_VERDICTS)}
     out["_o"] = out["verdict"].map(order)
     return out.sort_values(["_o", "n_trig", "vol_x"], ascending=[True, False, False]).drop(columns="_o").reset_index(drop=True)
+
+
+# ─────────────────────────── 🧺 비교용: 남들 하는 엔벨로프 하단 매매(깡토 글 0단계) ───────────────────────────
+# 20일선보다 20%↓ 종목 → 다음 날 시가에 1/3 · 첫 매수가 대비 -10%·-20% 더 빠지면 1/3씩 물타기 ·
+# 종가가 20일선 위면 다음 날 시가에 전부 · 손절 없음 · 동시에 5종목 · 신호가 여럿이면 거래대금 큰 순 · 시장 상관없이 언제나
+ENV_DEFAULTS = {"gap20": 20.0, "slots": 5, "adds": (10.0, 20.0), "min_cap": 0.0, "min_tv": 0.0, "min_px": 0.0, "min_bars": 0,
+                "exit_ma": 5, "fee": 0.00015, "tax": 0.0020, "slip": 0.001}
+
+
+def env_sim(df: pd.DataFrame, histories: dict, kospi: pd.DataFrame, start: date, seed: float = 1e7,
+            p: dict | None = None) -> dict | None:
+    """엔벨로프 하단 + 물타기 모의 계좌(같은 기간·같은 비용으로 바닥 줍기 최종 규칙과 비교)."""
+    p = {**ENV_DEFAULTS, **(p or {})}
+    if kospi is None or len(kospi) < 60:
+        return None
+    k = kospi[["date", "close"]].copy()
+    k["date"] = pd.to_datetime(k["date"]).dt.normalize()
+    k = k.drop_duplicates("date", keep="last").set_index("date")["close"].astype(float)
+    days = [d for d in k.index if d >= pd.Timestamp(start)]
+    if len(days) < 2:
+        return None
+    fr = _frames(df, histories, p)
+    buy_cost = 1 + p["fee"] + p["slip"]
+    sell_keep = 1 - p["fee"] - p["tax"] - p["slip"]
+    cash, hold, pend_buy, pend_sell = float(seed), {}, [], {}
+    journal, trades, curve = [], [], []
+    peak_eq, mdd, prev_eq = float(seed), 0.0, float(seed)
+
+    def row(code, d):
+        h = fr[code][2]
+        return h.loc[d] if d in h.index else None
+
+    for d in days:
+        for code, why in list(pend_sell.items()):
+            x, r_ = hold.get(code), row(code, d)
+            if x is None:
+                pend_sell.pop(code)
+                continue
+            if r_ is None or not r_["open"] > 0:
+                continue
+            px = float(r_["open"])
+            amt = px * x["qty"] * sell_keep
+            pnl = amt - x["cost"]
+            cash += amt
+            trades.append({"date": d, "code": code, "name": x["name"], "side": "매도", "why": why, "price": px,
+                           "qty": x["qty"], "amount": px * x["qty"], "pnl": pnl})
+            x["j"].update(status="청산", exit_date=d, exit_px=px, exit_why=why, days=x["held"], pnl=pnl,
+                          ret=(amt / x["cost"] - 1) * 100, buys=x["n"])
+            hold.pop(code)
+            pend_sell.pop(code)
+        for code, why_in, step in pend_buy:
+            r_ = row(code, d)
+            if r_ is None or not r_["open"] > 0:
+                continue
+            if step == 0 and (code in hold or len(hold) >= p["slots"]):
+                continue
+            if step > 0 and code not in hold:
+                continue
+            px = float(r_["open"])
+            unit = (prev_eq / p["slots"] / 3) if step == 0 else hold[code]["unit"]
+            qty = int(min(unit, cash) // (px * buy_cost))
+            if qty <= 0:
+                continue
+            cost = px * qty * buy_cost
+            cash -= cost
+            if step == 0:
+                name, grp = fr[code][0], fr[code][1]
+                j = {"status": "보유", "code": code, "name": name, "group": grp, "entry_date": d, "entry_px": px,
+                     "why": why_in, "buys": 1}
+                journal.append(j)
+                hold[code] = {"name": name, "qty": qty, "cost": cost, "held": 0, "last": px, "j": j, "first": px,
+                              "unit": unit, "n": 1}
+            else:
+                x = hold[code]
+                x["qty"] += qty
+                x["cost"] += cost
+                x["n"] += 1
+                x["j"]["buys"] = x["n"]
+            x = hold[code]
+            x["j"].update(qty=x["qty"], avg=x["cost"] / x["qty"])
+            trades.append({"date": d, "code": code, "name": x["name"], "side": "매수",
+                           "why": why_in if step == 0 else f"물타기 {x['n']}차 — {why_in}", "price": px, "qty": qty,
+                           "amount": px * qty, "pnl": None})
+        pend_buy = []
+        for code, x in hold.items():
+            x["held"] += 1
+            r_ = row(code, d)
+            if r_ is None or code in pend_sell:
+                continue
+            if r_["close"] >= r_["ma20"]:
+                pend_sell[code] = f"종가가 20일선 회복({r_['close']:,.0f} ≥ {r_['ma20']:,.0f}) → 다음 날 시가"
+            elif x["n"] < 3:
+                lvl = p["adds"][x["n"] - 1]
+                if r_["close"] <= x["first"] * (1 - lvl / 100):
+                    pend_buy.append((code, f"첫 매수가 대비 -{lvl:.0f}%↓", x["n"]))
+        free = p["slots"] - sum(1 for c_ in hold if c_ not in pend_sell)
+        if free > 0:
+            cands = []
+            for code, (_, _, h) in fr.items():
+                if code in hold or d not in h.index:
+                    continue
+                r_ = h.loc[d]
+                if r_["ma20"] > 0 and (r_["close"] / r_["ma20"] - 1) * 100 <= -p["gap20"]:
+                    cands.append((float(np.nan_to_num(r_["tv20"])), code, (r_["close"] / r_["ma20"] - 1) * 100))
+            cands.sort(reverse=True)
+            pend_buy += [(c_, f"20일선 {g:+.1f}% · 1/3 매수", 0) for _, c_, g in cands[:free]]
+        eq = cash
+        for code, x in hold.items():
+            r_ = row(code, d)
+            if r_ is not None and r_["close"] == r_["close"]:
+                x["last"] = float(r_["close"])
+            eq += x["last"] * x["qty"]
+        prev_eq = eq
+        peak_eq = max(peak_eq, eq)
+        mdd = min(mdd, (eq / peak_eq - 1) * 100)
+        curve.append({"date": d, "equity": eq})
+    for code, x in hold.items():
+        x["j"].update(cur_px=x["last"], days=x["held"], pnl=x["last"] * x["qty"] * sell_keep - x["cost"],
+                      ret=(x["last"] * x["qty"] * sell_keep / x["cost"] - 1) * 100,
+                      exit_why=pend_sell.get(code) or f"보유 중 · {x['n']}번 매수")
+    closed = [j for j in journal if j["status"] == "청산"]
+    eq = curve[-1]["equity"]
+    by_n = {}
+    for j in closed:
+        b = by_n.setdefault(j.get("buys", 1), [0, 0])
+        b[0] += 1
+        b[1] += j["pnl"] > 0
+    return {"seed": seed, "start": days[0].date(), "end": days[-1].date(), "equity": eq, "pnl": eq - seed,
+            "ret": (eq / seed - 1) * 100, "mdd": mdd, "closed": len(closed), "wins": sum(1 for j in closed if j["pnl"] > 0),
+            "cash": cash, "journal": journal[::-1], "trades": trades[::-1], "curve": pd.DataFrame(curve),
+            "universe": len(fr), "by_buys": by_n}
